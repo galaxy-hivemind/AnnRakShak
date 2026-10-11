@@ -1,0 +1,26 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment Variables & Secrets
+.env
+*.env
+!.env.example
+
+# macOS System Files
+.DS_Store
+
+# Local Captures (keep directory if needed)
+captures/*.jpg
+
+# Native OCR Compiled Binary
+mac_vision_ocr
+
+# Temporary files
+/tmp/annarakshak_*
