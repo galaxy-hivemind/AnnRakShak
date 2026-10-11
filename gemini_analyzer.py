@@ -37,7 +37,8 @@ load_dotenv()
 
 logger = logging.getLogger("AnnaRakshak.Gemini")
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 SYSTEM_INSTRUCTION = """\
@@ -262,62 +263,80 @@ class GeminiAnalyzer:
         ext = path.suffix.lower()
         mime_type = "image/png" if ext == ".png" else "image/jpeg"
 
-        try:
-            image_bytes = path.read_bytes()
+        models_to_try = [self.model_name]
+        for fb in FALLBACK_MODELS:
+            if fb not in models_to_try:
+                models_to_try.append(fb)
 
-            config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=FoodAnalysisResult,
-                temperature=0.1,
-                system_instruction=SYSTEM_INSTRUCTION,
-            )
+        last_err: Exception | None = None
+        for current_model in models_to_try:
+            try:
+                image_bytes = path.read_bytes()
 
-            prompt = (
-                "Carefully inspect this food package image. "
-                "Identify the product name, brand, category, and all printed dates. "
-                "Follow all strict date interpretation rules without hallucination."
-            )
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=FoodAnalysisResult,
+                    temperature=0.1,
+                    system_instruction=SYSTEM_INSTRUCTION,
+                )
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    prompt,
-                ],
-                config=config,
-            )
+                prompt = (
+                    "Carefully inspect this food package image. "
+                    "Identify the product name, brand, category, and all printed dates. "
+                    "Follow all strict date interpretation rules without hallucination."
+                )
 
-            if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
-                return FoodAnalysisResult.post_validate(response.parsed)
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt,
+                    ],
+                    config=config,
+                )
 
-            if hasattr(response, "text") and response.text:
-                res = FoodAnalysisResult.model_validate_json(response.text)
-                return FoodAnalysisResult.post_validate(res)
+                if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
+                    return FoodAnalysisResult.post_validate(response.parsed)
 
-            return FoodAnalysisResult(
-                analysis_status="error",
-                needs_review=True,
-                review_reason="Empty response received from Gemini API",
-            )
+                if hasattr(response, "text") and response.text:
+                    res = FoodAnalysisResult.model_validate_json(response.text)
+                    return FoodAnalysisResult.post_validate(res)
 
-        except Exception as e:
-            err_msg = str(e)
-            logger.error("Gemini API call failed: %s", err_msg)
-            # Differentiate common failure modes
-            if "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
-                reason = "Gemini API rate limit or quota exceeded. Please try again later."
-            elif "UNAUTHENTICATED" in err_msg or "API_KEY_INVALID" in err_msg or "403" in err_msg:
-                reason = "Gemini API key is invalid or unauthorized."
-            elif "timeout" in err_msg.lower():
-                reason = "Gemini API request timed out."
-            else:
-                reason = f"Gemini API request failed: {err_msg}"
+                return FoodAnalysisResult(
+                    analysis_status="error",
+                    needs_review=True,
+                    review_reason="Empty response received from Gemini API",
+                )
 
-            return FoodAnalysisResult(
-                analysis_status="error",
-                needs_review=True,
-                review_reason=reason,
-            )
+            except Exception as e:
+                last_err = e
+                err_msg = str(e)
+                # If model is unavailable (503 / 404), log warning and attempt fallback model
+                is_transient = any(k in err_msg for k in ("503", "UNAVAILABLE", "high demand", "404", "NOT_FOUND"))
+                if is_transient and current_model != models_to_try[-1]:
+                    logger.warning("Model '%s' unavailable (%s). Falling back to next model...", current_model, err_msg.split('\n')[0])
+                    continue
+                break
+
+        err_msg = str(last_err) if last_err else "Unknown error"
+        logger.error("Gemini API call failed: %s", err_msg)
+        # Differentiate common failure modes
+        if "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+            reason = "Gemini API rate limit or quota exceeded. Please try again later."
+        elif "UNAUTHENTICATED" in err_msg or "API_KEY_INVALID" in err_msg or "403" in err_msg:
+            reason = "Gemini API key is invalid or unauthorized."
+        elif "503" in err_msg or "UNAVAILABLE" in err_msg:
+            reason = "Gemini API is temporarily experiencing high demand (503). Please retry in a few seconds."
+        elif "timeout" in err_msg.lower():
+            reason = "Gemini API request timed out."
+        else:
+            reason = f"Gemini API request failed: {err_msg}"
+
+        return FoodAnalysisResult(
+            analysis_status="error",
+            needs_review=True,
+            review_reason=reason,
+        )
 
 
 # ---------------------------------------------------------------------------
