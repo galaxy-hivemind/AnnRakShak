@@ -837,6 +837,11 @@ if __name__ == "__main__":
         suite.addTests(loader.loadTestsFromModule(test_gemini_analyzer))
     except ImportError:
         pass
+    try:
+        import test_inventory
+        suite.addTests(loader.loadTestsFromModule(test_inventory))
+    except ImportError:
+        pass
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

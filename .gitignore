@@ -22,5 +22,9 @@ captures/*.jpg
 # Native OCR Compiled Binary
 mac_vision_ocr
 
+# Local SQLite Database
+*.db
+*.sqlite3
+
 # Temporary files
 /tmp/annarakshak_*

@@ -6,10 +6,11 @@
 
 ## Project Overview
 
-AnnaRakshak uses a webcam and Gemini vision to scan food packages, read expiry dates, and maintain a spoken inventory — so you never have to touch a keyboard while cooking or unpacking groceries.> **Current phase:** Step 5 — Gemini Vision Integration (`google-genai` SDK + Structured Output).  
-> Using the **built-in MacBook Air FaceTime camera** (index 0) or external webcam (e.g. Logitech C505e).  
+AnnaRakshak uses a webcam and Gemini vision to scan food packages, read expiry dates, and maintain a spoken inventory — so you never have to touch a keyboard while cooking or unpacking groceries.> **Current phase:** Step 6A — SQLite Inventory Persistence (`annarakshak.db` + `inventory.py` CLI).  
+> Using the **built-in MacBook Air FaceTime camera** (index 0) or external webcam.  
 > Native Apple Vision OCR verifies visible text on packages before authorizing capture.  
-> Google Gemini 2.5 Flash (`google-genai` SDK) analyzes captured frames for structured food identification and strict expiry date interpretation.
+> Google Gemini Flash analyzes captured frames for structured food identification and strict expiry date interpretation.  
+> All scans and products are safely persisted locally in `annarakshak.db` without cloud dependencies or auto-confirming unverified dates.
 
 ---
 
@@ -203,36 +204,159 @@ python auto_scan.py --gemini-model gemini-3.8-flash
 
 ---
 
-## 5. Running the Test Suite
+---
 
-The test suite runs **59 automated tests** across all project layers in ~0.8s with **zero external network access and no API key required**:
+## 5. SQLite Local Inventory Persistence (`inventory_db.py`)
+
+All food records and scan attempts are safely stored in a local SQLite database:
+
+`annarakshak.db` (auto-created at project root, excluded from git).
+
+### Database Schema
+
+1. **`products` Table:**
+   - `id`: Unique integer primary key.
+   - `product_name`: Identified product name (required).
+   - `brand`: Brand name (nullable).
+   - `food_category`: Category e.g. Dairy, Bakery (nullable).
+   - `date_type`: Preserved date type (`expiry`, `use_by`, `best_before`, `manufacturing`, `packed_on`, `unknown`).
+   - `date_text`: Raw printed date text from package.
+   - `normalized_date`: Strict ISO `YYYY-MM-DD` date (nullable).
+   - `date_status`: User verification state (`confirmed`, `unverified`, `needs_review`).
+   - `date_source`: Source of the date (`printed`, `user_confirmed`).
+   - `analysis_status`: Gemini analysis outcome.
+   - `image_path`: Path to local captured image (stored locally in `captures/`, no image blobs).
+   - `notes`: User notes.
+   - `created_at` / `updated_at`: ISO 8601 UTC timestamps.
+
+2. **`date_candidates` Table:**
+   - Preserves all detected candidate dates from labels to prevent discarding evidence.
+   - Foreign keys to `products` (cascade on delete) and `scan_history`.
+
+3. **`scan_history` Table:**
+   - Audit trail of every scan attempt including image path, timestamps, Gemini output, error messages, and review reasons.
+   - Prevents duplicate scans from silently overwriting existing records.
+
+---
+
+## 6. Inventory CLI (`inventory.py`)
+
+Manage and inspect your inventory directly from the command line:
+
+```bash
+# List all inventory products
+python inventory.py list
+
+# Filter inventory by status (unverified, expiring, expired, all)
+python inventory.py list --filter expiring
+python inventory.py list --filter unverified
+
+# Search by product name, brand, or category
+python inventory.py search "milk"
+
+# Show detailed information for a product (including candidate dates & image path)
+python inventory.py show 1
+
+# Confirm or correct a product's date
+python inventory.py confirm-date 1 2026-10-25 --date-type expiry
+
+# Manually add a product
+python inventory.py add "Organic Whole Milk" --brand "Amul" --date 2026-10-20 --date-type expiry
+
+# Promote a captured scan into inventory
+python inventory.py add-scan 3
+
+# Edit an existing product
+python inventory.py edit 1 --name "Full Cream Milk" --notes "Kept in top fridge shelf"
+
+# Delete a product (prompts confirmation unless --force is supplied)
+python inventory.py delete 1
+
+# View recent scan history
+python inventory.py scans --limit 10
+```
+
+---
+
+## 7. Date Safeguards & Status Calculation
+
+AnnaRakshak applies deterministic, safe food safety rules:
+
+- **Missing or Unverified Dates:** Classified as `unknown`. Never assumed safe.
+- **Expiry / Use-by Dates (`expiry`, `use_by`):**
+  - `expired`: date < today
+  - `expires_today`: date == today
+  - `expiring_soon`: today < date <= today + 7 days (inclusive warning threshold)
+  - `not_expiring_soon`: date > today + 7 days
+- **Best-Before Dates (`best_before`):**
+  - Kept distinct from safety expiry dates: `best_before_passed`, `best_before_today`, `best_before_soon`, `best_before_future`.
+- **Manufacturing & Packing Dates (`manufacturing`, `packed_on`):**
+  - Classified as `not_an_expiry_date`. Never treated as expiry.
+- **Shelf-Life Wording:**
+  - Preserved in notes/raw text without synthetic calculation.
+- **Duplicate Protection:**
+  - Prevents accidental duplicate entries when scanning the same item multiple times. Adding duplicates requires explicit confirmation (`--force`).
+
+---
+
+## 8. Backup & Recovery Guidance
+
+Because AnnaRakshak uses standard SQLite with Write-Ahead Logging (WAL):
+
+- **Database File:** `annarakshak.db`
+- **Captured Images:** `captures/` folder
+
+### Creating a Backup:
+```bash
+# Using sqlite3 backup API (safe even while scanner is running)
+sqlite3 annarakshak.db ".backup 'backups/annarakshak_backup_$(date +%Y%m%d).db'"
+
+# Backup captured image references alongside DB
+cp -r captures/ backups/captures_backup_$(date +%Y%m%d)/
+```
+
+### Restoring from Backup:
+```bash
+cp backups/annarakshak_backup_20261011.db annarakshak.db
+```
+
+---
+
+## 9. Running the Test Suite
+
+The test suite runs **86 automated tests** across all project layers in ~1.4s with **zero external network access and no API key required**:
 
 ```bash
 source .venv/bin/activate
 python test_auto_scan.py
 ```
 
-Or run the Gemini analyzer unit tests independently:
+Or run test suites independently:
 ```bash
+# SQLite inventory persistence tests (27 tests):
+python test_inventory.py
+
+# Gemini analyzer unit tests (19 tests):
 python test_gemini_analyzer.py
 ```
 
-### Test Coverage (59 Tests, 100% Passing):
+### Test Coverage (86 Tests, 100% Passing):
 - ✅ **Step 2 (11 tests):** Standalone frame-to-frame stability and motion thresholds.
 - ✅ **Step 3 (9 tests):** Two-stage foreground gate and background calibration.
 - ✅ **Step 4 (20 tests):** Text-verified trigger, shadow rejection, Apple Vision OCR, drift stability, rearming.
-- ✅ **Step 5 (19 tests):**
-  - Image file validation (missing, directories, unsupported extensions, 0 bytes).
-  - Missing API key graceful handling.
-  - Structured output parsing and JSON fallback.
-  - Distinguishing manufacturing/packing dates from expiry dates (zero false expiry dates).
-  - Rejection of inferred days for month/year-only dates.
-  - Ambiguous / conflicting multiple dates handling (`needs_review=True`).
-  - Unreadable labels & non-food items classification.
-  - Malformed API responses & invalid JSON handling.
-  - Rate limit (429) & timeout error handling.
-  - `AsyncGeminiWorker` non-blocking lifecycle and single-slot bounded queue.
-  - Scanner engine state machine resilience upon Gemini failure.
+- ✅ **Step 5 (19 tests):** Gemini analyzer, structured output, schema validation, zero-hallucination date rules, error handling, worker queues.
+- ✅ **Step 6A (27 tests):**
+  - SQLite schema creation, idempotency, foreign keys, and indexes.
+  - Adding, retrieving, listing, searching, editing, and deleting products.
+  - Deterministic date status calculations across boundary conditions (threshold inclusive, expired, today, future).
+  - Distinct `best_before` quality classification.
+  - Strict rejection of manufacturing/packing dates as expiry.
+  - Strict validation of ISO dates and rejection of malformed/impossible dates.
+  - Scan history and date candidate persistence.
+  - Verification safety: unreviewed scans remain unconfirmed until explicit confirmation.
+  - Duplicate product detection and `--force` confirmation guard.
+  - Persistence across separate SQLite connections.
+  - Full CLI test coverage (`list`, `search`, `show`, `add`, `confirm-date`, `delete`).
 
 ---
 
@@ -243,8 +367,8 @@ python test_gemini_analyzer.py
 - [x] Two-stage foreground trigger & background calibration (`auto_scan.py` — Step 3)
 - [x] Apple Vision text-verified trigger (`auto_scan.py` & `ocr_engine.py` — Step 4)
 - [x] Gemini vision integration — product identification + expiry date extraction (`gemini_analyzer.py` — Step 5)
-- [ ] Voice guidance (spoken feedback via macOS `say` or TTS)
-- [ ] Inventory storage (SQLite or JSON)
+- [x] Local SQLite inventory persistence & CLI (`inventory_db.py`, `inventory.py` — Step 6A)
+- [ ] Voice guidance (spoken feedback via macOS `say` or TTS — Step 6B)
 - [ ] Expiry dashboard with urgency indicators
 - [ ] Unpackaged food tracking (produce, dairy, bakery)
 

@@ -81,6 +81,9 @@ from gemini_analyzer import (
     GeminiAnalyzer,
 )
 
+# SQLite Inventory Database
+from inventory_db import InventoryDatabase
+
 # ---------------------------------------------------------------------------
 # Configurable defaults
 # ---------------------------------------------------------------------------
@@ -1084,6 +1087,10 @@ def main() -> int:
     else:
         print("[AnnaRakshak] Gemini Analysis disabled by --no-gemini.")
 
+    # Initialize local SQLite inventory database
+    inv_db = InventoryDatabase()
+    print(f"[AnnaRakshak] Local inventory database ready at {inv_db.db_path.name}")
+
     print("=" * 70)
     print("AnnaRakshak — Text-Verified Automatic Scan Trigger")
     print("=" * 70)
@@ -1158,12 +1165,26 @@ def main() -> int:
                 curr_res = gemini_worker.latest_result
                 if curr_res is not None and curr_res is not last_reported_gemini_res:
                     last_reported_gemini_res = curr_res
+                    scan_id: int | None = None
+                    try:
+                        scan_id = inv_db.record_scan(
+                            image_path=gemini_worker.latest_image_path,
+                            result=curr_res,
+                            error_message=curr_res.review_reason if curr_res.analysis_status == "error" else None,
+                        )
+                    except Exception as e:
+                        print(f"[AnnaRakshak] Warning: Could not record scan to database: {e}")
+
                     print("\n" + "=" * 65)
                     print(f"[AnnaRakshak] GEMINI ANALYSIS RESULT — {gemini_worker.status}:")
+                    if scan_id is not None:
+                        print(f"Recorded in scan history as Scan #{scan_id}")
                     print("-" * 65)
                     print(curr_res.model_dump_json(indent=2))
                     print("-" * 65)
                     print(f"Summary: {curr_res.summary}")
+                    if scan_id is not None:
+                        print(f"To inspect or confirm into inventory: python inventory.py add-scan {scan_id}")
                     print("=" * 65 + "\n")
 
             draw_overlay(frame, engine, cam_index, width, height, fps,
