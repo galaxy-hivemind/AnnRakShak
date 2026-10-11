@@ -530,14 +530,15 @@ class InventoryDatabase:
                     c_norm = getattr(c, "normalized_date", None)
                     c_conf = float(getattr(c, "confidence", 1.0))
                     c_evid = getattr(c, "evidence", "")
+                    c_scan_id = getattr(c, "scan_id", None)
                     conn.execute(
                         """
                         INSERT INTO date_candidates (
                             product_id, scan_id, raw_text, date_type,
                             normalized_date, confidence, evidence, created_at
-                        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (product_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                        (product_id, c_scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
                     )
 
             return product_id
@@ -606,6 +607,33 @@ class InventoryDatabase:
                 ORDER BY id ASC
                 """,
                 (product_id,),
+            ).fetchall()
+            return [
+                DateCandidateRecord(
+                    id=r["id"],
+                    product_id=r["product_id"],
+                    scan_id=r["scan_id"],
+                    raw_text=r["raw_text"],
+                    date_type=r["date_type"],
+                    normalized_date=r["normalized_date"],
+                    confidence=r["confidence"],
+                    evidence=r["evidence"],
+                    created_at=r["created_at"],
+                )
+                for r in rows
+            ]
+
+    def get_scan_date_candidates(self, scan_id: int) -> list[DateCandidateRecord]:
+        """Retrieve all candidate dates associated with a scan history record."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, product_id, scan_id, raw_text, date_type,
+                       normalized_date, confidence, evidence, created_at
+                FROM date_candidates WHERE scan_id = ?
+                ORDER BY id ASC
+                """,
+                (scan_id,),
             ).fetchall()
             return [
                 DateCandidateRecord(

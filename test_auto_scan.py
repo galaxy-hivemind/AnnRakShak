@@ -549,11 +549,15 @@ class TestTextScanEngine(unittest.TestCase):
         max_drift: float = 0.15,
         removal_duration: float = 0.8,
         skip_calibration: bool = True,
+        capture_stability_seconds: float | None = None,
     ) -> tuple[TextScanEngine, MockOCREngine]:
         mock_ocr = MockOCREngine()
+        if capture_stability_seconds is None:
+            capture_stability_seconds = max(0.0, (required_consecutive_checks - 1) * 0.25)
         engine = TextScanEngine(
             ocr_engine=mock_ocr,
             required_consecutive_checks=required_consecutive_checks,
+            capture_stability_seconds=capture_stability_seconds,
             min_confidence=min_confidence,
             min_text_area=min_text_area,
             max_drift=max_drift,
@@ -780,7 +784,7 @@ class TestTextScanEngine(unittest.TestCase):
     def test_state_machine_with_mock_ocr_lifecycle(self):
         """Tests full lifecycle using MockOCREngine without physical camera."""
         mock_ocr = MockOCREngine()
-        engine = TextScanEngine(ocr_engine=mock_ocr, required_consecutive_checks=2)
+        engine = TextScanEngine(ocr_engine=mock_ocr, required_consecutive_checks=2, capture_stability_seconds=0.2)
         engine.calibrate()
 
         # 1. Empty scene
@@ -840,6 +844,11 @@ if __name__ == "__main__":
     try:
         import test_inventory
         suite.addTests(loader.loadTestsFromModule(test_inventory))
+    except ImportError:
+        pass
+    try:
+        import test_stability_and_dates
+        suite.addTests(loader.loadTestsFromModule(test_stability_and_dates))
     except ImportError:
         pass
     runner = unittest.TextTestRunner(verbosity=2)

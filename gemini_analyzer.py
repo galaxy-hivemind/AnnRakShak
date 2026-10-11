@@ -46,20 +46,37 @@ You are an expert food safety packaging analyst for AnnaRakshak.
 Your task is to analyze images of food packages and extract product details and printed dates with strict precision and zero hallucinations.
 
 STRICT EXTRACTION RULES:
-1. GROUNDING: Only report text and dates that are clearly and visibly printed on the package in the image. NEVER guess, invent, or assume typical shelf life.
-2. DATE CLASSIFICATION:
-   - 'expiry' or 'use_by': The date after which food is considered unsafe.
-   - 'best_before': Quality guarantee date. Do NOT treat best before as interchangeable with expiry/use by.
-   - 'manufacturing' or 'packed_on': The date the item was produced or packed. NEVER report this as the expiry date!
+1. THOROUGH VISUAL EXAMINATION:
+   - Carefully inspect the ENTIRE package visible in the frame, especially small-print date areas:
+     box top flap, bottom flap, bottle neck, cap/lid, crimped edges, back/side label panels,
+     and ink-jet or dot-matrix printed date codes.
+   - Extract EVERY visibly printed date and all nearby label text into 'date_candidates'.
+   - Preserve the exact printed characters in 'raw_text' (e.g. '04/2026', 'EXP 03/2028', '15-OCT-2026').
+   - Ground 'evidence' in nearby printed words (e.g. 'Printed next to Exp.: on top label panel').
+
+2. DATE CLASSIFICATION & INDIAN PACKAGING TERMS:
+   - 'manufacturing' or 'packed_on': Marked with Mfg, MFD, Mfg Date, Manufactured, PKD, Packed, Packaging Date, Batch Mfd.
+     CRITICAL: NEVER classify a manufacturing or packing date as an expiry date!
+   - 'expiry' or 'use_by': Marked with EXP, Exp Date, Expiry, Use By, UB, Expires, Valid Till.
+   - 'best_before': Marked with Best Before, BB, Best By, Best before X months from packaging.
+     Do NOT treat best-before as interchangeable with explicit expiry/use-by.
    - 'unknown': A date with no legible preceding label or clear indicator.
-3. BATCH & LOT NUMBERS: Alphanumeric lot numbers, batch codes (e.g. 'L2410', 'B12'), and barcodes are NOT dates.
-4. INCOMPLETE DATES:
-   - If only Month and Year are printed (e.g. 'OCT 2026' or '10/26'), do NOT invent an arbitrary day (like '01' or '31'). Set normalized_date = null and explain in evidence.
-   - If Day, Month, and Year are clearly printed, format normalized_date as 'YYYY-MM-DD'.
-5. AMBIGUOUS OR CONFLICTING DATES:
-   - If print is blurry, faint, smeared, or has multiple conflicting dates, list all candidates and set needs_review = true with a concise review_reason.
-   - Only set selected_expiry_date (YYYY-MM-DD) if supported by clear, unambiguous evidence of an expiry or use-by date.
-6. NON-FOOD OR UNREADABLE:
+
+3. DATE FORMATS & AMBIGUITY:
+   - Recognize common date formats: DD/MM/YY, DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, MM/YYYY, MM-YYYY, DD MMM YYYY, MMM YYYY.
+   - If Day, Month, and Year are clearly legible, set normalized_date to 'YYYY-MM-DD'.
+   - If only Month and Year are printed (e.g. '03/2028' or 'OCT 2026'): do NOT guess or invent an arbitrary day (like 01 or 31).
+     Set normalized_date = null and preserve the exact 'MM/YYYY' string in raw_text.
+   - Treat ambiguous numeric dates conservatively: if day vs month is ambiguous, set normalized_date = null and list in date_candidates.
+   - Alphanumeric lot numbers, batch codes (e.g. 'BD0114', 'L2410'), MRP, and barcodes are NOT dates.
+
+4. SELECTION OF EXPIRY DATE:
+   - Set 'selected_expiry_date' (YYYY-MM-DD) ONLY when supported by clear, unambiguous evidence of an explicit expiry or use-by date with full year, month, and day.
+   - If only manufacturing dates, only best-before dates, or only month/year dates exist: set selected_expiry_date = null.
+
+5. REVIEW & QUALITY FLAGS:
+   - If no dates are visible on the presented portion of the package, set needs_review = true, review_reason = 'No printed expiry or manufacturing dates visible on the presented portion of the package; date panel may be on another side or out of frame.'
+   - If the label or date area is blurry, faint, smeared, or small-print is illegible, set analysis_status = 'needs_review', needs_review = true, and explain clearly in review_reason.
    - If the object is not a food product, set analysis_status = 'not_a_food_product' and needs_review = true.
    - If no text or label is readable, set analysis_status = 'unreadable' and needs_review = true.
 """
@@ -184,7 +201,53 @@ class FoodAnalysisResult(BaseModel):
                 or f"Multiple conflicting expiry dates found ({', '.join(sorted(exp_dates))})."
             )
 
+        # Rule 5: If no unambiguous expiry date is selected, review is required
+        if result.selected_expiry_date is None:
+            result.needs_review = True
+            if not result.review_reason:
+                if len(result.date_candidates) == 0:
+                    result.review_reason = "No printed expiry or date markings detected on visible packaging."
+                else:
+                    has_exp = any(c.date_type in ("expiry", "use_by") for c in result.date_candidates)
+                    has_bb = any(c.date_type == "best_before" for c in result.date_candidates)
+                    has_mfg = any(c.date_type in ("manufacturing", "packed_on") for c in result.date_candidates)
+                    if has_exp:
+                        result.review_reason = "Expiry date candidate detected but lacks precise full day or requires manual confirmation."
+                    elif has_bb and not has_mfg:
+                        result.review_reason = "Best-before date detected; requires verification for safety expiry."
+                    elif has_mfg and not has_bb:
+                        result.review_reason = "Only manufacturing or packing date detected; no expiry date visible."
+                    else:
+                        result.review_reason = "Date candidates detected but require manual confirmation."
+
         return result
+
+
+def format_date_candidates_review(result: FoodAnalysisResult) -> str:
+    """
+    Format a clean, readable date inspection block for terminal review.
+    Format:
+      Date candidates:
+      • Candidate 1:
+        - Original text: exact text read from the image
+        - Type: expiry / use_by / best_before / manufacturing / packed_on / unknown
+        - Normalized date: ISO date or unavailable
+        - Confidence: model-reported score
+        - Evidence: nearby printed label or reason for uncertainty
+    """
+    lines = ["Date candidates:"]
+    if not result.date_candidates:
+        lines.append("  (None detected on visible packaging)")
+    else:
+        for idx, c in enumerate(result.date_candidates, 1):
+            norm_str = c.normalized_date if c.normalized_date else "unavailable"
+            lines.append(f"  • Candidate {idx}:")
+            lines.append(f"    - Original text: {c.raw_text}")
+            lines.append(f"    - Type: {c.date_type}")
+            lines.append(f"    - Normalized date: {norm_str}")
+            lines.append(f"    - Confidence: {c.confidence:.2f}")
+            lines.append(f"    - Evidence: {c.evidence}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +344,9 @@ class GeminiAnalyzer:
                 )
 
                 prompt = (
-                    "Carefully inspect this food package image. "
-                    "Identify the product name, brand, category, and all printed dates. "
+                    "Carefully inspect this food package image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
+                    "Identify the product name, brand, food category, and ALL printed dates (manufacturing, packing, expiry, use-by, best-before). "
+                    "Extract each printed date into date_candidates with exact raw_text, accurate date_type, and nearby evidence. "
                     "Follow all strict date interpretation rules without hallucination."
                 )
 
@@ -488,10 +552,11 @@ def main() -> int:
     if result.review_reason:
         print(f"Review Reason: {result.review_reason}")
     print(f"Expiry Date  : {result.selected_expiry_date or 'None'}")
-    print(f"Date Count   : {len(result.date_candidates)} candidate(s) found")
-    for i, c in enumerate(result.date_candidates, 1):
-        print(f"  [{i}] '{c.raw_text}' -> Type: {c.date_type}, Norm: {c.normalized_date}, Conf: {c.confidence:.2f}")
-        print(f"      Evidence: {c.evidence}")
+    print("-" * 65)
+    print(format_date_candidates_review(result))
+    if result.needs_review:
+        print("-" * 65)
+        print(f"Original image preserved at: {args.image}")
     print("=" * 65)
 
     return 0 if result.analysis_status != "error" else 1

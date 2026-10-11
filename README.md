@@ -186,6 +186,9 @@ python auto_scan.py
 # Start directly without pressing [c] to arm:
 python auto_scan.py --skip-calib
 
+# Configure capture stability duration (default: 2.5s continuous stability):
+python auto_scan.py --capture-stability-seconds 2.5
+
 # Target external USB webcam (index 1):
 python auto_scan.py --index 1
 
@@ -193,7 +196,7 @@ python auto_scan.py --index 1
 python auto_scan.py --no-gemini
 
 # Override Gemini model:
-python auto_scan.py --gemini-model gemini-3.8-flash
+python auto_scan.py --gemini-model gemini-3.5-flash-lite
 ```
 
 ### Preview Window Controls:
@@ -201,6 +204,13 @@ python auto_scan.py --gemini-model gemini-3.8-flash
 - `r` — Reset scanner back to `UNCALIBRATED`.
 - `s` — Save snapshot and submit to Gemini.
 - `q` — Quit and cleanly release camera, OCR, and Gemini workers.
+
+### Stability Gate & HUD Feedback:
+- Requires **2.5 seconds** (configurable via `--capture-stability-seconds`) of continuous qualifying text stability.
+- If the package moves beyond the drift tolerance (15%) or text disappears, the timer immediately resets.
+- Live HUD renders a real-time countdown progress bar:
+  `HOLD STEADY TO CAPTURE... 1.8s / 2.5s (72%)`
+- Clean un-annotated camera frames are captured and passed to Gemini in the background without blocking the 30+ FPS preview stream.
 
 ---
 
@@ -263,8 +273,14 @@ python inventory.py confirm-date 1 2026-10-25 --date-type expiry
 # Manually add a product
 python inventory.py add "Organic Whole Milk" --brand "Amul" --date 2026-10-20 --date-type expiry
 
-# Promote a captured scan into inventory
+# Promote a captured scan into inventory (displays all candidate dates interactively):
 python inventory.py add-scan 3
+
+# Promote a scan and explicitly select candidate date #2:
+python inventory.py add-scan 3 --candidate 2
+
+# Promote a scan with a user-confirmed date override:
+python inventory.py add-scan 3 --date 2028-03-31 --date-type expiry
 
 # Edit an existing product
 python inventory.py edit 1 --name "Full Cream Milk" --notes "Kept in top fridge shelf"
@@ -324,7 +340,7 @@ cp backups/annarakshak_backup_20261011.db annarakshak.db
 
 ## 9. Running the Test Suite
 
-The test suite runs **86 automated tests** across all project layers in ~1.4s with **zero external network access and no API key required**:
+The test suite runs **99 automated tests** across all project layers in ~1.4s with **zero external network access and no API key required**:
 
 ```bash
 source .venv/bin/activate
@@ -333,6 +349,9 @@ python test_auto_scan.py
 
 Or run test suites independently:
 ```bash
+# Capture stability & date flow regression tests (13 tests):
+python test_stability_and_dates.py
+
 # SQLite inventory persistence tests (27 tests):
 python test_inventory.py
 
@@ -340,7 +359,7 @@ python test_inventory.py
 python test_gemini_analyzer.py
 ```
 
-### Test Coverage (86 Tests, 100% Passing):
+### Test Coverage (99 Tests, 100% Passing):
 - ✅ **Step 2 (11 tests):** Standalone frame-to-frame stability and motion thresholds.
 - ✅ **Step 3 (9 tests):** Two-stage foreground gate and background calibration.
 - ✅ **Step 4 (20 tests):** Text-verified trigger, shadow rejection, Apple Vision OCR, drift stability, rearming.
@@ -348,7 +367,7 @@ python test_gemini_analyzer.py
 - ✅ **Step 6A (27 tests):**
   - SQLite schema creation, idempotency, foreign keys, and indexes.
   - Adding, retrieving, listing, searching, editing, and deleting products.
-  - Deterministic date status calculations across boundary conditions (threshold inclusive, expired, today, future).
+  - Deterministic date status calculations across boundary conditions.
   - Distinct `best_before` quality classification.
   - Strict rejection of manufacturing/packing dates as expiry.
   - Strict validation of ISO dates and rejection of malformed/impossible dates.
@@ -357,6 +376,15 @@ python test_gemini_analyzer.py
   - Duplicate product detection and `--force` confirmation guard.
   - Persistence across separate SQLite connections.
   - Full CLI test coverage (`list`, `search`, `show`, `add`, `confirm-date`, `delete`).
+- ✅ **Part A & B Regression (13 tests):**
+  - 2.5s continuous stability gate enforcement.
+  - Stability timer reset on motion drift or text disappearance.
+  - Zero premature captures before 2.5s threshold.
+  - Single capture guard (no duplicate triggers for same presentation).
+  - Scanner rearming upon package removal.
+  - Complete end-to-end survival of all date candidates in DB and CLI.
+  - Interactive candidate selection and user-confirmed overrides during `add-scan`.
+  - Re-analysis of saved images without duplicate scan records.
 
 ---
 

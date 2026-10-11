@@ -513,7 +513,7 @@ class TestScannerResilienceOnGeminiFailure(unittest.TestCase):
     """Verifies that a Gemini failure cannot duplicate captures or crash the scanner engine."""
 
     def test_scanner_state_remains_intact_if_gemini_fails(self) -> None:
-        engine = TextScanEngine(required_consecutive_checks=2)
+        engine = TextScanEngine(required_consecutive_checks=2, capture_stability_seconds=0.25)
         engine.calibrate()
 
         reg = TextRegion("BROWN BREAD", 0.92, 0.2, 0.2, 0.3, 0.1)

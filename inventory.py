@@ -179,29 +179,81 @@ def cmd_add_scan(db: InventoryDatabase, args: argparse.Namespace) -> int:
         print(f"\nError: Scan ID #{args.scan_id} not found in scan history.\n")
         return 1
 
+    candidates = db.get_scan_date_candidates(args.scan_id)
+
     name = args.name or scan.product_name or "Unknown Item"
     brand = args.brand or scan.brand
     category = args.category or scan.food_category
-    date_val = args.date if args.date is not None else scan.selected_expiry_date
-    date_type = args.type or ("expiry" if date_val else "unknown")
 
-    # If date was selected or overridden, status is confirmed; otherwise needs review
-    date_status = "confirmed" if (args.date or (date_val and not scan.needs_review)) else "needs_review"
-    date_source = "user_confirmed" if args.date else "printed"
+    # Date resolution logic:
+    selected_candidate = None
+    if getattr(args, "candidate", None) is not None:
+        c_idx = args.candidate
+        if 1 <= c_idx <= len(candidates):
+            selected_candidate = candidates[c_idx - 1]
+        else:
+            print(f"\nError: Invalid candidate index {c_idx}. Must be between 1 and {len(candidates)}.\n")
+            return 1
 
-    print("=" * 65)
-    print(f"Confirm Adding Product from Scan #{scan.id}")
-    print("=" * 65)
+    date_text = None
+    if selected_candidate is not None:
+        date_type = args.type or selected_candidate.date_type
+        date_text = selected_candidate.raw_text
+        if args.date is not None:
+            date_val = args.date
+            date_status = "confirmed"
+            date_source = "user_confirmed"
+        elif selected_candidate.normalized_date is not None:
+            date_val = selected_candidate.normalized_date
+            date_status = "confirmed" if not scan.needs_review else "needs_review"
+            date_source = "printed"
+        else:
+            date_val = None
+            date_status = "needs_review"
+            date_source = "printed"
+    elif args.date is not None:
+        date_val = args.date
+        date_type = args.type or "expiry"
+        date_status = "confirmed"
+        date_source = "user_confirmed"
+    elif scan.selected_expiry_date is not None:
+        date_val = scan.selected_expiry_date
+        date_type = args.type or "expiry"
+        date_status = "confirmed" if not scan.needs_review else "needs_review"
+        date_source = "printed"
+    else:
+        date_val = None
+        date_type = args.type or "unknown"
+        date_status = "needs_review"
+        date_source = "printed"
+
+    print("=" * 70)
+    print(f"AnnaRakshak — Confirm Adding Product from Scan #{scan.id}")
+    print("=" * 70)
     print(f"Product Name : {name}")
     print(f"Brand        : {brand or '—'}")
     print(f"Category     : {category or '—'}")
-    print(f"Date Type    : {date_type}")
-    print(f"Date         : {date_val or 'None'}")
-    print(f"Date Status  : {date_status}")
     print(f"Image File   : {scan.image_path}")
     if scan.review_reason:
         print(f"Scan Note    : {scan.review_reason}")
-    print("-" * 65)
+    print("-" * 70)
+
+    # Display detected candidates
+    if candidates:
+        print("Detected Date Candidates:")
+        for idx, c in enumerate(candidates, 1):
+            marker = " [SELECTED]" if selected_candidate and selected_candidate.id == c.id else ""
+            norm = c.normalized_date or "unavailable (requires ISO YYYY-MM-DD)"
+            print(f"  [{idx}] '{c.raw_text}' -> Type: {c.date_type}, Normalized: {norm}, Conf: {c.confidence:.2f}{marker}")
+            print(f"      Evidence: {c.evidence}")
+    else:
+        print("⚠️  No printed dates were detected on this package in the scanned image.")
+        print("    Tip: Verify the date panel (MFG/EXP/Best Before) is facing the camera, or pass --date YYYY-MM-DD.")
+    print("-" * 70)
+    print(f"Record Date  : {date_val or 'None'}")
+    print(f"Date Type    : {date_type}")
+    print(f"Date Status  : {date_status} (Source: {date_source})")
+    print("-" * 70)
 
     try:
         product_id = db.add_product(
@@ -209,12 +261,14 @@ def cmd_add_scan(db: InventoryDatabase, args: argparse.Namespace) -> int:
             brand=brand,
             food_category=category,
             date_type=date_type,
+            date_text=date_text,
             normalized_date=date_val,
             date_status=date_status,
             date_source=date_source,
             analysis_status=scan.analysis_status,
             image_path=scan.image_path,
             notes=f"Created from Scan #{scan.id}. Reason: {scan.review_reason or 'None'}",
+            candidate_dates=candidates,
             force=args.force,
         )
         print(f"Successfully added to inventory as Product ID #{product_id}!\n")
@@ -366,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     # add-scan
     p_add_scan = subparsers.add_parser("add-scan", help="Add a product from camera scan history.")
     p_add_scan.add_argument("scan_id", type=int, help="Scan history ID.")
+    p_add_scan.add_argument("--candidate", type=int, default=None, help="Select candidate date index (1-based) from scan.")
     p_add_scan.add_argument("--name", type=str, default=None, help="Override product name.")
     p_add_scan.add_argument("--brand", type=str, default=None, help="Override brand.")
     p_add_scan.add_argument("--category", type=str, default=None, help="Override category.")

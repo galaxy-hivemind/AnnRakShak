@@ -79,6 +79,7 @@ from gemini_analyzer import (
     AsyncGeminiWorker,
     FoodAnalysisResult,
     GeminiAnalyzer,
+    format_date_candidates_review,
 )
 
 # SQLite Inventory Database
@@ -87,6 +88,9 @@ from inventory_db import InventoryDatabase
 # ---------------------------------------------------------------------------
 # Configurable defaults
 # ---------------------------------------------------------------------------
+
+DEFAULT_CAPTURE_STABILITY_SECONDS = 2.5
+"""Seconds of continuous steady qualifying text required before automatic capture."""
 
 DEFAULT_CONSECUTIVE_CHECKS = 3
 """Number of consecutive consistent OCR checks required before capture."""
@@ -255,6 +259,7 @@ class TextScanEngine:
         self,
         ocr_engine: BaseOCREngine | None = None,
         required_consecutive_checks: int = DEFAULT_CONSECUTIVE_CHECKS,
+        capture_stability_seconds: float = DEFAULT_CAPTURE_STABILITY_SECONDS,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         min_text_area: float = DEFAULT_MIN_TEXT_AREA,
         min_text_len: int = DEFAULT_MIN_TEXT_LEN,
@@ -264,6 +269,7 @@ class TextScanEngine:
     ) -> None:
         self.ocr_engine = ocr_engine
         self.required_consecutive_checks = required_consecutive_checks
+        self.capture_stability_seconds = capture_stability_seconds
         self.min_confidence = min_confidence
         self.min_text_area = min_text_area
         self.min_text_len = min_text_len
@@ -374,11 +380,14 @@ class TextScanEngine:
             self.absence_since = None
             self.removal_elapsed = 0.0
             self.stable_elapsed = 0.0
+            self.stable_since = None
 
             if has_qualifying:
                 self.baseline_region = self.qualifying_regions[0]
                 self.consecutive_checks = 1
                 self.detection_since = now
+                self.stable_since = now
+                self.stable_elapsed = 0.0
                 self.state = ScanState.TEXT_DETECTED
 
         # -- TEXT_DETECTED ----------------------------------------------------
@@ -387,6 +396,8 @@ class TextScanEngine:
                 # Text disappeared -> reset immediately
                 self.consecutive_checks = 0
                 self.baseline_region = None
+                self.stable_since = None
+                self.stable_elapsed = 0.0
                 self.state = ScanState.SEARCHING_FOR_TEXT
             else:
                 current_region = self.qualifying_regions[0]
@@ -396,19 +407,29 @@ class TextScanEngine:
                     current_region.center[1] - self.baseline_region.center[1],
                 ))
                 if drift > self.max_drift:
-                    # Excessive movement -> reset baseline to current position, remain at 1 check
+                    # Excessive movement -> reset baseline and stability timer
                     self.baseline_region = current_region
                     self.consecutive_checks = 1
+                    self.stable_since = now
+                    self.stable_elapsed = 0.0
                 else:
                     self.consecutive_checks += 1
+                    if self.stable_since is None:
+                        self.stable_since = now
+                    self.stable_elapsed = max(0.0, now - self.stable_since)
                     self.state = ScanState.VERIFYING_TEXT_STABILITY
-                    if self.consecutive_checks >= self.required_consecutive_checks:
+                    if (
+                        self.stable_elapsed >= (self.capture_stability_seconds - 1e-4)
+                        and self.consecutive_checks >= self.required_consecutive_checks
+                    ):
                         # TRIGGER CAPTURE
                         self.state = ScanState.CAPTURED_WAITING_FOR_REMOVAL
                         self.consecutive_checks = 0
                         self.baseline_region = None
                         self.absence_since = None
                         self.removal_elapsed = 0.0
+                        self.stable_since = None
+                        self.stable_elapsed = 0.0
                         triggered = True
 
         # -- VERIFYING_TEXT_STABILITY -----------------------------------------
@@ -417,6 +438,8 @@ class TextScanEngine:
                 # Text disappeared mid-verification -> reset to SEARCHING
                 self.consecutive_checks = 0
                 self.baseline_region = None
+                self.stable_since = None
+                self.stable_elapsed = 0.0
                 self.state = ScanState.SEARCHING_FOR_TEXT
             else:
                 current_region = self.qualifying_regions[0]
@@ -426,24 +449,36 @@ class TextScanEngine:
                     current_region.center[1] - self.baseline_region.center[1],
                 ))
                 if drift > self.max_drift:
-                    # Moved excessively -> drop back to TEXT_DETECTED
+                    # Moved excessively -> drop back to TEXT_DETECTED and reset stability timer
                     self.baseline_region = current_region
                     self.consecutive_checks = 1
+                    self.stable_since = now
+                    self.stable_elapsed = 0.0
                     self.state = ScanState.TEXT_DETECTED
                 else:
                     self.consecutive_checks += 1
-                    if self.consecutive_checks >= self.required_consecutive_checks:
+                    if self.stable_since is None:
+                        self.stable_since = now
+                    self.stable_elapsed = max(0.0, now - self.stable_since)
+                    if (
+                        self.stable_elapsed >= (self.capture_stability_seconds - 1e-4)
+                        and self.consecutive_checks >= self.required_consecutive_checks
+                    ):
                         # TRIGGER CAPTURE
                         self.state = ScanState.CAPTURED_WAITING_FOR_REMOVAL
                         self.consecutive_checks = 0
                         self.baseline_region = None
                         self.absence_since = None
                         self.removal_elapsed = 0.0
+                        self.stable_since = None
+                        self.stable_elapsed = 0.0
                         triggered = True
 
         # -- CAPTURED_WAITING_FOR_REMOVAL -------------------------------------
         elif self.state == ScanState.CAPTURED_WAITING_FOR_REMOVAL:
             self.consecutive_checks = 0
+            self.stable_since = None
+            self.stable_elapsed = 0.0
 
             if not has_qualifying:
                 if self.absence_since is None:
@@ -829,7 +864,9 @@ def draw_overlay(
     cv2.rectangle(frame, (0, bar_y), (w, bar_y + bar_h), (45, 45, 45), -1)
 
     if engine.state in (ScanState.TEXT_DETECTED, ScanState.VERIFYING_TEXT_STABILITY):
-        progress = min(engine.consecutive_checks / max(engine.required_consecutive_checks, 1), 1.0)
+        stab_dur = getattr(engine, "capture_stability_seconds", 2.5)
+        stab_elapsed = getattr(engine, "stable_elapsed", 0.0)
+        progress = min(max(stab_elapsed / max(stab_dur, 0.1), 0.0), 1.0)
         colour = C_CYAN if progress < 1.0 else C_GREEN
         cv2.rectangle(frame, (0, bar_y), (int(w * progress), bar_y + bar_h), colour, -1)
     elif engine.state == ScanState.CAPTURED_WAITING_FOR_REMOVAL and engine.removal_duration > 0:
@@ -879,14 +916,20 @@ def draw_overlay(
         guide_str = "Status: Searching for package text... (motion alone will not trigger)."
         guide_col = C_WHITE
     elif engine.state == ScanState.TEXT_DETECTED:
-        guide_str = "Status: Text candidate detected. Hold package steady to verify..."
+        stab_dur = getattr(engine, "capture_stability_seconds", 2.5)
+        stab_elapsed = getattr(engine, "stable_elapsed", 0.0)
+        pct = int(min(1.0, stab_elapsed / max(stab_dur, 0.1)) * 100)
+        guide_str = f"Status: Package detected. Hold steady... ({stab_elapsed:.1f}s / {stab_dur:.1f}s, {pct}%)"
         guide_col = C_YELLOW
     elif engine.state == ScanState.VERIFYING_TEXT_STABILITY:
+        stab_dur = getattr(engine, "capture_stability_seconds", 2.5)
+        stab_elapsed = getattr(engine, "stable_elapsed", 0.0)
+        pct = int(min(1.0, stab_elapsed / max(stab_dur, 0.1)) * 100)
         guide_str = (
-            f"Status: Verifying text consistency... "
-            f"({engine.consecutive_checks}/{engine.required_consecutive_checks} checks)"
+            f"Status: HOLD STEADY TO CAPTURE... {stab_elapsed:.1f}s / {stab_dur:.1f}s ({pct}%) "
+            f"[{engine.consecutive_checks} checks]"
         )
-        guide_col = C_CYAN
+        guide_col = C_CYAN if pct < 80 else C_GREEN
     elif engine.state == ScanState.CAPTURED_WAITING_FOR_REMOVAL:
         guide_str = (
             f"Status: Generic text verified & captured! Remove package "
@@ -991,6 +1034,11 @@ def main() -> int:
         help=f"Consecutive successful OCR checks required (default {DEFAULT_CONSECUTIVE_CHECKS}).",
     )
     parser.add_argument(
+        "--capture-stability-seconds", type=float, default=DEFAULT_CAPTURE_STABILITY_SECONDS,
+        dest="capture_stability_seconds",
+        help=f"Continuous stability duration in seconds required before capture (default {DEFAULT_CAPTURE_STABILITY_SECONDS}s).",
+    )
+    parser.add_argument(
         "--min-conf", type=float, default=DEFAULT_MIN_CONFIDENCE,
         dest="min_conf",
         help=f"Minimum OCR confidence 0.0-1.0 (default {DEFAULT_MIN_CONFIDENCE}).",
@@ -1069,6 +1117,7 @@ def main() -> int:
     engine = TextScanEngine(
         ocr_engine=ocr_engine,
         required_consecutive_checks=args.consecutive_checks,
+        capture_stability_seconds=args.capture_stability_seconds,
         min_confidence=args.min_conf,
         min_text_area=args.min_text_area,
         max_drift=args.max_drift,
@@ -1098,7 +1147,7 @@ def main() -> int:
     print(f"Resolution        : {width}x{height}")
     print(f"OCR Engine        : Apple Vision (macOS Neural Engine)")
     print(f"Gemini Analysis   : {'Enabled' if gemini_worker else 'Disabled'} ({gemini_analyzer.model_name if gemini_analyzer else 'N/A'})")
-    print(f"Required Checks   : {args.consecutive_checks} consecutive consistent checks")
+    print(f"Stability Required: {args.capture_stability_seconds:.1f}s continuous stability ({args.consecutive_checks} checks)")
     print(f"Min Confidence    : {args.min_conf:.2f}")
     print(f"Min Text Area     : {args.min_text_area * 100:.2f}% of frame")
     print(f"Max Drift Allowed : {args.max_drift * 100:.1f}%")
@@ -1181,6 +1230,10 @@ def main() -> int:
                         print(f"Recorded in scan history as Scan #{scan_id}")
                     print("-" * 65)
                     print(curr_res.model_dump_json(indent=2))
+                    print("-" * 65)
+                    print(format_date_candidates_review(curr_res))
+                    if curr_res.needs_review and curr_res.review_reason:
+                        print(f"Review Reason: {curr_res.review_reason}")
                     print("-" * 65)
                     print(f"Summary: {curr_res.summary}")
                     if scan_id is not None:
