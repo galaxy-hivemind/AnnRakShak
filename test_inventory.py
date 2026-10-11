@@ -412,6 +412,54 @@ class TestScanHistoryAndReviewSafety(unittest.TestCase):
         products = self.db.list_products()
         self.assertEqual(len(products), 0, "Scan must NOT automatically become an inventory product!")
 
+    def test_update_scan_reanalysis(self) -> None:
+        """Verifies update_scan updates an existing scan entry and refreshes candidate dates in-place."""
+        class InitialResult:
+            product_name = None
+            brand = None
+            food_category = None
+            analysis_status = "error"
+            needs_review = True
+            review_reason = "SSL connection failed"
+            selected_expiry_date = None
+            date_candidates = []
+
+        scan_id = self.db.record_scan("captures/item.jpg", InitialResult(), error_message="SSL error")
+        self.assertEqual(len(self.db.get_scan_date_candidates(scan_id)), 0)
+
+        # Re-analyzed result
+        class CandidateAfter:
+            raw_text = "EXP 2027-01-15"
+            date_type = "expiry"
+            normalized_date = "2027-01-15"
+            confidence = 0.95
+            evidence = "Printed clearly"
+
+        class ReanalyzedResult:
+            product_name = "Greek Yogurt"
+            brand = "Epigamia"
+            food_category = "Dairy"
+            analysis_status = "success"
+            needs_review = False
+            review_reason = None
+            selected_expiry_date = "2027-01-15"
+            date_candidates = [CandidateAfter()]
+
+        updated = self.db.update_scan(scan_id, ReanalyzedResult())
+        self.assertTrue(updated)
+
+        updated_scan = self.db.get_scan(scan_id)
+        self.assertIsNotNone(updated_scan)
+        self.assertEqual(updated_scan.product_name, "Greek Yogurt")
+        self.assertEqual(updated_scan.analysis_status, "success")
+        self.assertFalse(updated_scan.needs_review)
+        self.assertEqual(updated_scan.selected_expiry_date, "2027-01-15")
+
+        # Candidates are now populated
+        candidates = self.db.get_scan_date_candidates(scan_id)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].raw_text, "EXP 2027-01-15")
+
 
 class TestInventoryCLI(unittest.TestCase):
     """Tests the inventory.py CLI commands."""

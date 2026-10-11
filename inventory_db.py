@@ -416,6 +416,77 @@ class InventoryDatabase:
                 raw_json=r["raw_json"],
             )
 
+    def update_scan(
+        self,
+        scan_id: int,
+        result: Any | None = None,
+        error_message: str | None = None,
+    ) -> bool:
+        """
+        Update an existing scan history record and its candidate dates after reanalysis.
+        """
+        existing = self.get_scan(scan_id)
+        if not existing:
+            return False
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        product_name = None
+        brand = None
+        food_category = None
+        analysis_status = "error" if error_message else "unknown"
+        needs_review = 1
+        review_reason = None
+        selected_expiry_date = None
+        raw_json = None
+        candidates = []
+
+        if result is not None:
+            product_name = getattr(result, "product_name", None)
+            brand = getattr(result, "brand", None)
+            food_category = getattr(result, "food_category", None)
+            analysis_status = getattr(result, "analysis_status", "unknown")
+            needs_review = 1 if getattr(result, "needs_review", True) else 0
+            review_reason = getattr(result, "review_reason", None)
+            selected_expiry_date = getattr(result, "selected_expiry_date", None)
+            if hasattr(result, "model_dump_json"):
+                raw_json = result.model_dump_json()
+            candidates = getattr(result, "date_candidates", []) or []
+
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE scan_history
+                SET timestamp = ?, product_name = ?, brand = ?, food_category = ?,
+                    analysis_status = ?, needs_review = ?, review_reason = ?,
+                    selected_expiry_date = ?, error_message = ?, raw_json = ?
+                WHERE id = ?
+                """,
+                (
+                    now, product_name, brand, food_category,
+                    analysis_status, needs_review, review_reason,
+                    selected_expiry_date, error_message, raw_json,
+                    scan_id,
+                ),
+            )
+            # Remove previous candidates for this scan and insert fresh ones
+            conn.execute("DELETE FROM date_candidates WHERE scan_id = ?", (scan_id,))
+            for c in candidates:
+                raw_text = getattr(c, "raw_text", "")
+                date_type = getattr(c, "date_type", "unknown")
+                normalized_date = getattr(c, "normalized_date", None)
+                confidence = float(getattr(c, "confidence", 1.0))
+                evidence = getattr(c, "evidence", "")
+                conn.execute(
+                    """
+                    INSERT INTO date_candidates (
+                        product_id, scan_id, raw_text, date_type,
+                        normalized_date, confidence, evidence, created_at
+                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (scan_id, raw_text, date_type, normalized_date, confidence, evidence, now),
+                )
+            return True
+
     # -----------------------------------------------------------------------
     # Product Inventory Operations
     # -----------------------------------------------------------------------

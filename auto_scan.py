@@ -951,6 +951,9 @@ def draw_overlay(
         elif g_status == "IMAGE CAPTURED":
             g_col = C_YELLOW
             g_str = "Gemini: [IMAGE CAPTURED] Queued for Gemini analysis..."
+        elif g_status.startswith("RETRYING"):
+            g_col = C_ORANGE
+            g_str = f"Gemini: [{g_status}] Waiting with backoff & jitter..."
         elif g_status == "EXPIRY DATE FOUND" and g_res:
             g_col = C_GREEN
             g_str = f"Gemini: [EXPIRY DATE FOUND] {g_res.summary}"
@@ -974,7 +977,7 @@ def draw_overlay(
 
     # Line 5: Camera details & Controls
     cam_info = (f"Camera #{cam_index}  {width}x{height}  {fps:.1f}fps  |  "
-                f"[c] Arm/Calibrate  [r] Reset  [s] Snapshot  [q] Quit")
+                f"[c] Arm/Calibrate  [r] Reset  [s] Snapshot  [a] Reanalyze  [q] Quit")
     _text(frame, cam_info, (10, h - 16), C_WHITE, 0.42)
 
     # Saved capture notification overlay
@@ -1263,9 +1266,24 @@ def main() -> int:
             elif key == ord("s"):
                 if last_clean_frame is not None:
                     snap_path = save_capture(last_clean_frame, label="snapshot")
+                    last_capture_path = snap_path
                     print(f"[AnnaRakshak] Snapshot saved -> {snap_path}")
                     if gemini_worker:
                         gemini_worker.submit_capture(snap_path)
+
+            elif key == ord("a"):
+                target_path = last_capture_path or (gemini_worker.latest_image_path if gemini_worker else "")
+                if target_path and Path(target_path).exists():
+                    if gemini_worker:
+                        accepted = gemini_worker.reanalyze_image(target_path)
+                        if accepted:
+                            print(f"[AnnaRakshak] Reanalyzing capture -> {target_path}")
+                        else:
+                            print("[AnnaRakshak] Gemini worker is currently busy. Try again shortly.")
+                    else:
+                        print("[AnnaRakshak] Gemini worker disabled (--no-gemini).")
+                else:
+                    print("[AnnaRakshak] No previous capture available to reanalyze. Capture an image first.")
 
     except KeyboardInterrupt:
         print("\n[AnnaRakshak] Interrupted by user.")

@@ -22,14 +22,19 @@ import json
 import logging
 import os
 import queue
+import random
+import re
+import socket
+import ssl
 import threading
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import errors, types
+import httpx
 from pydantic import BaseModel, Field
 
 # Load environment variables from .env if present
@@ -40,6 +45,93 @@ logger = logging.getLogger("AnnaRakshak.Gemini")
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+# Retry defaults
+DEFAULT_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "3"))
+DEFAULT_INITIAL_BACKOFF = float(os.environ.get("GEMINI_INITIAL_BACKOFF", "1.0"))
+DEFAULT_BACKOFF_FACTOR = float(os.environ.get("GEMINI_BACKOFF_FACTOR", "2.0"))
+DEFAULT_MAX_BACKOFF = float(os.environ.get("GEMINI_MAX_BACKOFF", "8.0"))
+
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+
+NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
+
+
+def is_retryable_exception(exc: Exception) -> tuple[bool, str]:
+    """
+    Classify whether an exception is transient and safe to retry.
+    Returns (is_retryable, failure_reason_category).
+    Guarantees secrets/API keys are never returned as part of the reason.
+    """
+    # 1. SSL & Connection/Socket issues (e.g. UNEXPECTED_EOF_WHILE_READING)
+    if isinstance(exc, (ssl.SSLError, ConnectionError, socket.timeout, socket.gaierror)):
+        return True, "SSL/Network connection error"
+
+    # 2. HTTPX network/timeout errors
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True, "HTTP network/timeout error"
+
+    # 3. Google GenAI APIError / ServerError / ClientError
+    status_code = getattr(exc, "code", None)
+    if status_code is not None:
+        try:
+            status_code = int(status_code)
+        except (ValueError, TypeError):
+            status_code = None
+
+    if status_code in NON_RETRYABLE_STATUS_CODES:
+        return False, f"Permanent HTTP error ({status_code})"
+
+    if status_code in TRANSIENT_STATUS_CODES:
+        return True, f"HTTP transient status code ({status_code})"
+
+    # 4. Inspect string patterns safely without leaking tokens
+    msg = str(exc)
+    msg_lower = msg.lower()
+
+    if any(k in msg_lower for k in ("unauthenticated", "api_key_invalid", "permission_denied", "forbidden", "not found", "bad request")):
+        return False, "Permanent client error or invalid authentication"
+
+    if any(k in msg_lower for k in (
+        "unexpected_eof_while_reading",
+        "eof occurred",
+        "connection reset",
+        "connection broken",
+        "broken pipe",
+        "timeout",
+        "timed out",
+        "resource_exhausted",
+        "quota exceeded",
+        "rate limit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "unavailable",
+        "high demand",
+    )):
+        return True, "Transient network, timeout, or rate-limit error"
+
+    return False, "Non-retryable application error"
+
+
+def parse_retry_after(exc: Exception) -> float | None:
+    """Extract Retry-After header or server retry delay advice if present."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        headers = getattr(resp, "headers", None)
+        if headers and hasattr(headers, "get"):
+            ra = headers.get("retry-after") or headers.get("Retry-After")
+            if ra:
+                try:
+                    delay = float(ra)
+                    if delay > 0:
+                        return min(delay, 60.0)
+                except ValueError:
+                    pass
+    return None
+
 
 SYSTEM_INSTRUCTION = """\
 You are an expert food safety packaging analyst for AnnaRakshak.
@@ -265,10 +357,20 @@ class GeminiAnalyzer:
         api_key: str | None = None,
         model_name: str | None = None,
         client: Any | None = None,
+        max_retries: int | None = None,
+        initial_backoff: float | None = None,
+        backoff_factor: float | None = None,
+        max_backoff: float | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
         self._injected_client = client
+        self.max_retries = max_retries if max_retries is not None else DEFAULT_MAX_RETRIES
+        self.initial_backoff = initial_backoff if initial_backoff is not None else DEFAULT_INITIAL_BACKOFF
+        self.backoff_factor = backoff_factor if backoff_factor is not None else DEFAULT_BACKOFF_FACTOR
+        self.max_backoff = max_backoff if max_backoff is not None else DEFAULT_MAX_BACKOFF
+        self._sleeper = sleeper or time.sleep
 
     @property
     def client(self) -> genai.Client | None:
@@ -297,9 +399,15 @@ class GeminiAnalyzer:
             return False, f"Image file is empty (0 bytes): {path}"
         return True, None
 
-    def analyze_image(self, image_path: Path | str) -> FoodAnalysisResult:
+    def analyze_image(
+        self,
+        image_path: Path | str,
+        on_retry: Callable[[int, int, float, str], None] | None = None,
+    ) -> FoodAnalysisResult:
         """
         Analyze a captured food package image.
+        Implements bounded exponential backoff with full jitter for transient errors.
+        Respects server Retry-After guidance when provided.
         Returns a validated FoodAnalysisResult without raising exceptions.
         """
         path = Path(image_path)
@@ -332,54 +440,103 @@ class GeminiAnalyzer:
                 models_to_try.append(fb)
 
         last_err: Exception | None = None
+
         for current_model in models_to_try:
-            try:
-                image_bytes = path.read_bytes()
+            model_exhausted = False
+            for attempt in range(self.max_retries + 1):
+                try:
+                    image_bytes = path.read_bytes()
 
-                config = types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=FoodAnalysisResult,
-                    temperature=0.1,
-                    system_instruction=SYSTEM_INSTRUCTION,
-                )
+                    config = types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=FoodAnalysisResult,
+                        temperature=0.1,
+                        system_instruction=SYSTEM_INSTRUCTION,
+                    )
 
-                prompt = (
-                    "Carefully inspect this food package image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
-                    "Identify the product name, brand, food category, and ALL printed dates (manufacturing, packing, expiry, use-by, best-before). "
-                    "Extract each printed date into date_candidates with exact raw_text, accurate date_type, and nearby evidence. "
-                    "Follow all strict date interpretation rules without hallucination."
-                )
+                    prompt = (
+                        "Carefully inspect this food package image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
+                        "Identify the product name, brand, food category, and ALL printed dates (manufacturing, packing, expiry, use-by, best-before). "
+                        "Extract each printed date into date_candidates with exact raw_text, accurate date_type, and nearby evidence. "
+                        "Follow all strict date interpretation rules without hallucination."
+                    )
 
-                response = client.models.generate_content(
-                    model=current_model,
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                        prompt,
-                    ],
-                    config=config,
-                )
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                            prompt,
+                        ],
+                        config=config,
+                    )
 
-                if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
-                    return FoodAnalysisResult.post_validate(response.parsed)
+                    if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
+                        return FoodAnalysisResult.post_validate(response.parsed)
 
-                if hasattr(response, "text") and response.text:
-                    res = FoodAnalysisResult.model_validate_json(response.text)
-                    return FoodAnalysisResult.post_validate(res)
+                    if hasattr(response, "text") and response.text:
+                        res = FoodAnalysisResult.model_validate_json(response.text)
+                        return FoodAnalysisResult.post_validate(res)
 
-                return FoodAnalysisResult(
-                    analysis_status="error",
-                    needs_review=True,
-                    review_reason="Empty response received from Gemini API",
-                )
+                    return FoodAnalysisResult(
+                        analysis_status="error",
+                        needs_review=True,
+                        review_reason="Empty response received from Gemini API",
+                    )
 
-            except Exception as e:
-                last_err = e
-                err_msg = str(e)
-                # If model is unavailable (503 / 404), log warning and attempt fallback model
-                is_transient = any(k in err_msg for k in ("503", "UNAVAILABLE", "high demand", "404", "NOT_FOUND"))
-                if is_transient and current_model != models_to_try[-1]:
-                    logger.warning("Model '%s' unavailable (%s). Falling back to next model...", current_model, err_msg.split('\n')[0])
-                    continue
+                except Exception as e:
+                    last_err = e
+                    retryable, reason_cat = is_retryable_exception(e)
+
+                    # Check for model not found / unavailable where switching model is preferred
+                    err_str = str(e)
+                    is_model_unavailable = any(k in err_str for k in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "high demand"))
+                    if is_model_unavailable and current_model != models_to_try[-1]:
+                        logger.warning(
+                            "Model '%s' unavailable (%s). Switching to fallback model...",
+                            current_model, err_str.split("\n")[0]
+                        )
+                        model_exhausted = True
+                        break
+
+                    if not retryable:
+                        # Permanent error (e.g., auth, bad request, invalid API key) — do not retry
+                        logger.warning(
+                            "Non-retryable error encountered for model '%s': %s",
+                            current_model, reason_cat
+                        )
+                        break
+
+                    # If we have reached the maximum retry count for this model
+                    if attempt >= self.max_retries:
+                        logger.warning(
+                            "Retry budget exhausted (%d/%d retries) on model '%s' for reason: %s",
+                            attempt, self.max_retries, current_model, reason_cat
+                        )
+                        break
+
+                    # Compute backoff with full jitter and Retry-After header consideration
+                    server_delay = parse_retry_after(e)
+                    if server_delay is not None:
+                        delay = min(server_delay, self.max_backoff)
+                    else:
+                        base_delay = min(self.initial_backoff * (self.backoff_factor ** attempt), self.max_backoff)
+                        delay = random.uniform(base_delay * 0.5, base_delay * 1.5)
+
+                    logger.warning(
+                        "Gemini request transient failure (attempt %d/%d, model '%s', delay: %.2fs): %s",
+                        attempt + 1, self.max_retries, current_model, delay, reason_cat
+                    )
+
+                    if on_retry:
+                        try:
+                            on_retry(attempt + 1, self.max_retries, delay, reason_cat)
+                        except Exception:
+                            pass
+
+                    self._sleeper(delay)
+
+            if not model_exhausted:
+                # If we broke out without exhausting retries/models (and didn't return), break models loop
                 break
 
         err_msg = str(last_err) if last_err else "Unknown error"
@@ -393,6 +550,8 @@ class GeminiAnalyzer:
             reason = "Gemini API is temporarily experiencing high demand (503). Please retry in a few seconds."
         elif "timeout" in err_msg.lower():
             reason = "Gemini API request timed out."
+        elif any(k in err_msg.lower() for k in ("unexpected_eof_while_reading", "eof occurred in violation of protocol")):
+            reason = "Gemini API SSL/connection interrupted (unexpected EOF)."
         else:
             reason = f"Gemini API request failed: {err_msg}"
 
@@ -401,6 +560,7 @@ class GeminiAnalyzer:
             needs_review=True,
             review_reason=reason,
         )
+
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +624,18 @@ class AsyncGeminiWorker:
         except queue.Full:
             return False
 
+    def reanalyze_image(self, image_path: str) -> bool:
+        """
+        Reanalyze a specific existing image capture.
+        Returns True if accepted into worker queue, False if busy.
+        """
+        return self.submit_capture(image_path)
+
     def _worker_loop(self) -> None:
+        def on_retry(attempt: int, max_retries: int, delay: float, reason_cat: str) -> None:
+            with self._lock:
+                self._current_status = f"RETRYING ({attempt}/{max_retries})"
+
         while not self._stop_event.is_set():
             try:
                 image_path = self._queue.get(timeout=0.1)
@@ -476,7 +647,10 @@ class AsyncGeminiWorker:
                 self._current_status = "ANALYZING WITH GEMINI"
 
             try:
-                result = self.analyzer.analyze_image(image_path)
+                try:
+                    result = self.analyzer.analyze_image(image_path, on_retry=on_retry)
+                except TypeError:
+                    result = self.analyzer.analyze_image(image_path)
             except Exception as e:
                 result = FoodAnalysisResult(
                     analysis_status="error",
@@ -505,6 +679,7 @@ class AsyncGeminiWorker:
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
+
 
 
 # ---------------------------------------------------------------------------

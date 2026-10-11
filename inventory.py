@@ -376,9 +376,49 @@ def cmd_scans(db: InventoryDatabase, args: argparse.Namespace) -> int:
         rev = "YES" if s.needs_review else "NO"
         print(f"{s.id:<4} | {ts:<20} | {item:<26} | {status:<12} | {exp:<12} | {rev:<8}")
 
-    print("-" * 95)
-    print("To add any scan to inventory, run: python inventory.py add-scan <ID>\n")
-    return 0
+def cmd_reanalyze(db: InventoryDatabase, args: argparse.Namespace) -> int:
+    scan = db.get_scan(args.scan_id)
+    if not scan:
+        print(f"\nError: Scan ID #{args.scan_id} not found in scan history.\n")
+        return 1
+
+    img_path = Path(scan.image_path)
+    if not img_path.exists():
+        print(f"\nError: Image file for Scan #{scan.id} not found at: {img_path}\n")
+        return 1
+
+    print("=" * 65)
+    print(f"AnnaRakshak — Reanalyzing Scan #{scan.id}")
+    print("=" * 65)
+    print(f"Image File   : {img_path}")
+    print(f"Prior Status : {scan.analysis_status} (Review: {scan.needs_review})")
+    if scan.review_reason:
+        print(f"Prior Reason : {scan.review_reason}")
+    print("-" * 65)
+
+    from gemini_analyzer import GeminiAnalyzer, format_date_candidates_review
+
+    analyzer = GeminiAnalyzer(model_name=args.model)
+    print(f"Using Gemini Model: {analyzer.model_name}")
+    print("Re-running analysis with exponential backoff & jitter...")
+
+    result = analyzer.analyze_image(img_path)
+
+    db.update_scan(
+        scan_id=scan.id,
+        result=result,
+        error_message=result.review_reason if result.analysis_status == "error" else None,
+    )
+
+    print("\nUpdated Scan History Entry:")
+    print("-" * 65)
+    print(result.model_dump_json(indent=2))
+    print("-" * 65)
+    print(format_date_candidates_review(result))
+    print(f"Summary: {result.summary}")
+    print("=" * 65 + "\n")
+    return 0 if result.analysis_status != "error" else 1
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -453,6 +493,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_scans = subparsers.add_parser("scans", help="Show recent camera scan history.")
     p_scans.add_argument("--limit", type=int, default=15, help="Number of scans to show.")
 
+    # reanalyze
+    p_reanalyze = subparsers.add_parser("reanalyze", help="Reanalyze an existing scan image from scan history.")
+    p_reanalyze.add_argument("scan_id", type=int, help="Scan history ID to reanalyze.")
+    p_reanalyze.add_argument("--model", type=str, default=None, help="Override Gemini model identifier.")
+
     return parser
 
 
@@ -471,6 +516,7 @@ def main() -> int:
         "edit": cmd_edit,
         "delete": cmd_delete,
         "scans": cmd_scans,
+        "reanalyze": cmd_reanalyze,
     }
 
     handler = handlers.get(args.subcommand)

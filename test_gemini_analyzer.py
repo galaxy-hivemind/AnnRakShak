@@ -396,7 +396,7 @@ class TestNetworkFailureAndErrorHandling(unittest.TestCase):
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = Exception("429 RESOURCE_EXHAUSTED: quota exceeded")
 
-        analyzer = GeminiAnalyzer(api_key="mock_key", client=mock_client)
+        analyzer = GeminiAnalyzer(api_key="mock_key", client=mock_client, sleeper=lambda s: None)
         result = analyzer.analyze_image(self.test_img)
 
         self.assertEqual(result.analysis_status, "error")
@@ -407,7 +407,7 @@ class TestNetworkFailureAndErrorHandling(unittest.TestCase):
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = Exception("Client timeout while waiting for response")
 
-        analyzer = GeminiAnalyzer(api_key="mock_key", client=mock_client)
+        analyzer = GeminiAnalyzer(api_key="mock_key", client=mock_client, sleeper=lambda s: None)
         result = analyzer.analyze_image(self.test_img)
 
         self.assertEqual(result.analysis_status, "error")
@@ -426,6 +426,132 @@ class TestNetworkFailureAndErrorHandling(unittest.TestCase):
 
         self.assertEqual(result.analysis_status, "error")
         self.assertTrue(result.needs_review)
+
+    def test_ssl_unexpected_eof_retries_and_recovers(self) -> None:
+        """Transient [SSL: UNEXPECTED_EOF_WHILE_READING] retries with backoff and succeeds."""
+        import ssl
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.parsed = FoodAnalysisResult(
+            product_name="Almond Milk",
+            brand="Silk",
+            food_category="Beverage",
+            date_candidates=[],
+            selected_expiry_date="2027-02-14",
+            analysis_status="success",
+            needs_review=False,
+        )
+
+        sleep_delays: list[float] = []
+        # Attempt 1: SSL Unexpected EOF -> Attempt 2: Succeeds
+        mock_client.models.generate_content.side_effect = [
+            ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"),
+            mock_resp,
+        ]
+
+        analyzer = GeminiAnalyzer(
+            api_key="mock_key",
+            client=mock_client,
+            max_retries=3,
+            initial_backoff=1.0,
+            sleeper=lambda s: sleep_delays.append(s),
+        )
+
+        result = analyzer.analyze_image(self.test_img)
+
+        self.assertEqual(result.analysis_status, "success")
+        self.assertEqual(result.product_name, "Almond Milk")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        self.assertEqual(len(sleep_delays), 1)
+        self.assertGreater(sleep_delays[0], 0.0)
+
+    def test_permanent_error_not_retried(self) -> None:
+        """Permanent errors (e.g. 403 Forbidden, 401 Unauthorized, invalid key) must not be retried."""
+        from google.genai import errors
+        mock_client = MagicMock()
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 403
+        fake_resp.headers = {}
+        err403 = errors.ClientError(403, {"error": {"code": 403, "message": "API key not valid", "status": "PERMISSION_DENIED"}}, fake_resp)
+        mock_client.models.generate_content.side_effect = err403
+
+        sleep_calls: list[float] = []
+        analyzer = GeminiAnalyzer(
+            api_key="mock_key",
+            client=mock_client,
+            max_retries=3,
+            sleeper=lambda s: sleep_calls.append(s),
+        )
+
+        result = analyzer.analyze_image(self.test_img)
+
+        self.assertEqual(result.analysis_status, "error")
+        # Must only call generate_content once, no retries
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+        self.assertEqual(len(sleep_calls), 0)
+        self.assertIn("invalid or unauthorized", (result.review_reason or "").lower())
+
+    def test_respects_server_retry_after_header(self) -> None:
+        """When HTTP 429 returns a Retry-After header, the backoff respects it."""
+        from google.genai import errors
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.parsed = FoodAnalysisResult(
+            product_name="Dark Chocolate",
+            brand="Amul",
+            food_category="Snacks",
+            date_candidates=[],
+            selected_expiry_date="2027-05-20",
+            analysis_status="success",
+            needs_review=False,
+        )
+
+        fake_resp = MagicMock()
+        fake_resp.status_code = 429
+        fake_resp.headers = {"retry-after": "2.5"}
+        err429 = errors.ClientError(429, {"error": {"code": 429, "message": "Resource exhausted", "status": "RESOURCE_EXHAUSTED"}}, fake_resp)
+
+        mock_client.models.generate_content.side_effect = [err429, mock_resp]
+
+        sleep_delays: list[float] = []
+        analyzer = GeminiAnalyzer(
+            api_key="mock_key",
+            client=mock_client,
+            max_retries=3,
+            sleeper=lambda s: sleep_delays.append(s),
+        )
+
+        result = analyzer.analyze_image(self.test_img)
+
+        self.assertEqual(result.analysis_status, "success")
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        self.assertEqual(len(sleep_delays), 1)
+        self.assertEqual(sleep_delays[0], 2.5)
+
+    def test_max_retries_budget_exhaustion_produces_error(self) -> None:
+        """Transient errors that persist beyond max_retries cleanly produce an error result."""
+        import socket
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = socket.timeout("timed out reading from socket")
+
+        sleep_delays: list[float] = []
+        analyzer = GeminiAnalyzer(
+            api_key="mock_key",
+            client=mock_client,
+            max_retries=2,
+            initial_backoff=1.0,
+            sleeper=lambda s: sleep_delays.append(s),
+        )
+
+        result = analyzer.analyze_image(self.test_img)
+
+        self.assertEqual(result.analysis_status, "error")
+        self.assertTrue(result.needs_review)
+        # Attempt 0, attempt 1 (retry 1), attempt 2 (retry 2) -> 3 calls total
+        self.assertEqual(mock_client.models.generate_content.call_count, 3)
+        self.assertEqual(len(sleep_delays), 2)
+
 
 
 class TestAsyncGeminiWorker(unittest.TestCase):
@@ -505,6 +631,68 @@ class TestAsyncGeminiWorker(unittest.TestCase):
             self.assertIsNotNone(worker.latest_result)
             self.assertEqual(worker.latest_result.analysis_status, "error")
 
+        finally:
+            worker.shutdown()
+
+    def test_worker_reanalyze_existing_capture(self) -> None:
+        """AsyncGeminiWorker reanalyzes an existing capture path cleanly."""
+        mock_analyzer = MagicMock()
+        mock_analyzer.analyze_image.return_value = FoodAnalysisResult(
+            product_name="Reanalyzed Milk",
+            analysis_status="success",
+            selected_expiry_date="2026-12-31",
+            needs_review=False,
+        )
+
+        worker = AsyncGeminiWorker(mock_analyzer)
+        try:
+            ok = worker.reanalyze_image(str(self.test_img))
+            self.assertTrue(ok)
+
+            for _ in range(50):
+                if not worker.is_analyzing and worker.latest_result is not None:
+                    break
+                time.sleep(0.02)
+
+            self.assertEqual(worker.status, "EXPIRY DATE FOUND")
+            self.assertIsNotNone(worker.latest_result)
+            self.assertEqual(worker.latest_result.product_name, "Reanalyzed Milk")
+        finally:
+            worker.shutdown()
+
+    def test_worker_on_retry_status_reporting(self) -> None:
+        """AsyncGeminiWorker updates status to RETRYING (1/2) during backoff without blocking."""
+        mock_analyzer = MagicMock()
+
+        def analyze_with_retry_callback(path, on_retry=None):
+            if on_retry:
+                on_retry(1, 2, 0.05, "Transient test error")
+            time.sleep(0.05)
+            return FoodAnalysisResult(
+                product_name="Retry Recovered Item",
+                analysis_status="success",
+                selected_expiry_date="2027-01-01",
+                needs_review=False,
+            )
+
+        mock_analyzer.analyze_image.side_effect = analyze_with_retry_callback
+        worker = AsyncGeminiWorker(mock_analyzer)
+
+        try:
+            worker.submit_capture(str(self.test_img))
+            # Give thread a small moment to trigger callback
+            time.sleep(0.02)
+            with worker._lock:
+                status_during = worker._current_status
+            self.assertIn(status_during, ("ANALYZING WITH GEMINI", "RETRYING (1/2)"))
+
+            for _ in range(50):
+                if not worker.is_analyzing and worker.latest_result is not None:
+                    break
+                time.sleep(0.02)
+
+            self.assertEqual(worker.status, "EXPIRY DATE FOUND")
+            self.assertEqual(worker.latest_result.product_name, "Retry Recovered Item")
         finally:
             worker.shutdown()
 
