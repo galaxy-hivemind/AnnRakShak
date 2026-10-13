@@ -1,0 +1,151 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { FastApiFoodSafetyService, toFrontendCategory, toBackendCategory, toFrontendDateType, toBackendDateType, parseId } from './fastapi';
+
+describe('FastApiFoodSafetyService Adapter', () => {
+  let service: FastApiFoodSafetyService;
+
+  beforeEach(() => {
+    service = new FastApiFoodSafetyService('http://127.0.0.1:8000');
+    vi.restoreAllMocks();
+  });
+
+  it('converts categories accurately between frontend and backend', () => {
+    expect(toFrontendCategory('Dairy')).toBe('Dairy & Eggs');
+    expect(toFrontendCategory('Bakery')).toBe('Grains & Cereals');
+    expect(toFrontendCategory('Beverage')).toBe('Beverages');
+    expect(toFrontendCategory('Snacks')).toBe('Snacks');
+    expect(toFrontendCategory('Produce')).toBe('Fresh Produce');
+    expect(toFrontendCategory('Unknown')).toBe('Pantry Staples');
+
+    expect(toBackendCategory('Dairy & Eggs')).toBe('Dairy');
+    expect(toBackendCategory('Grains & Cereals')).toBe('Grains');
+    expect(toBackendCategory('Beverages')).toBe('Beverage');
+    expect(toBackendCategory('Fresh Produce')).toBe('Produce');
+    expect(toBackendCategory('Pantry Staples')).toBe('Pantry');
+  });
+
+  it('converts date types accurately', () => {
+    expect(toFrontendDateType('expiry')).toBe('Expiry');
+    expect(toFrontendDateType('use_by')).toBe('Use By');
+    expect(toFrontendDateType('best_before')).toBe('Best Before');
+    expect(toFrontendDateType('manufacturing')).toBe('Manufacturing');
+    expect(toFrontendDateType('packed_on')).toBe('Packed On');
+
+    expect(toBackendDateType('Expiry')).toBe('expiry');
+    expect(toBackendDateType('Use By')).toBe('use_by');
+    expect(toBackendDateType('Best Before')).toBe('best_before');
+    expect(toBackendDateType('Manufacturing')).toBe('manufacturing');
+    expect(toBackendDateType('Packed On')).toBe('packed_on');
+  });
+
+  it('parses numeric product IDs from string prefixes', () => {
+    expect(parseId('PR-12')).toBe(12);
+    expect(parseId('12')).toBe(12);
+    expect(parseId('SC-5')).toBe(5);
+    expect(() => parseId('invalid')).toThrow();
+  });
+
+  it('fetches and maps products list correctly', async () => {
+    const mockProducts = [
+      {
+        id: 1,
+        product_name: 'Amul Taaza Milk',
+        brand: 'Amul',
+        food_category: 'Dairy',
+        date_type: 'expiry',
+        date_text: 'EXP 20/10/2026',
+        normalized_date: '2026-10-20',
+        date_status: 'confirmed',
+        current_status: 'expiring_soon',
+        date_source: 'printed',
+        analysis_status: 'success',
+        image_path: null,
+        notes: 'Door shelf',
+        created_at: '2026-10-12T00:00:00Z',
+        updated_at: '2026-10-12T00:00:00Z',
+        date_candidates: [],
+      },
+    ];
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: async () => mockProducts,
+    } as Response);
+
+    const products = await service.getProducts();
+    expect(products.length).toBe(1);
+    expect(products[0].id).toBe('PR-1');
+    expect(products[0].name).toBe('Amul Taaza Milk');
+    expect(products[0].category).toBe('Dairy & Eggs');
+    expect(products[0].verified).toBe(true);
+    expect(products[0].dateType).toBe('Expiry');
+  });
+
+  it('propagates meaningful errors when API request fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: async () => ({ detail: 'Product with ID 999 not found.' }),
+    } as Response);
+
+    await expect(service.getProductById('PR-999')).rejects.toThrow('Product with ID 999 not found.');
+  });
+
+  it('posts real captured image to /api/scans and returns mapped ScanRecord', async () => {
+    const mockScanResponse = {
+      id: 10,
+      timestamp: '2026-10-13T12:00:00Z',
+      image_path: 'captures/scan_10.jpg',
+      product_name: 'Organic Milk',
+      brand: 'Horizon',
+      food_category: 'Dairy',
+      analysis_status: 'success',
+      needs_review: true,
+      review_reason: 'Confirm printed expiry',
+      selected_expiry_date: null,
+      error_message: null,
+      raw_json: null,
+      date_candidates: [
+        {
+          id: 1,
+          product_id: null,
+          scan_id: 10,
+          raw_text: 'EXP 25/10/2026',
+          date_type: 'expiry',
+          normalized_date: '2026-10-25',
+          confidence: 0.95,
+          evidence: 'Cap print',
+          created_at: '2026-10-13T12:00:00Z',
+        },
+      ],
+    };
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: async () => mockScanResponse,
+    } as Response);
+
+    const scan = await service.startScan('data:image/jpeg;base64,/9j/4AAQSkZJRg==');
+    expect(fetchSpy).toHaveBeenCalledWith('http://127.0.0.1:8000/api/scans', expect.objectContaining({
+      method: 'POST',
+      body: expect.any(FormData),
+    }));
+    expect(scan.id).toBe('SC-10');
+    expect(scan.name).toBe('Organic Milk');
+    expect(scan.category).toBe('Dairy & Eggs');
+    expect(scan.reviewStatus).toBe('Needs Review');
+    expect(scan.image).toBe('http://127.0.0.1:8000/api/scans/10/image');
+    expect(scan.candidates.length).toBe(1);
+    expect(scan.candidates[0].printedText).toBe('EXP 25/10/2026');
+  });
+
+  it('throws meaningful error when image upload fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: 'Uploaded image is empty (0 bytes).' }),
+    } as Response);
+
+    await expect(service.startScan('data:image/jpeg;base64,')).rejects.toThrow('Uploaded image is empty (0 bytes).');
+  });
+});

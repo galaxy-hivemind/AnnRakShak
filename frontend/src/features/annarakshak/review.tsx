@@ -1,0 +1,16 @@
+import { useState } from 'react';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { Search, ArrowRight, CircleHelp, ShieldCheck } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { scansQuery } from '@/services/api';
+import { displayDate } from '@/services/dates';
+import type { ScanRecord } from '@/services/types';
+import { PageIntro, ProductCell, Empty, Footer } from './common';
+import { ScanDetailDialog } from './scan-details';
+export function NeedsReview(){
+ const {data}=useSuspenseQuery(scansQuery);const [reason,setReason]=useState('All review reasons');const [query,setQuery]=useState('');const [selected,setSelected]=useState<ScanRecord>();
+ const reviews=data.filter(s=>s.reviewStatus==='Needs Review');const rows=reviews.filter(s=>(reason==='All review reasons'||s.reason===reason)&&`${s.name} ${s.brand}`.toLowerCase().includes(query.toLowerCase()));const reasons=[...new Set(reviews.map(s=>s.reason).filter(Boolean))];
+ return <div className="page"><PageIntro title="A second look makes a difference" description="Resolve uncertain dates with the original packaging evidence."/><div className="demo-strip"><ShieldCheck size={18} className="shrink-0"/><span>{reviews.length} scans awaiting your review. These records are not counted as verified expiry dates.</span></div><div className="toolbar"><div className="search-input"><Search/><input aria-label="Search review queue" placeholder="Search product or brand…" value={query} onChange={e=>setQuery(e.target.value)}/></div><select aria-label="Filter review reason" value={reason} onChange={e=>setReason(e.target.value)}><option>All review reasons</option>{reasons.map(r=><option key={r}>{r}</option>)}</select></div>
+ {rows.length?<div className="review-list">{rows.map(s=><article className="review-card" key={s.id}><div className="review-card-top"><ProductCell product={s}/><span className="text-[10px] text-muted-foreground ml-auto">{s.id}</span></div><span className="status status-warning"><CircleHelp/>{s.reason}</span><div className="evidence"><div className="text-[10px] text-muted-foreground">Original printed evidence</div>{s.candidates.length?<><blockquote>{s.candidates[0]?.printedText}</blockquote><p>Proposed: {s.candidates[0]?.dateType} · {displayDate(s.candidates[0]?.date || '')}</p>{s.candidates.length>1 && <p>{s.candidates.length} interpretations — select and verify a candidate.</p>}{s.candidates[0]?.precision==='month' && <p>Exact day unknown. No day has been inferred.</p>}</>:<p>{s.analysisStatus==='Failed'?'Analysis failed. No readable evidence returned.':'No printed date was identified.'}</p>}</div><div className="actions"><Button variant="outline" onClick={()=>setSelected(s)}>Review Details<ArrowRight/></Button></div></article>)}</div>:<div className="panel"><Empty title={reviews.length?'No matching reviews':'All caught up'} message={reviews.length?'Try adjusting your search or review reason.':'No packaging dates are waiting for your confirmation.'}>{reviews.length>0 && <Button variant="outline" onClick={()=>{setQuery('');setReason('All review reasons');}}>Clear filters</Button>}</Empty></div>}
+ <Footer/>{selected && <ScanDetailDialog scan={selected} onClose={()=>setSelected(undefined)} onChange={setSelected}/>}</div>;
+}

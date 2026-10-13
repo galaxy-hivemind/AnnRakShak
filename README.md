@@ -216,7 +216,53 @@ python auto_scan.py --gemini-model gemini-3.5-flash-lite
 
 ---
 
-## 5. SQLite Local Inventory Persistence (`inventory_db.py`)
+## 5. Web Application & Local Development Workflow
+
+AnnaRakshak includes a unified full-stack architecture pairing a local Python FastAPI backend with a modern React/TanStack Start frontend.
+
+### 5.1 Starting the FastAPI Backend
+
+The backend HTTP server provides REST endpoints for health checks, dashboard metrics, inventory management, alerts, and scan history.
+
+```bash
+# Activate existing virtual environment
+source .venv/bin/activate
+
+# Run FastAPI development server (binds to 127.0.0.1:8000 by default)
+python api.py
+
+# Or via Uvicorn CLI
+uvicorn api:app --host 127.0.0.1 --port 8000
+```
+
+- **Interactive API Documentation (Swagger UI):** `http://127.0.0.1:8000/docs`
+- **ReDoc:** `http://127.0.0.1:8000/redoc`
+
+### 5.2 Starting the React / TanStack Frontend
+
+The web UI is located in `frontend/` and communicates directly with the FastAPI backend.
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install Node dependencies (if first time)
+npm install
+
+# Start the Vite development server (runs on http://localhost:5173)
+npm run dev
+```
+
+- **Frontend Application URL:** `http://localhost:5173`
+- **Configuration (`frontend/.env`):**
+  ```ini
+  VITE_API_BASE_URL=http://127.0.0.1:8000
+  VITE_API_MODE=live
+  ```
+
+---
+
+## 6. SQLite Local Inventory Persistence (`inventory_db.py`)
 
 All food records and scan attempts are safely stored in a local SQLite database:
 
@@ -352,14 +398,20 @@ Or run test suites independently:
 # Capture stability & date flow regression tests (13 tests):
 python test_stability_and_dates.py
 
-# SQLite inventory persistence tests (27 tests):
+# SQLite inventory persistence tests (28 tests):
 python test_inventory.py
 
-# Gemini analyzer unit tests (19 tests):
+# Gemini analyzer unit tests (25 tests):
 python test_gemini_analyzer.py
+
+# FastAPI REST API unit tests (33 tests):
+python test_api.py
+
+# Frontend React/TypeScript unit tests (17 tests):
+cd frontend && npm test
 ```
 
-### Test Coverage (99 Tests, 100% Passing):
+### Test Coverage (100% Passing):
 - ✅ **Step 2 (11 tests):** Standalone frame-to-frame stability and motion thresholds.
 - ✅ **Step 3 (9 tests):** Two-stage foreground gate and background calibration.
 - ✅ **Step 4 (20 tests):** Text-verified trigger, shadow rejection, Apple Vision OCR, drift stability, rearming.
@@ -385,6 +437,15 @@ python test_gemini_analyzer.py
   - Complete end-to-end survival of all date candidates in DB and CLI.
   - Interactive candidate selection and user-confirmed overrides during `add-scan`.
   - Re-analysis of saved images without duplicate scan records.
+- ✅ **FastAPI Backend (33 tests):**
+  - REST endpoints for products, scans, alerts, dashboard, and health.
+  - CORS preflight validation for local development origins.
+  - Multipart and JSON scan processing, local OCR pass, and Gemini analysis.
+  - Image retrieval and security isolation.
+- ✅ **Frontend Web Application (17 tests):**
+  - Date formatting and status logic.
+  - FastAPI service adapter integration.
+  - Live browser camera capture and real image scanning workflow.
 
 ---
 
@@ -396,8 +457,10 @@ python test_gemini_analyzer.py
 - [x] Apple Vision text-verified trigger (`auto_scan.py` & `ocr_engine.py` — Step 4)
 - [x] Gemini vision integration — product identification + expiry date extraction (`gemini_analyzer.py` — Step 5)
 - [x] Local SQLite inventory persistence & CLI (`inventory_db.py`, `inventory.py` — Step 6A)
+- [x] Local FastAPI REST backend & API docs (`api.py`, `API.md`)
+- [x] Integrated web frontend with live camera scanning (`frontend/`)
 - [ ] Voice guidance (spoken feedback via macOS `say` or TTS — Step 6B)
-- [ ] Expiry dashboard with urgency indicators
+- [x] Expiry dashboard with urgency indicators
 - [ ] Unpackaged food tracking (produce, dairy, bakery)
 
 ---

@@ -28,3 +28,17 @@ mac_vision_ocr
 
 # Temporary files
 /tmp/annarakshak_*
+
+# Frontend Build & Node Modules
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.output/
+frontend/.vinxi/
+frontend/.tanstack/
+frontend/.nitro/
+frontend/*.local
+frontend/.env
+frontend/.env.*.local
+frontend/.wrangler/
+frontend/.dev.vars
