@@ -181,17 +181,54 @@ export function parseId(id: string): number {
 // FastAPI Adapter Implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolves the backend API base URL:
+ * 1. Server-side runtime: checks process.env.FASTAPI_URL (injected via Vercel service binding)
+ * 2. Client/build-time: checks import.meta.env.VITE_API_BASE_URL
+ * 3. Browser environment:
+ *    - In local dev (localhost / 127.0.0.1): defaults to 'http://127.0.0.1:8000'
+ *    - In production (Vercel): uses '' (relative path) to route via top-level /api/(.*) rewrites
+ * 4. Fallback default: 'http://127.0.0.1:8000'
+ */
+export function getApiBaseUrl(): string {
+  if (typeof process !== 'undefined' && process.env?.FASTAPI_URL) {
+    return process.env.FASTAPI_URL.replace(/\/+$/, '');
+  }
+
+  if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) {
+    return import.meta.env.VITE_API_BASE_URL.replace(/\/+$/, '');
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+      return 'http://127.0.0.1:8000';
+    }
+    return '';
+  }
+
+  return 'http://127.0.0.1:8000';
+}
+
 export class FastApiFoodSafetyService implements FoodSafetyService {
-  private baseUrl: string;
+  private explicitBaseUrl?: string;
 
   constructor(baseUrl?: string) {
-    const raw = baseUrl || import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
-    // Remove trailing slash if present
-    this.baseUrl = raw.replace(/\/+$/, '');
+    if (baseUrl !== undefined) {
+      this.explicitBaseUrl = baseUrl.replace(/\/+$/, '');
+    }
+  }
+
+  public get baseUrl(): string {
+    if (this.explicitBaseUrl !== undefined) {
+      return this.explicitBaseUrl;
+    }
+    return getApiBaseUrl();
   }
 
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const url = `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    const base = this.baseUrl;
+    const url = base ? `${base}${cleanPath}` : cleanPath;
     try {
       const response = await fetch(url, {
         ...options,
@@ -218,7 +255,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     } catch (err: unknown) {
       if (err instanceof TypeError && err.message.includes('Failed to fetch')) {
         throw new Error(
-          `Unable to connect to AnnaRakshak API at ${this.baseUrl}. Make sure the FastAPI server is running (.venv/bin/python api.py).`
+          `Unable to connect to AnnaRakshak API at ${this.baseUrl || 'current origin'}. Make sure the FastAPI server is running (.venv/bin/python api.py).`
         );
       }
       throw err;
@@ -408,7 +445,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       formData.append('image', image);
     }
 
-    const url = `${this.baseUrl}/api/scans`;
+    const url = this.baseUrl ? `${this.baseUrl}/api/scans` : '/api/scans';
     const response = await fetch(url, {
       method: 'POST',
       body: formData,
@@ -564,7 +601,13 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     return {
       id: `SC-${bs.id}`,
       timestamp: bs.timestamp,
-      image: bs.image_path ? `${this.baseUrl}/api/scans/${bs.id}/image` : categorySvg(cat),
+      image: bs.image_path
+        ? (typeof process !== 'undefined' && process.env?.FASTAPI_URL && this.baseUrl === process.env.FASTAPI_URL
+            ? `/api/scans/${bs.id}/image`
+            : this.baseUrl
+            ? `${this.baseUrl}/api/scans/${bs.id}/image`
+            : `/api/scans/${bs.id}/image`)
+        : categorySvg(cat),
       name: bs.product_name || 'Unidentified Item',
       brand: bs.brand || '',
       category: cat,

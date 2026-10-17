@@ -1,0 +1,54 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "fastapi",
+      "entrypoint": "api:app"
+    },
+    "frontend": {
+      "root": "frontend",
+      "framework": "tanstack-start-lovable",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "app",
+          "format": "url",
+          "env": "FASTAPI_URL"
+        }
+      ]
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    },
+    {
+      "source": "/docs",
+      "destination": {
+        "service": "app"
+      }
+    },
+    {
+      "source": "/openapi.json",
+      "destination": {
+        "service": "app"
+      }
+    },
+    {
+      "source": "/redoc",
+      "destination": {
+        "service": "app"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "frontend"
+      }
+    }
+  ]
+}

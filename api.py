@@ -75,7 +75,7 @@ DEFAULT_FRONTEND_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-LOCAL_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+LOCAL_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://.*\.vercel\.app$"
 
 
 def get_cors_origins() -> list[str]:

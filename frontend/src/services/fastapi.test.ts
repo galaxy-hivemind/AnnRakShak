@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FastApiFoodSafetyService, toFrontendCategory, toBackendCategory, toFrontendDateType, toBackendDateType, parseId } from './fastapi';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { FastApiFoodSafetyService, getApiBaseUrl, toFrontendCategory, toBackendCategory, toFrontendDateType, toBackendDateType, parseId } from './fastapi';
 
 describe('FastApiFoodSafetyService Adapter', () => {
   let service: FastApiFoodSafetyService;
@@ -148,4 +148,53 @@ describe('FastApiFoodSafetyService Adapter', () => {
 
     await expect(service.startScan('data:image/jpeg;base64,')).rejects.toThrow('Uploaded image is empty (0 bytes).');
   });
+
+  describe('Vercel Multi-Service URL & Binding Resolution', () => {
+    const originalEnv = process.env.FASTAPI_URL;
+
+    afterEach(() => {
+      if (originalEnv !== undefined) {
+        process.env.FASTAPI_URL = originalEnv;
+      } else {
+        delete process.env.FASTAPI_URL;
+      }
+    });
+
+    it('resolves internal binding URL from process.env.FASTAPI_URL', () => {
+      process.env.FASTAPI_URL = 'http://app.internal:8080/';
+      expect(getApiBaseUrl()).toBe('http://app.internal:8080');
+
+      const boundService = new FastApiFoodSafetyService();
+      expect(boundService.baseUrl).toBe('http://app.internal:8080');
+    });
+
+    it('uses relative path when running in production browser on Vercel', () => {
+      delete process.env.FASTAPI_URL;
+      const originalLocation = window.location;
+      // @ts-expect-error test mock
+      delete window.location;
+      // @ts-expect-error test mock
+      window.location = { hostname: 'annarakshak.vercel.app' };
+
+      try {
+        expect(getApiBaseUrl()).toBe('');
+        const vService = new FastApiFoodSafetyService();
+        expect(vService.baseUrl).toBe('');
+      } finally {
+        window.location = originalLocation;
+      }
+    });
+
+    it('makes relative requests when baseUrl is empty string in production', async () => {
+      const vService = new FastApiFoodSafetyService('');
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: 'ok', database: 'connected', total_products: 5, version: '1.0.0' }),
+      } as Response);
+
+      await vService.getHealth();
+      expect(fetchSpy).toHaveBeenCalledWith('/api/health', expect.any(Object));
+    });
+  });
 });
+
