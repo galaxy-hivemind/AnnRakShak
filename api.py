@@ -293,6 +293,58 @@ class DeleteResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Database & Dependency Injection
 # ---------------------------------------------------------------------------
+# Storage & Environment Configuration Helpers
+# ---------------------------------------------------------------------------
+
+def is_serverless_environment() -> bool:
+    """Return True if running inside Vercel, AWS Lambda, or similar serverless container."""
+    return (
+        os.getenv("VERCEL") == "1"
+        or bool(os.getenv("VERCEL_ENV"))
+        or bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    )
+
+
+def get_captures_dir() -> Path:
+    """
+    Determine the storage directory for scan images:
+    - If ANNARAKSHAK_CAPTURES_DIR is explicitly configured, use it (resolved to absolute path).
+    - If running in a serverless environment (e.g. Vercel), use a writable directory under /tmp:
+      Path("/tmp/annarakshak/captures").
+    - Otherwise (local development), use Path(__file__).parent / "captures".
+    """
+    custom = os.getenv("ANNARAKSHAK_CAPTURES_DIR")
+    if custom and custom.strip():
+        return Path(custom.strip()).resolve()
+    if is_serverless_environment():
+        return Path("/tmp/annarakshak/captures").resolve()
+    return (Path(__file__).parent / "captures").resolve()
+
+
+def should_cleanup_captures() -> bool:
+    """
+    Determine whether capture files should be deleted after processing:
+    - If ANNARAKSHAK_CLEANUP_CAPTURES is set, respect it ("1", "true", "yes" -> True, "0", "false", "no" -> False).
+    - If running on Vercel/serverless, defaults to True to prevent /tmp disk exhaustion.
+    - Otherwise (local development), defaults to False to preserve capture files on disk for inspection and re-analysis.
+    """
+    env_val = os.getenv("ANNARAKSHAK_CLEANUP_CAPTURES")
+    if env_val is not None:
+        return env_val.strip().lower() in ("1", "true", "yes")
+    return is_serverless_environment()
+
+
+def _safe_remove_file(file_path: Path | str | None) -> None:
+    """Safely delete a file if it exists, without raising errors."""
+    if not file_path:
+        return
+    try:
+        p = Path(file_path)
+        if p.exists() and p.is_file():
+            p.unlink()
+    except Exception as e:
+        logger.warning("Could not remove capture file %s: %s", file_path, e)
+
 
 def get_database() -> InventoryDatabase:
     """
@@ -303,7 +355,7 @@ def get_database() -> InventoryDatabase:
     - Otherwise (local development): initializes project-local SQLite with absolute path resolution.
     """
     database_url = os.getenv("DATABASE_URL") or os.getenv("ANNARAKSHAK_DATABASE_URL")
-    is_vercel = os.getenv("VERCEL") == "1" or bool(os.getenv("VERCEL_ENV")) or bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+    is_vercel = is_serverless_environment()
 
     if database_url and database_url.strip():
         logger.info("Initializing PostgreSQL database from DATABASE_URL (%s)", mask_database_url(database_url))
@@ -984,69 +1036,86 @@ async def create_scan(
     else:
         optimized_bytes = image_bytes
 
-    # Save to captures directory
-    captures_dir = Path("captures")
-    captures_dir.mkdir(parents=True, exist_ok=True)
+    # Save to environment-aware captures directory
+    captures_dir = get_captures_dir()
+    try:
+        captures_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.error("Failed to create captures directory at %s: %s", captures_dir, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unable to initialize image capture directory: {e}",
+        )
+
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_tag = uuid.uuid4().hex[:6]
     image_filename = f"scan_{timestamp_str}_{unique_tag}.jpg"
     image_path = captures_dir / image_filename
-    image_path.write_bytes(optimized_bytes)
 
-    upload_preprocess_ms = (time.perf_counter() - t_prep_0) * 1000.0
+    cleanup_needed = should_cleanup_captures()
+    image_written = False
 
-    # 4. Local OCR Pass (reusing shared persistent Apple Vision engine)
-    t_ocr_0 = time.perf_counter()
-    shared_ocr = getattr(request.app.state, "ocr_engine", None)
-    ocr_result = await asyncio.to_thread(run_local_ocr, frame_bgr, shared_ocr)
-    ocr_ms = (time.perf_counter() - t_ocr_0) * 1000.0
-    ocr_text = ocr_result.summary_text if (ocr_result and ocr_result.has_text) else None
-    if ocr_text:
-        logger.info("Local OCR extracted text (%d regions): %s", len(ocr_result.regions), ocr_text[:120])
+    try:
+        image_path.write_bytes(optimized_bytes)
+        image_written = True
 
-    # 5. Gemini AI Analysis (asynchronous in worker thread with OCR context)
-    t_gem_0 = time.perf_counter()
-    if ocr_text:
-        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), ocr_text=ocr_text)
-    else:
-        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
-    gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
+        upload_preprocess_ms = (time.perf_counter() - t_prep_0) * 1000.0
 
-    # 6. Record to SQLite Database
-    t_db_0 = time.perf_counter()
-    error_message = result.review_reason if result.analysis_status == "error" else None
-    scan_id = db.record_scan(
-        image_path=str(image_path),
-        result=result,
-        error_message=error_message,
-    )
-    db_ms = (time.perf_counter() - t_db_0) * 1000.0
-    total_ms = (time.perf_counter() - t_total_0) * 1000.0
+        # 4. Local OCR Pass (reusing shared persistent Apple Vision engine)
+        t_ocr_0 = time.perf_counter()
+        shared_ocr = getattr(request.app.state, "ocr_engine", None)
+        ocr_result = await asyncio.to_thread(run_local_ocr, frame_bgr, shared_ocr)
+        ocr_ms = (time.perf_counter() - t_ocr_0) * 1000.0
+        ocr_text = ocr_result.summary_text if (ocr_result and ocr_result.has_text) else None
+        if ocr_text:
+            logger.info("Local OCR extracted text (%d regions): %s", len(ocr_result.regions), ocr_text[:120])
 
-    created_scan = db.get_scan(scan_id)
-    if not created_scan:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve scan after saving to database.",
+        # 5. Gemini AI Analysis (asynchronous in worker thread with OCR context)
+        t_gem_0 = time.perf_counter()
+        if ocr_text:
+            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), ocr_text=ocr_text)
+        else:
+            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
+        gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
+
+        # 6. Record to Database
+        t_db_0 = time.perf_counter()
+        error_message = result.review_reason if result.analysis_status == "error" else None
+        scan_id = db.record_scan(
+            image_path=str(image_path),
+            result=result,
+            error_message=error_message,
         )
-    candidates = db.get_scan_date_candidates(scan_id)
+        db_ms = (time.perf_counter() - t_db_0) * 1000.0
+        total_ms = (time.perf_counter() - t_total_0) * 1000.0
 
-    timing_meta = ScanTiming(
-        upload_preprocess_ms=round(upload_preprocess_ms, 2),
-        ocr_ms=round(ocr_ms, 2),
-        gemini_ms=round(gemini_ms, 2),
-        db_ms=round(db_ms, 2),
-        total_ms=round(total_ms, 2),
-        models_attempted=result.models_attempted,
-        retries_count=result.retries_count,
-    )
+        created_scan = db.get_scan(scan_id)
+        if not created_scan:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to retrieve scan after saving to database.",
+            )
+        candidates = db.get_scan_date_candidates(scan_id)
 
-    logger.info(
-        "Scan %d completed in %.1fms (preprocess=%.1fms, ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
-        scan_id, total_ms, upload_preprocess_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
-    )
+        timing_meta = ScanTiming(
+            upload_preprocess_ms=round(upload_preprocess_ms, 2),
+            ocr_ms=round(ocr_ms, 2),
+            gemini_ms=round(gemini_ms, 2),
+            db_ms=round(db_ms, 2),
+            total_ms=round(total_ms, 2),
+            models_attempted=result.models_attempted,
+            retries_count=result.retries_count,
+        )
 
-    return serialize_scan(created_scan, candidates=candidates, timing=timing_meta)
+        logger.info(
+            "Scan %d completed in %.1fms (preprocess=%.1fms, ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
+            scan_id, total_ms, upload_preprocess_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
+        )
+
+        return serialize_scan(created_scan, candidates=candidates, timing=timing_meta)
+    finally:
+        if cleanup_needed and image_written:
+            _safe_remove_file(image_path)
 
 
 @app.get("/api/scans/{scan_id}/image", tags=["Scans"])

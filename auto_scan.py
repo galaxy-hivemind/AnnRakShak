@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import argparse
 import enum
+import logging
+import os
 import sys
 import threading
 import time
@@ -55,6 +57,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("AnnaRakshak.AutoScan")
 
 # Re-use camera helpers from camera_test.py
 from camera_test import (
@@ -119,7 +123,7 @@ DEFAULT_FG_RATIO           = 0.015
 DEFAULT_FG_PIXEL_THRESHOLD = 20
 DEFAULT_CAL_FRAMES         = 15
 
-CAPTURES_DIR = Path(__file__).parent / "captures"
+CAPTURES_DIR = Path(os.getenv("ANNARAKSHAK_CAPTURES_DIR", str(Path(__file__).parent / "captures"))).resolve()
 BLUR_KERNEL  = (5, 5)
 WINDOW_TITLE = "AnnaRakshak - Text-Verified Scan Trigger"
 
@@ -993,7 +997,10 @@ def draw_overlay(
 
 def save_capture(frame: np.ndarray, label: str = "") -> str:
     """Save clean raw frame without HUD to captures/ directory."""
-    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("Could not create CAPTURES_DIR at %s: %s", CAPTURES_DIR, e)
     ts     = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     suffix = f"_{label}" if label else ""
     path   = CAPTURES_DIR / f"{ts}{suffix}.jpg"
