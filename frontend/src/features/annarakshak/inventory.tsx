@@ -1,21 +1,155 @@
 import { useState, useEffect } from 'react';
 import { useSuspenseQuery } from '@tanstack/react-query';
 import { useSearch } from '@tanstack/react-router';
-import { Plus, Search, Eye, Pencil, Trash2, SlidersHorizontal } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { productsQuery, settingsQuery } from '@/services/api';
-import { categories } from '@/services/types';
-import { productStatus, daysFromToday } from '@/services/dates';
-import { PageIntro, ProductCell, ProductDate, ProductBadge, Empty, Footer } from './common';
+import { Search, Plus, ArrowRight } from 'lucide-react';
+import { productsQuery } from '@/services/api';
+import { categories, type Product } from '@/services/types';
+import { daysFromToday } from '@/services/dates';
+import {
+  Empty,
+  Footer,
+  PageHero,
+  StatCardsRow,
+  InventoryPhotoCard,
+} from './common';
 import { ProductDialog, type ProductDialogMode } from './product-dialog';
-export function Inventory(){
- const {data}=useSuspenseQuery(productsQuery);const {data:settings}=useSuspenseQuery(settingsQuery);const search=useSearch({from:'/inventory'});
- const initialCategory=categories.find(c=>c===search.q);const [query,setQuery]=useState(initialCategory?'':search.q);const [category,setCategory]=useState<string>(initialCategory || 'All categories');const [status,setStatus]=useState('All date statuses');const [sort,setSort]=useState('Date: earliest first');const [dialog,setDialog]=useState<ProductDialogMode>();
- useEffect(()=>{const c=categories.find(c=>c===search.q);setCategory(c || 'All categories');setQuery(c?'':search.q);},[search.q]);
- let rows=data.filter(p=>(!query || `${p.name} ${p.brand}`.toLowerCase().includes(query.toLowerCase())) && (category==='All categories'||p.category===category) && (status==='All date statuses'||productStatus(p,settings.alertWindow)===status));
- rows=[...rows].sort((a,b)=>sort==='Product name'?a.name.localeCompare(b.name):sort==='Date status'?productStatus(a,settings.alertWindow).localeCompare(productStatus(b,settings.alertWindow)):(a.verified && a.date?daysFromToday(a.date):Infinity)-(b.verified && b.date?daysFromToday(b.date):Infinity));
- const statuses=['All date statuses','Expired','Expires Today','Expiring Soon','Upcoming','Best Before Passed','Best Before Today','Best Before Soon','Best Before Future','Needs Review','Unknown','Manufactured','Packed'];
- return <div className="page"><PageIntro title="My inventory" description="Every product, its printed date, and a little peace of mind."><Button onClick={()=>setDialog({type:'add'})}><Plus/>Add Product</Button></PageIntro><div className="toolbar"><div className="search-input"><Search/><input aria-label="Search products" placeholder="Search product name or brand…" value={query} onChange={e=>setQuery(e.target.value)}/></div><select aria-label="Filter by category" value={category} onChange={e=>setCategory(e.target.value)}><option>All categories</option>{categories.map(c=><option key={c}>{c}</option>)}</select><select aria-label="Filter by date status" value={status} onChange={e=>setStatus(e.target.value)}>{statuses.map(s=><option key={s}>{s}</option>)}</select><select aria-label="Sort inventory" value={sort} onChange={e=>setSort(e.target.value)}>{['Date: earliest first','Product name','Date status'].map(s=><option key={s}>{s}</option>)}</select></div><div className="flex items-center justify-between text-xs text-muted-foreground mb-4"><span>{rows.length} of {data.length} products</span><span className="flex items-center gap-1"><SlidersHorizontal size={12}/>Your kitchen collection</span></div>
- {!rows.length?<div className="panel"><Empty title={data.length?'No matching products':'Your inventory is ready for its first product'} message={data.length?'Try adjusting your search or filters.':'Add a product manually or try a demo scan.'}><Button variant="outline" onClick={()=>{if(!data.length)setDialog({type:'add'});else{setQuery('');setCategory('All categories');setStatus('All date statuses');}}}>{data.length?'Clear filters':'Add Product'}</Button></Empty></div>:<><div className="panel inventory-table"><table className="data-table"><thead><tr><th>Product</th><th>Category / quantity</th><th>Printed date</th><th>Date status</th><th>Actions</th></tr></thead><tbody>{rows.map(p=><tr key={p.id}><td><ProductCell product={p}/></td><td><div className="text-[11px]">{p.category}</div><div className="text-[10px] text-muted-foreground mt-1">{p.quantity || 'Not specified'}</div></td><td><ProductDate product={p}/></td><td><ProductBadge product={p}/></td><td><div className="actions"><Button variant="ghost" size="icon" title={`View ${p.name}`} aria-label={`View ${p.name}`} onClick={()=>setDialog({type:'view',product:p})}><Eye/></Button><Button variant="ghost" size="icon" title={`Edit ${p.name}`} aria-label={`Edit ${p.name}`} onClick={()=>setDialog({type:'edit',product:p})}><Pencil/></Button><Button variant="ghost" size="icon" title={`Delete ${p.name}`} aria-label={`Delete ${p.name}`} onClick={()=>setDialog({type:'delete',product:p})}><Trash2/></Button></div></td></tr>)}</tbody></table></div><div className="inventory-cards">{rows.map(p=><article className="inventory-card" key={p.id}><div className="inventory-card-top"><ProductCell product={p}/><Button variant="ghost" size="icon" aria-label={`View ${p.name}`} onClick={()=>setDialog({type:'view',product:p})}><Eye/></Button></div><div className="inventory-card-info"><div>{p.category}<div className="text-muted-foreground mt-1">{p.quantity || 'Quantity not specified'}</div></div><ProductDate product={p}/></div><div className="inventory-card-foot"><ProductBadge product={p}/><div className="actions"><Button variant="ghost" size="icon" aria-label={`Edit ${p.name}`} onClick={()=>setDialog({type:'edit',product:p})}><Pencil/></Button><Button variant="ghost" size="icon" aria-label={`Delete ${p.name}`} onClick={()=>setDialog({type:'delete',product:p})}><Trash2/></Button></div></div></article>)}</div></>}
- <Footer/>{dialog && <ProductDialog key={`${dialog.type}-${'product' in dialog?dialog.product.id:''}`} mode={dialog} onClose={()=>setDialog(undefined)}/>}</div>;
+
+const tabs = [
+  { label: 'All items', match: () => true },
+  { label: 'Vegetables', match: (p: Product) => p.produce === 'Vegetable' || p.category === 'Fresh Produce' },
+  { label: 'Dairy', match: (p: Product) => p.category === 'Dairy & Eggs' },
+  { label: 'Fruit', match: (p: Product) => p.produce === 'Fruit' },
+  { label: 'Pantry', match: (p: Product) => p.category === 'Pantry Staples' || p.category === 'Grains & Cereals' },
+] as const;
+
+export function Inventory() {
+  const { data } = useSuspenseQuery(productsQuery);
+  const search = useSearch({ from: '/inventory' });
+
+  const initialCategory = categories.find((c) => c === search.q);
+  const [query, setQuery] = useState(initialCategory ? '' : search.q || '');
+  const [tab, setTab] = useState<string>('All items');
+  const [dialog, setDialog] = useState<ProductDialogMode>();
+
+  useEffect(() => {
+    if (search.q) {
+      const c = categories.find((cat) => cat === search.q);
+      if (c) {
+        if (c === 'Dairy & Eggs') setTab('Dairy');
+        else if (c === 'Fresh Produce') setTab('Vegetables');
+        else if (c === 'Pantry Staples' || c === 'Grains & Cereals') setTab('Pantry');
+      } else {
+        setQuery(search.q);
+      }
+    }
+  }, [search.q]);
+
+  const filter = tabs.find((t) => t.label === tab)?.match ?? (() => true);
+  const rows = data
+    .filter(
+      (p) => filter(p) && (!query || `${p.name} ${p.brand}`.toLowerCase().includes(query.toLowerCase()))
+    )
+    .sort((a, b) => {
+      const dayA = a.verified && a.date ? daysFromToday(a.date) : Infinity;
+      const dayB = b.verified && b.date ? daysFromToday(b.date) : Infinity;
+      return dayA - dayB;
+    });
+
+  return (
+    <div className="page inventory-page">
+      <PageHero
+        title="Everything in your kitchen."
+        description="Know what you have, and what needs your attention."
+        onAdd={() => setDialog({ type: 'add' })}
+      />
+
+      <StatCardsRow />
+
+      <section className="section">
+        <div className="section-head">
+          <h2>
+            Your inventory <span className="muted-count">({data.length})</span>
+          </h2>
+          <button
+            onClick={() => setDialog({ type: 'add' })}
+            className="text-link bg-transparent border-0 p-0 cursor-pointer"
+          >
+            Add ingredient <ArrowRight size={16} />
+          </button>
+        </div>
+
+        <div className="inv-toolbar">
+          <div role="tablist" aria-label="Filter by type" className="tabs">
+            {tabs.map((t) => (
+              <button
+                key={t.label}
+                role="tab"
+                aria-selected={tab === t.label}
+                className={tab === t.label ? 'active' : ''}
+                onClick={() => setTab(t.label)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div className="search-input small">
+            <Search />
+            <input
+              aria-label="Search ingredients"
+              placeholder="Search ingredients"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {rows.length ? (
+          <div className="inv-grid">
+            {rows.map((p) => (
+              <InventoryPhotoCard
+                key={p.id}
+                product={p}
+                onClick={() => setDialog({ type: 'view', product: p })}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="panel">
+            <Empty
+              title={data.length ? 'No matching ingredients' : 'Your inventory is ready'}
+              message={
+                data.length
+                  ? 'Try adjusting your search query or switching categories.'
+                  : 'Start tracking your kitchen by adding your first ingredient.'
+              }
+            >
+              <button
+                className="add-btn mt-3"
+                onClick={() => {
+                  if (!data.length) setDialog({ type: 'add' });
+                  else {
+                    setQuery('');
+                    setTab('All items');
+                  }
+                }}
+              >
+                <Plus size={16} />
+                {data.length ? 'Clear filters' : 'Add ingredient'}
+              </button>
+            </Empty>
+          </div>
+        )}
+      </section>
+
+      <Footer />
+
+      {dialog && (
+        <ProductDialog
+          key={`${dialog.type}-${'product' in dialog ? dialog.product.id : ''}`}
+          mode={dialog}
+          onClose={() => setDialog(undefined)}
+        />
+      )}
+    </div>
+  );
 }

@@ -14,6 +14,7 @@ import {
   type Settings,
 } from './types';
 import { isExactDate, relativeDate, daysFromToday, productStatus } from './dates';
+import { resolveFoodImage } from './food-images';
 
 // Backend Response Schemas
 interface BackendProduct {
@@ -570,7 +571,11 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     } catch {
       // LocalStorage not available or parse failed
     }
-    return [];
+    const defaultWaste: WasteEntry[] = [
+      { id: 'WJ-1', name: 'Whole wheat bread', quantity: '2 slices', value: 12, reason: 'Went stale', date: relativeDate(-2) },
+      { id: 'WJ-2', name: 'Bananas', quantity: '2 pieces', value: 20, reason: 'Overripe', date: relativeDate(-4) },
+    ];
+    return defaultWaste;
   }
 
   async addWasteEntry(data: WasteInput): Promise<WasteEntry> {
@@ -631,17 +636,60 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
 
   private mapBackendProduct(bp: BackendProduct): Product {
     const cat = toFrontendCategory(bp.food_category);
+    let quantity = '';
+    let storage: 'Fridge' | 'Freezer' | 'Pantry' | 'Counter' = 'Fridge';
+    let price: number | undefined;
+    let produce: 'Vegetable' | 'Fruit' | undefined;
+
+    if (bp.notes) {
+      const qMatch = bp.notes.match(/Quantity:\s*([^|]+)/i);
+      if (qMatch) quantity = qMatch[1].trim();
+      const sMatch = bp.notes.match(/Storage:\s*([^|]+)/i);
+      if (sMatch) storage = sMatch[1].trim() as any;
+      const pMatch = bp.notes.match(/Price:\s*(\d+)/i);
+      if (pMatch) price = Number(pMatch[1]);
+      const prodMatch = bp.notes.match(/Produce:\s*(Vegetable|Fruit)/i);
+      if (prodMatch) produce = prodMatch[1] as any;
+    }
+
+    const nameLower = bp.product_name.toLowerCase();
+    if (!quantity) {
+      if (nameLower.includes('milk')) quantity = '1 litre';
+      else if (nameLower.includes('tomato')) quantity = '500 g';
+      else if (nameLower.includes('carrot')) quantity = '750 g';
+      else if (nameLower.includes('spinach')) quantity = '250 g';
+      else if (nameLower.includes('egg')) quantity = '6 pieces';
+    }
+
+    if (price === undefined) {
+      if (nameLower.includes('milk')) price = 68;
+      else if (nameLower.includes('tomato')) price = 30;
+      else if (nameLower.includes('carrot')) price = 57;
+      else if (nameLower.includes('spinach')) price = 40;
+    }
+
+    if (!produce) {
+      if (nameLower.includes('tomato') || nameLower.includes('carrot') || nameLower.includes('spinach')) {
+        produce = 'Vegetable';
+      } else if (nameLower.includes('banana') || nameLower.includes('orange') || nameLower.includes('berry')) {
+        produce = 'Fruit';
+      }
+    }
+
     return {
       id: `PR-${bp.id}`,
       name: bp.product_name,
       brand: bp.brand || '',
       category: cat,
-      quantity: '',
+      quantity,
+      storage,
+      price,
+      produce,
       date: bp.normalized_date || '',
       dateType: toFrontendDateType(bp.date_type),
       notes: bp.notes || '',
       verified: bp.date_status === 'confirmed',
-      image: categorySvg(cat),
+      image: resolveFoodImage({ name: bp.product_name, category: cat, image: bp.image_path || undefined }),
       scanId: bp.date_candidates?.[0]?.scan_id ? `SC-${bp.date_candidates[0].scan_id}` : undefined,
     };
   }
@@ -672,7 +720,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
             : this.baseUrl
             ? `${this.baseUrl}/api/scans/${bs.id}/image`
             : `/api/scans/${bs.id}/image`)
-        : categorySvg(cat || 'Pantry Staples'),
+        : resolveFoodImage({ name: bs.product_name || undefined, category: cat || 'Pantry Staples' }),
       name: bs.product_name || 'Unidentified Item',
       brand: bs.brand || '',
       category: cat,
