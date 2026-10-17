@@ -34,6 +34,7 @@ interface BackendProduct {
   created_at: string;
   updated_at: string;
   date_candidates: BackendDateCandidate[];
+  scan_id?: number | null;
 }
 
 interface BackendDateCandidate {
@@ -88,6 +89,7 @@ interface BackendScan {
   error_message: string | null;
   raw_json: string | null;
   date_candidates: BackendDateCandidate[];
+  product_id?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +421,13 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     return this.mapBackendScan(bs);
   }
 
+  async deleteScan(id: string): Promise<void> {
+    const numericId = parseId(id);
+    await this.request<{ success: boolean; deleted_id: number }>(`/api/scans/${numericId}?delete_product=true`, {
+      method: 'DELETE',
+    });
+  }
+
   async getDateCandidates(scanId: string): Promise<DateCandidate[]> {
     const numericId = parseId(scanId);
     const rawCandidates = await this.request<BackendDateCandidate[]>(`/api/scans/${numericId}/date-candidates`);
@@ -690,7 +699,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       notes: bp.notes || '',
       verified: bp.date_status === 'confirmed',
       image: resolveFoodImage({ name: bp.product_name, category: cat, image: bp.image_path || undefined }),
-      scanId: bp.date_candidates?.[0]?.scan_id ? `SC-${bp.date_candidates[0].scan_id}` : undefined,
+      scanId: bp.scan_id ? `SC-${bp.scan_id}` : (bp.date_candidates?.[0]?.scan_id ? `SC-${bp.date_candidates[0].scan_id}` : undefined),
     };
   }
 
@@ -727,6 +736,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       quantity,
       analysisStatus,
       reviewStatus,
+      productId: bs.product_id ? `PR-${bs.product_id}` : undefined,
       reason: bs.review_reason || bs.error_message || undefined,
       candidates,
     };

@@ -123,7 +123,7 @@ export function AnalysisPanel({
     setError('');
     try {
       const verifiedIds = verifiedList.map((c) => c.id);
-      await service.confirmDate(scan.id, verifiedIds, {
+      const product = await service.confirmDate(scan.id, verifiedIds, {
         name: productName,
         brand,
         category,
@@ -131,7 +131,11 @@ export function AnalysisPanel({
         candidates,
       });
       const updated = await service.getScanById(scan.id);
-      onChange(updated);
+      onChange({
+        ...updated,
+        reviewStatus: 'Confirmed',
+        productId: product?.id || updated.productId,
+      });
       await qc.invalidateQueries();
       toast.success('Date confirmed · Product added to inventory');
       onConfirmed?.();

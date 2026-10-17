@@ -197,6 +197,7 @@ class ProductRecord:
     notes: str | None
     created_at: str
     updated_at: str
+    scan_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -220,6 +221,7 @@ class ScanHistoryRecord:
     selected_expiry_date: str | None
     error_message: str | None
     raw_json: str | None
+    product_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -232,6 +234,7 @@ class ScanHistoryRecord:
 SQLITE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER,
         product_name TEXT NOT NULL,
         brand TEXT,
         food_category TEXT,
@@ -244,11 +247,13 @@ SQLITE_SCHEMA = """
         image_path TEXT,
         notes TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS scan_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
         timestamp TEXT NOT NULL,
         image_path TEXT NOT NULL,
         product_name TEXT,
@@ -259,7 +264,8 @@ SQLITE_SCHEMA = """
         review_reason TEXT,
         selected_expiry_date TEXT,
         error_message TEXT,
-        raw_json TEXT
+        raw_json TEXT,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS date_candidates (
@@ -279,6 +285,8 @@ SQLITE_SCHEMA = """
     CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
     CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
     CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
+    CREATE INDEX IF NOT EXISTS idx_products_scan ON products(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_scan_history_product ON scan_history(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
@@ -287,6 +295,7 @@ SQLITE_SCHEMA = """
 POSTGRES_SCHEMA = """
     CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY,
+        scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL,
         product_name TEXT NOT NULL,
         brand TEXT,
         food_category TEXT,
@@ -304,6 +313,7 @@ POSTGRES_SCHEMA = """
 
     CREATE TABLE IF NOT EXISTS scan_history (
         id SERIAL PRIMARY KEY,
+        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
         timestamp TEXT NOT NULL,
         image_path TEXT NOT NULL,
         product_name TEXT,
@@ -332,6 +342,8 @@ POSTGRES_SCHEMA = """
     CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
     CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
     CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
+    CREATE INDEX IF NOT EXISTS idx_products_scan ON products(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_scan_history_product ON scan_history(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
@@ -487,10 +499,14 @@ class InventoryDatabase:
                 conn.close()
 
     def init_db(self) -> None:
-        """Create tables and indexes idempotently."""
+        """Create tables and indexes idempotently, and migrate existing schemas."""
         if self.is_postgres:
             with self._get_connection() as conn:
                 conn.executescript(POSTGRES_SCHEMA)
+                with contextlib.suppress(Exception):
+                    conn.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
+                with contextlib.suppress(Exception):
+                    conn.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
         else:
             assert self.db_path is not None
             try:
@@ -499,6 +515,10 @@ class InventoryDatabase:
                 logger.warning("Could not create parent directory for %s: %s", self.db_path, e)
             with self._get_connection() as conn:
                 conn.executescript(SQLITE_SCHEMA)
+                with contextlib.suppress(Exception):
+                    conn.execute("ALTER TABLE products ADD COLUMN scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
+                with contextlib.suppress(Exception):
+                    conn.execute("ALTER TABLE scan_history ADD COLUMN product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
 
     def close(self) -> None:
         """Release open connections and connection pools."""
@@ -609,7 +629,7 @@ class InventoryDatabase:
                 """
                 SELECT id, timestamp, image_path, product_name, brand, food_category,
                        analysis_status, needs_review, review_reason, selected_expiry_date,
-                       error_message, raw_json
+                       error_message, raw_json, product_id
                 FROM scan_history
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -629,6 +649,7 @@ class InventoryDatabase:
                     selected_expiry_date=r["selected_expiry_date"],
                     error_message=r["error_message"],
                     raw_json=r["raw_json"],
+                    product_id=r["product_id"] if (hasattr(r, "keys") and "product_id" in r.keys()) else None,
                 )
                 for r in rows
             ]
@@ -640,13 +661,16 @@ class InventoryDatabase:
                 """
                 SELECT id, timestamp, image_path, product_name, brand, food_category,
                        analysis_status, needs_review, review_reason, selected_expiry_date,
-                       error_message, raw_json
+                       error_message, raw_json, product_id
                 FROM scan_history WHERE id = ?
                 """,
                 (scan_id,),
             ).fetchone()
             if not r:
                 return None
+            prod_id = None
+            if hasattr(r, "keys") and "product_id" in r.keys():
+                prod_id = r["product_id"]
             return ScanHistoryRecord(
                 id=r["id"],
                 timestamp=r["timestamp"],
@@ -660,6 +684,7 @@ class InventoryDatabase:
                 selected_expiry_date=r["selected_expiry_date"],
                 error_message=r["error_message"],
                 raw_json=r["raw_json"],
+                product_id=prod_id,
             )
 
     def update_scan(
@@ -777,10 +802,13 @@ class InventoryDatabase:
         notes: str | None = None,
         candidate_dates: list[Any] | None = None,
         force: bool = False,
+        scan_id: int | None = None,
     ) -> int:
         """
         Add a verified or user-confirmed product into the inventory.
-        Validates date format and guards against duplicate entries unless force=True.
+        Validates date format, guards against duplicate entries unless force=True,
+        and atomically links scan_history when scan_id is provided.
+        Idempotent: if a product for scan_id already exists, updates it without duplicate.
         """
         clean_name = product_name.strip() if product_name else ""
         if not clean_name:
@@ -797,32 +825,99 @@ class InventoryDatabase:
             except (ValueError, TypeError) as e:
                 raise InvalidDateError(f"Invalid normalized date '{normalized_date}'. Must be ISO format YYYY-MM-DD.") from e
 
-        # Duplicate protection
-        if not force:
-            dups = self.find_potential_duplicates(clean_name, brand, clean_normalized)
-            if dups:
-                dup = dups[0]
-                msg = (
-                    f"Potential duplicate product exists (ID: {dup.id}, '{dup.product_name}', "
-                    f"Brand: {dup.brand or 'N/A'}, Date: {dup.normalized_date or 'None'}). "
-                    "Use force=True to confirm duplicate addition."
-                )
-                raise DuplicateProductError(msg, existing_id=dup.id)
-
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         with self._get_connection() as conn:
+            # Idempotent check for scan confirmation: if a product already exists for this scan_id, update it
+            if scan_id is not None:
+                cursor = conn.execute("SELECT id FROM products WHERE scan_id = ?", (scan_id,))
+                existing_row = cursor.fetchone()
+                if existing_row:
+                    prod_id = existing_row["id"] if hasattr(existing_row, "keys") else existing_row[0]
+                    conn.execute(
+                        """
+                        UPDATE products
+                        SET product_name = ?, brand = ?, food_category = ?, date_type = ?,
+                            date_text = ?, normalized_date = ?, date_status = ?, date_source = ?,
+                            analysis_status = ?, image_path = COALESCE(?, image_path),
+                            notes = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            clean_name,
+                            brand.strip() if brand else None,
+                            food_category.strip() if food_category else None,
+                            clean_date_type,
+                            date_text.strip() if date_text else None,
+                            clean_normalized,
+                            date_status,
+                            date_source,
+                            analysis_status,
+                            str(image_path) if image_path else None,
+                            notes.strip() if notes else None,
+                            now,
+                            prod_id,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE scan_history
+                        SET product_id = ?, product_name = ?, brand = ?, food_category = ?,
+                            selected_expiry_date = ?, needs_review = 0, review_reason = NULL
+                        WHERE id = ?
+                        """,
+                        (
+                            prod_id,
+                            clean_name,
+                            brand.strip() if brand else None,
+                            food_category.strip() if food_category else None,
+                            clean_normalized,
+                            scan_id,
+                        ),
+                    )
+                    if candidate_dates:
+                        conn.execute("DELETE FROM date_candidates WHERE product_id = ?", (prod_id,))
+                        for c in candidate_dates:
+                            raw_text = getattr(c, "raw_text", str(c))
+                            c_type = getattr(c, "date_type", "unknown")
+                            c_norm = getattr(c, "normalized_date", None)
+                            c_conf = float(getattr(c, "confidence", 1.0))
+                            c_evid = getattr(c, "evidence", "")
+                            conn.execute(
+                                """
+                                INSERT INTO date_candidates (
+                                    product_id, scan_id, raw_text, date_type,
+                                    normalized_date, confidence, evidence, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (prod_id, scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                            )
+                    return prod_id
+
+            # Duplicate protection when not confirming an existing scan or when force=False
+            if not force and scan_id is None:
+                dups = self.find_potential_duplicates(clean_name, brand, clean_normalized)
+                if dups:
+                    dup = dups[0]
+                    msg = (
+                        f"Potential duplicate product exists (ID: {dup.id}, '{dup.product_name}', "
+                        f"Brand: {dup.brand or 'N/A'}, Date: {dup.normalized_date or 'None'}). "
+                        "Use force=True to confirm duplicate addition."
+                    )
+                    raise DuplicateProductError(msg, existing_id=dup.id)
+
             if self.is_postgres:
                 cursor = conn.execute(
                     """
                     INSERT INTO products (
-                        product_name, brand, food_category, date_type, date_text,
+                        scan_id, product_name, brand, food_category, date_type, date_text,
                         normalized_date, date_status, date_source, analysis_status,
                         image_path, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id
                     """,
                     (
+                        scan_id,
                         clean_name,
                         brand.strip() if brand else None,
                         food_category.strip() if food_category else None,
@@ -844,12 +939,13 @@ class InventoryDatabase:
                 cursor = conn.execute(
                     """
                     INSERT INTO products (
-                        product_name, brand, food_category, date_type, date_text,
+                        scan_id, product_name, brand, food_category, date_type, date_text,
                         normalized_date, date_status, date_source, analysis_status,
                         image_path, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        scan_id,
                         clean_name,
                         brand.strip() if brand else None,
                         food_category.strip() if food_category else None,
@@ -868,6 +964,25 @@ class InventoryDatabase:
                 product_id = cursor.lastrowid
             assert product_id is not None
 
+            # Update scan_history atomically when scan_id is provided
+            if scan_id is not None:
+                conn.execute(
+                    """
+                    UPDATE scan_history
+                    SET product_id = ?, product_name = ?, brand = ?, food_category = ?,
+                        selected_expiry_date = ?, needs_review = 0, review_reason = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        product_id,
+                        clean_name,
+                        brand.strip() if brand else None,
+                        food_category.strip() if food_category else None,
+                        clean_normalized,
+                        scan_id,
+                    ),
+                )
+
             # Attach candidate dates if provided
             if candidate_dates:
                 for c in candidate_dates:
@@ -876,7 +991,7 @@ class InventoryDatabase:
                     c_norm = getattr(c, "normalized_date", None)
                     c_conf = float(getattr(c, "confidence", 1.0))
                     c_evid = getattr(c, "evidence", "")
-                    c_scan_id = getattr(c, "scan_id", None)
+                    c_scan_id = scan_id or getattr(c, "scan_id", None)
                     conn.execute(
                         """
                         INSERT INTO date_candidates (
@@ -1083,8 +1198,61 @@ class InventoryDatabase:
                 raise ProductNotFoundError(f"Product ID {product_id} not found.")
             return True
 
+    def delete_scan(self, scan_id: int, delete_associated_product: bool = True) -> tuple[bool, int | None]:
+        """
+        Delete a scan from scan_history, its date candidates, and associated capture file.
+        If delete_associated_product is True, also deletes the product created by this scan,
+        provided it has not been independently retained or modified.
+        Safe against already-deleted records.
+        Returns (success, deleted_product_id).
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT id, image_path, product_id FROM scan_history WHERE id = ?", (scan_id,))
+            scan_row = cursor.fetchone()
+            if not scan_row:
+                # Check if a product still references this scan_id even if scan_history record is gone
+                p_row = conn.execute("SELECT id FROM products WHERE scan_id = ?", (scan_id,)).fetchone()
+                if p_row and delete_associated_product:
+                    prod_id = p_row["id"] if hasattr(p_row, "keys") else p_row[0]
+                    conn.execute("DELETE FROM date_candidates WHERE product_id = ?", (prod_id,))
+                    conn.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+                    return True, prod_id
+                return False, None
+
+            image_path = scan_row["image_path"] if hasattr(scan_row, "keys") else scan_row[1]
+            prod_id = scan_row["product_id"] if hasattr(scan_row, "keys") else scan_row[2]
+
+            if prod_id is None:
+                p_row = conn.execute("SELECT id FROM products WHERE scan_id = ?", (scan_id,)).fetchone()
+                if p_row:
+                    prod_id = p_row["id"] if hasattr(p_row, "keys") else p_row[0]
+
+            deleted_prod_id = None
+            if delete_associated_product and prod_id is not None:
+                conn.execute("DELETE FROM date_candidates WHERE product_id = ?", (prod_id,))
+                conn.execute("DELETE FROM products WHERE id = ?", (prod_id,))
+                deleted_prod_id = prod_id
+
+            conn.execute("DELETE FROM date_candidates WHERE scan_id = ?", (scan_id,))
+            conn.execute("DELETE FROM scan_history WHERE id = ?", (scan_id,))
+
+            if image_path:
+                try:
+                    p = Path(image_path)
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception as e:
+                    logger.debug("Could not remove capture file %s: %s", image_path, e)
+
+            return True, deleted_prod_id
+
     @staticmethod
     def _row_to_product(row: Any) -> ProductRecord:
+        scan_id = None
+        if hasattr(row, "keys"):
+            scan_id = row["scan_id"] if "scan_id" in row.keys() else None
+        elif isinstance(row, dict):
+            scan_id = row.get("scan_id")
         return ProductRecord(
             id=row["id"],
             product_name=row["product_name"],
@@ -1100,4 +1268,5 @@ class InventoryDatabase:
             notes=row["notes"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            scan_id=scan_id,
         )

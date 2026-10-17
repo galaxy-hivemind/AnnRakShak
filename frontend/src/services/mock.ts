@@ -47,6 +47,7 @@ export const mockService: FoodSafetyService = {
  async deleteProduct(id){await delay();requireProduct(id);products=products.filter(p=>p.id!==id);for(const s of scans) if(s.productId===id) delete s.productId;},
  async getScanHistory(){await delay();return copy(scans);},
  async getScanById(id){await delay();return copy(requireScan(id));},
+ async deleteScan(id){await delay();const s=scans.find(sc=>sc.id===id);if(s && s.productId){products=products.filter(p=>p.id!==s.productId && p.scanId!==id);}scans=scans.filter(sc=>sc.id!==id);},
  async startScan(upload){await delay();const s:ScanRecord={id:`SC-${Date.now()}`,timestamp:new Date().toISOString(),image:upload || image(categories[0]),name:'Fresh Toned Milk',brand:'Amul',category:categories[0],analysisStatus:'Successful',reviewStatus:'Needs Review',reason:'Multiple possible dates',candidates:[{id:'c1',printedText:`USE BY ${relativeDate(4)} · BATCH A241`,date:relativeDate(4),dateType:'Use By',precision:'day',confidence:.92},{id:'c2',printedText:`PACKED ON ${relativeDate(-1)}`,date:relativeDate(-1),dateType:'Packed On',precision:'day'}]};scans.unshift(s);return copy(s);},
  async reanalyzeScan(id){await delay();const s=requireScan(id);if(s.reviewStatus==='Confirmed') return copy(s);s.analysisStatus='Successful'; if(!s.candidates.length){s.candidates=[{id:'c1',printedText:`BEST BEFORE ${relativeDate(30)}`,date:relativeDate(30),dateType:'Best Before',precision:'day'}];s.reason='Date awaiting confirmation';}return copy(s);},
  async getDateCandidates(id){await delay();return copy(requireScan(id).candidates);},

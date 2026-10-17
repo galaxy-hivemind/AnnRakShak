@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Link } from '@tanstack/react-router';
-import { Camera, ScanLine, Upload, RotateCcw, X, Check, LoaderCircle, ArrowRight } from 'lucide-react';
+import { Camera, ScanLine, Upload, RotateCcw, X, Check, LoaderCircle, Trash2, Plus } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { service } from '@/services/api';
 import type { ScanRecord } from '@/services/types';
 import { PageIntro, PanelHead, Footer, Empty } from './common';
@@ -16,6 +17,8 @@ export function Scan() {
   const [scan, setScan] = useState<ScanRecord>();
   const [error, setError] = useState('');
   const [cameraError, setCameraError] = useState('');
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -166,6 +169,30 @@ export function Scan() {
     setState('Ready');
   }
 
+  function handleNewScan() {
+    handleCancel();
+  }
+
+  async function handleDeleteScan() {
+    if (!scan) return;
+    setDeleteBusy(true);
+    setError('');
+    try {
+      await service.deleteScan(scan.id);
+      await qc.invalidateQueries();
+      toast.success('Scan and associated product deleted');
+      setConfirmDeleteOpen(false);
+      handleCancel();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to delete scan.';
+      setError(msg);
+      toast.error(msg);
+      setConfirmDeleteOpen(false);
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -214,8 +241,10 @@ export function Scan() {
               ? 'Camera active · Live preview'
               : state === 'Analyzing'
               ? 'Analyzing with OCR & Gemini…'
+              : scan?.reviewStatus === 'Confirmed'
+              ? 'Scan completed · Product saved to inventory'
               : state === 'Complete'
-              ? 'Capture complete · Evidence extracted'
+              ? 'Evidence extracted · Review details below'
               : state === 'Analysis Failed'
               ? 'Analysis failed · Check photo or retry'
               : 'Ready to scan'}
@@ -359,18 +388,56 @@ export function Scan() {
             />
           )}
           {scan?.reviewStatus === 'Confirmed' && (
-            <div className="scan-actions">
-              <Button asChild>
-                <Link to="/inventory" search={{ q: scan.name }}>
-                  <Check />
-                  View in inventory
-                  <ArrowRight />
-                </Link>
+            <div className="scan-actions flex flex-wrap gap-2.5 mt-4" id="completed-scan-actions">
+              <Button
+                variant="destructive"
+                id="delete-scan-btn"
+                onClick={() => setConfirmDeleteOpen(true)}
+                disabled={deleteBusy}
+              >
+                <Trash2 size={15} />
+                Delete Scan
+              </Button>
+              <Button
+                variant="outline"
+                id="new-scan-btn"
+                onClick={handleNewScan}
+                disabled={deleteBusy}
+              >
+                <Plus size={15} />
+                New Scan
               </Button>
             </div>
           )}
         </section>
       </div>
+
+      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>Delete this scan?</DialogTitle>
+          <DialogDescription>
+            Are you sure you want to delete this scan and its saved product from your inventory? This action cannot be undone.
+          </DialogDescription>
+          <div className="flex justify-end gap-2 mt-4">
+            <Button
+              variant="outline"
+              onClick={() => setConfirmDeleteOpen(false)}
+              disabled={deleteBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              id="confirm-delete-dialog-btn"
+              onClick={() => void handleDeleteScan()}
+              disabled={deleteBusy}
+            >
+              {deleteBusy ? <LoaderCircle className="animate-spin" size={14} /> : <Trash2 size={14} />}
+              Confirm Delete
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Footer />
     </div>

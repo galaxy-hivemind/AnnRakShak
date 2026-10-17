@@ -21,6 +21,7 @@ export interface FoodSafetyService {
  deleteProduct(id: string): Promise<void>;
  getScanHistory(): Promise<ScanRecord[]>;
  getScanById(id: string): Promise<ScanRecord>;
+ deleteScan(id: string): Promise<void>;
  startScan(image?: string): Promise<ScanRecord>;
  reanalyzeScan(id: string): Promise<ScanRecord>;
  simulateAnalysisFailure(id: string): Promise<ScanRecord>;

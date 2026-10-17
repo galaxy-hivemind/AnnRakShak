@@ -129,6 +129,7 @@ class ProductResponse(BaseModel):
     updated_at: str
     date_candidates: list[DateCandidateItem] = []
     quantity: str | None = None
+    scan_id: int | None = None
 
 
 class ProductCreate(BaseModel):
@@ -287,6 +288,7 @@ class ScanResponse(BaseModel):
     raw_json: str | None = None
     date_candidates: list[DateCandidateItem] = []
     timing: ScanTiming | None = None
+    product_id: int | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -425,6 +427,7 @@ def serialize_product(
         created_at=p.created_at,
         updated_at=p.updated_at,
         date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
+        scan_id=p.scan_id,
     )
 
 
@@ -458,6 +461,7 @@ def serialize_scan(
         raw_json=s.raw_json,
         date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
         timing=timing,
+        product_id=s.product_id,
     )
 
 
@@ -756,6 +760,7 @@ def create_product(
         notes=notes,
         force=payload.force,
         candidate_dates=candidate_dates,
+        scan_id=payload.scan_id,
     )
     p = db.get_product(product_id)
     if not p:
@@ -882,6 +887,34 @@ def get_scan_date_candidates(
         )
     candidates = db.get_scan_date_candidates(scan_id)
     return [DateCandidateItem(**c.to_dict()) for c in candidates]
+
+
+@app.delete("/api/scans/{scan_id}", response_model=DeleteResponse, tags=["Scans"])
+def delete_scan(
+    scan_id: int,
+    delete_product: bool = Query(default=True, description="Also remove the inventory product created by this scan"),
+    db: InventoryDatabase = Depends(get_db),
+) -> DeleteResponse:
+    """
+    Delete a scan record, associated candidate dates, image capture, and
+    optionally the inventory product created from this scan.
+    Safe against already-deleted records.
+    """
+    success, deleted_prod_id = db.delete_scan(scan_id=scan_id, delete_associated_product=delete_product)
+    if not success:
+        return DeleteResponse(
+            success=True,
+            message=f"Scan {scan_id} not found or already deleted.",
+            deleted_id=scan_id,
+        )
+    msg = f"Scan {scan_id} successfully deleted."
+    if deleted_prod_id:
+        msg += f" Associated product {deleted_prod_id} removed from inventory."
+    return DeleteResponse(
+        success=True,
+        message=msg,
+        deleted_id=scan_id,
+    )
 
 
 @app.post("/api/scans/{scan_id}/reanalyze", response_model=ScanResponse, tags=["Scans"])
