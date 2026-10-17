@@ -20,15 +20,44 @@ from __future__ import annotations
 import contextlib
 import datetime
 import logging
+import os
 import sqlite3
+import urllib.parse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Generator
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.pool import ThreadedConnectionPool
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    psycopg2 = None
+    psycopg2_extras = None
+    ThreadedConnectionPool = None
+    PSYCOPG2_AVAILABLE = False
+
 logger = logging.getLogger("AnnaRakshak.InventoryDB")
 
-DEFAULT_DB_PATH = Path(__file__).parent / "annarakshak.db"
+DEFAULT_DB_PATH = (Path(__file__).parent / "annarakshak.db").resolve()
 DEFAULT_WARNING_DAYS = 7
+
+
+def mask_database_url(url: str | None) -> str:
+    """Mask password credentials in a database connection URL for safe logging."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.password:
+            netloc = f"{parsed.username}:****@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return "postgresql://****"
 
 
 class DuplicateProductError(Exception):
@@ -197,89 +226,287 @@ class ScanHistoryRecord:
 
 
 # ---------------------------------------------------------------------------
-# SQLite Inventory Database
+# Database Schemas & Connection Wrappers
+# ---------------------------------------------------------------------------
+
+SQLITE_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_name TEXT NOT NULL,
+        brand TEXT,
+        food_category TEXT,
+        date_type TEXT NOT NULL,
+        date_text TEXT,
+        normalized_date TEXT,
+        date_status TEXT NOT NULL DEFAULT 'unverified',
+        date_source TEXT NOT NULL DEFAULT 'printed',
+        analysis_status TEXT,
+        image_path TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        image_path TEXT NOT NULL,
+        product_name TEXT,
+        brand TEXT,
+        food_category TEXT,
+        analysis_status TEXT NOT NULL,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        review_reason TEXT,
+        selected_expiry_date TEXT,
+        error_message TEXT,
+        raw_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS date_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        scan_id INTEGER,
+        raw_text TEXT NOT NULL,
+        date_type TEXT NOT NULL,
+        normalized_date TEXT,
+        confidence REAL NOT NULL DEFAULT 1.0,
+        evidence TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
+    CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
+    CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
+    CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
+    CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
+"""
+
+POSTGRES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        product_name TEXT NOT NULL,
+        brand TEXT,
+        food_category TEXT,
+        date_type TEXT NOT NULL,
+        date_text TEXT,
+        normalized_date TEXT,
+        date_status TEXT NOT NULL DEFAULT 'unverified',
+        date_source TEXT NOT NULL DEFAULT 'printed',
+        analysis_status TEXT,
+        image_path TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_history (
+        id SERIAL PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        image_path TEXT NOT NULL,
+        product_name TEXT,
+        brand TEXT,
+        food_category TEXT,
+        analysis_status TEXT NOT NULL,
+        needs_review INTEGER NOT NULL DEFAULT 0,
+        review_reason TEXT,
+        selected_expiry_date TEXT,
+        error_message TEXT,
+        raw_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS date_candidates (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+        scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL,
+        raw_text TEXT NOT NULL,
+        date_type TEXT NOT NULL,
+        normalized_date TEXT,
+        confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+        evidence TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
+    CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
+    CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
+    CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
+    CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
+    CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
+"""
+
+
+class PostgresConnectionWrapper:
+    """Wrapper around psycopg2 connection providing sqlite3-compatible .execute() syntax."""
+
+    def __init__(self, raw_conn: Any) -> None:
+        self._conn = raw_conn
+        self._last_cursor: Any = None
+
+    def execute(self, sql: str, params: tuple | list | None = None) -> Any:
+        pg_sql = sql.replace("?", "%s")
+        if " LIKE " in pg_sql and " ILIKE " not in pg_sql:
+            pg_sql = pg_sql.replace(" LIKE ", " ILIKE ")
+        cursor = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        self._last_cursor = cursor
+        cursor.execute(pg_sql, params or ())
+        return cursor
+
+    def executescript(self, sql_script: str) -> None:
+        with self._conn.cursor() as cursor:
+            cursor.execute(sql_script)
+
+    @property
+    def lastrowid(self) -> int | None:
+        if self._last_cursor:
+            return getattr(self._last_cursor, "lastrowid", None)
+        return None
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Inventory Database (SQLite & PostgreSQL)
 # ---------------------------------------------------------------------------
 
 class InventoryDatabase:
     """
-    Thread-safe, project-local SQLite inventory repository.
+    Thread-safe repository supporting local SQLite storage and hosted PostgreSQL (e.g. Neon).
     """
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
-        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        self._pool: Any = None
+
+        if database_url is not None:
+            self.is_postgres = True
+            self.database_url = database_url.strip()
+            self.db_path = None
+        elif db_path is not None:
+            self.is_postgres = False
+            self.database_url = None
+            self.db_path = Path(db_path).resolve()
+        else:
+            env_db_url = os.getenv("DATABASE_URL") or os.getenv("ANNARAKSHAK_DATABASE_URL")
+            if env_db_url and env_db_url.strip():
+                self.is_postgres = True
+                self.database_url = env_db_url.strip()
+                self.db_path = None
+            else:
+                self.is_postgres = False
+                self.database_url = None
+                raw_path = os.getenv("ANNARAKSHAK_DB_PATH", str(DEFAULT_DB_PATH))
+                self.db_path = Path(raw_path).resolve()
+
+        if self.is_postgres:
+            if not PSYCOPG2_AVAILABLE:
+                raise RuntimeError(
+                    "psycopg2 is required for PostgreSQL operation. Please install psycopg2-binary."
+                )
+            self._init_postgres_pool()
+        else:
+            assert self.db_path is not None
+            try:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.warning("Could not create parent directory for %s: %s", self.db_path, e)
+
         self.init_db()
 
+    def _get_clean_dsn(self) -> str:
+        dsn = self.database_url or ""
+        if "sslmode=" not in dsn and any(h in dsn for h in ("neon.tech", "supabase.co", "amazonaws.com", "render.com")):
+            sep = "&" if "?" in dsn else "?"
+            dsn = f"{dsn}{sep}sslmode=require"
+        if dsn.startswith("postgres://"):
+            dsn = "postgresql://" + dsn[len("postgres://"):]
+        return dsn
+
+    def _init_postgres_pool(self) -> None:
+        dsn = self._get_clean_dsn()
+        logger.info("Initializing PostgreSQL connection pool (%s)", mask_database_url(dsn))
+        self._pool = ThreadedConnectionPool(minconn=1, maxconn=10, dsn=dsn)
+
     @contextlib.contextmanager
-    def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Establish a connection with foreign keys and WAL mode, managing transaction and lifecycle."""
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA journal_mode = WAL;")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+    def _get_connection(self) -> Generator[Any, None, None]:
+        """Establish a connection managing transactions and lifecycle across SQLite or PostgreSQL."""
+        if self.is_postgres:
+            conn = None
+            try:
+                conn = self._pool.getconn()
+                if conn.closed:
+                    conn = self._pool._connect()
+                else:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+            except Exception:
+                try:
+                    if conn:
+                        self._pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = psycopg2.connect(self._get_clean_dsn())
+
+            wrapped = PostgresConnectionWrapper(conn)
+            try:
+                yield wrapped
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                try:
+                    self._pool.putconn(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        else:
+            assert self.db_path is not None
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            try:
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
 
     def init_db(self) -> None:
         """Create tables and indexes idempotently."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._get_connection() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS products (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    product_name TEXT NOT NULL,
-                    brand TEXT,
-                    food_category TEXT,
-                    date_type TEXT NOT NULL,
-                    date_text TEXT,
-                    normalized_date TEXT,
-                    date_status TEXT NOT NULL DEFAULT 'unverified',
-                    date_source TEXT NOT NULL DEFAULT 'printed',
-                    analysis_status TEXT,
-                    image_path TEXT,
-                    notes TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
+        if self.is_postgres:
+            with self._get_connection() as conn:
+                conn.executescript(POSTGRES_SCHEMA)
+        else:
+            assert self.db_path is not None
+            try:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.warning("Could not create parent directory for %s: %s", self.db_path, e)
+            with self._get_connection() as conn:
+                conn.executescript(SQLITE_SCHEMA)
 
-                CREATE TABLE IF NOT EXISTS scan_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    image_path TEXT NOT NULL,
-                    product_name TEXT,
-                    brand TEXT,
-                    food_category TEXT,
-                    analysis_status TEXT NOT NULL,
-                    needs_review INTEGER NOT NULL DEFAULT 0,
-                    review_reason TEXT,
-                    selected_expiry_date TEXT,
-                    error_message TEXT,
-                    raw_json TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS date_candidates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    product_id INTEGER,
-                    scan_id INTEGER,
-                    raw_text TEXT NOT NULL,
-                    date_type TEXT NOT NULL,
-                    normalized_date TEXT,
-                    confidence REAL NOT NULL DEFAULT 1.0,
-                    evidence TEXT,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
-                    FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
-                CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
-                CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
-                CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
-                CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
-                CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
-            """)
+    def close(self) -> None:
+        """Release open connections and connection pools."""
+        if self.is_postgres and self._pool is not None:
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
 
     # -----------------------------------------------------------------------
     # Scan History Operations
@@ -320,21 +547,40 @@ class InventoryDatabase:
             candidates = getattr(result, "date_candidates", []) or []
 
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO scan_history (
-                    timestamp, image_path, product_name, brand, food_category,
-                    analysis_status, needs_review, review_reason, selected_expiry_date,
-                    error_message, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now, str(image_path), product_name, brand, food_category,
-                    analysis_status, needs_review, review_reason, selected_expiry_date,
-                    error_message, raw_json,
-                ),
-            )
-            scan_id = cursor.lastrowid
+            if self.is_postgres:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO scan_history (
+                        timestamp, image_path, product_name, brand, food_category,
+                        analysis_status, needs_review, review_reason, selected_expiry_date,
+                        error_message, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (
+                        now, str(image_path), product_name, brand, food_category,
+                        analysis_status, needs_review, review_reason, selected_expiry_date,
+                        error_message, raw_json,
+                    ),
+                )
+                row = cursor.fetchone()
+                scan_id = row[0]
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO scan_history (
+                        timestamp, image_path, product_name, brand, food_category,
+                        analysis_status, needs_review, review_reason, selected_expiry_date,
+                        error_message, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now, str(image_path), product_name, brand, food_category,
+                        analysis_status, needs_review, review_reason, selected_expiry_date,
+                        error_message, raw_json,
+                    ),
+                )
+                scan_id = cursor.lastrowid
             assert scan_id is not None
 
             # Record candidate dates attached to this scan
@@ -566,31 +812,60 @@ class InventoryDatabase:
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO products (
-                    product_name, brand, food_category, date_type, date_text,
-                    normalized_date, date_status, date_source, analysis_status,
-                    image_path, notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    clean_name,
-                    brand.strip() if brand else None,
-                    food_category.strip() if food_category else None,
-                    clean_date_type,
-                    date_text.strip() if date_text else None,
-                    clean_normalized,
-                    date_status,
-                    date_source,
-                    analysis_status,
-                    str(image_path) if image_path else None,
-                    notes.strip() if notes else None,
-                    now,
-                    now,
-                ),
-            )
-            product_id = cursor.lastrowid
+            if self.is_postgres:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO products (
+                        product_name, brand, food_category, date_type, date_text,
+                        normalized_date, date_status, date_source, analysis_status,
+                        image_path, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (
+                        clean_name,
+                        brand.strip() if brand else None,
+                        food_category.strip() if food_category else None,
+                        clean_date_type,
+                        date_text.strip() if date_text else None,
+                        clean_normalized,
+                        date_status,
+                        date_source,
+                        analysis_status,
+                        str(image_path) if image_path else None,
+                        notes.strip() if notes else None,
+                        now,
+                        now,
+                    ),
+                )
+                row = cursor.fetchone()
+                product_id = row[0]
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO products (
+                        product_name, brand, food_category, date_type, date_text,
+                        normalized_date, date_status, date_source, analysis_status,
+                        image_path, notes, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_name,
+                        brand.strip() if brand else None,
+                        food_category.strip() if food_category else None,
+                        clean_date_type,
+                        date_text.strip() if date_text else None,
+                        clean_normalized,
+                        date_status,
+                        date_source,
+                        analysis_status,
+                        str(image_path) if image_path else None,
+                        notes.strip() if notes else None,
+                        now,
+                        now,
+                    ),
+                )
+                product_id = cursor.lastrowid
             assert product_id is not None
 
             # Attach candidate dates if provided
@@ -809,7 +1084,7 @@ class InventoryDatabase:
             return True
 
     @staticmethod
-    def _row_to_product(row: sqlite3.Row) -> ProductRecord:
+    def _row_to_product(row: Any) -> ProductRecord:
         return ProductRecord(
             id=row["id"],
             product_name=row["product_name"],
@@ -823,6 +1098,6 @@ class InventoryDatabase:
             analysis_status=row["analysis_status"],
             image_path=row["image_path"],
             notes=row["notes"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
         )

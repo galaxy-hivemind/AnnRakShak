@@ -50,6 +50,7 @@ from inventory_db import (
     ProductRecord,
     ScanHistoryRecord,
     calculate_date_status,
+    mask_database_url,
 )
 
 # Load environment configuration
@@ -293,8 +294,42 @@ class DeleteResponse(BaseModel):
 # Database & Dependency Injection
 # ---------------------------------------------------------------------------
 
+def get_database() -> InventoryDatabase:
+    """
+    Construct the database instance based on environment:
+    - If DATABASE_URL or ANNARAKSHAK_DATABASE_URL is set: connects to persistent PostgreSQL.
+    - If running on Vercel (VERCEL='1' or VERCEL_ENV set) and no DATABASE_URL:
+      raises RuntimeError explaining that persistent PostgreSQL configuration is required.
+    - Otherwise (local development): initializes project-local SQLite with absolute path resolution.
+    """
+    database_url = os.getenv("DATABASE_URL") or os.getenv("ANNARAKSHAK_DATABASE_URL")
+    is_vercel = os.getenv("VERCEL") == "1" or bool(os.getenv("VERCEL_ENV")) or bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+
+    if database_url and database_url.strip():
+        logger.info("Initializing PostgreSQL database from DATABASE_URL (%s)", mask_database_url(database_url))
+        return InventoryDatabase(database_url=database_url.strip())
+
+    if is_vercel:
+        msg = (
+            "Vercel serverless environment detected (read-only filesystem), but DATABASE_URL is not configured.\n"
+            "AnnaRakshak requires persistent storage in production.\n"
+            "Please configure the DATABASE_URL environment variable in Vercel Project Settings -> Environment Variables "
+            "pointing to your hosted PostgreSQL database (e.g. Neon, Supabase, or AWS RDS)."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    # Local development with SQLite
+    raw_path = os.getenv("ANNARAKSHAK_DB_PATH", str(DEFAULT_DB_PATH))
+    db_path = Path(raw_path).resolve()
+    logger.info("Initializing local SQLite database at: %s", db_path)
+    return InventoryDatabase(db_path=db_path)
+
+
 def get_db(request: Request) -> InventoryDatabase:
-    """Dependency provider for the SQLite InventoryDatabase instance."""
+    """Dependency provider for the InventoryDatabase instance (lazily initializes if missing)."""
+    if not hasattr(request.app.state, "db") or request.app.state.db is None:
+        request.app.state.db = get_database()
     return request.app.state.db
 
 
@@ -361,8 +396,7 @@ def serialize_scan(
 async def lifespan(app: FastAPI):
     """Manage application state, database, Gemini analyzer, and persistent OCR engine."""
     if not hasattr(app.state, "db") or app.state.db is None:
-        db_path = os.getenv("ANNARAKSHAK_DB_PATH", str(DEFAULT_DB_PATH))
-        app.state.db = InventoryDatabase(db_path=db_path)
+        app.state.db = get_database()
     if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
         app.state.analyzer = GeminiAnalyzer()
     if not hasattr(app.state, "ocr_engine") or app.state.ocr_engine is None:
@@ -375,6 +409,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if hasattr(app.state, "db") and app.state.db is not None:
+            try:
+                app.state.db.close()
+            except Exception:
+                pass
         if hasattr(app.state, "ocr_engine") and app.state.ocr_engine is not None:
             try:
                 app.state.ocr_engine.shutdown()
