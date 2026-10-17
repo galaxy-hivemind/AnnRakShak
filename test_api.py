@@ -95,6 +95,54 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(data["normalized_date"], "2026-10-20")
         self.assertEqual(data["date_status"], "confirmed")
 
+    def test_create_product_with_scan_id_copies_date_candidates(self):
+        mfg_candidate = DateCandidate(
+            raw_text="MFG 01/09/2026",
+            date_type="manufacturing",
+            normalized_date="2026-09-01",
+            confidence=0.95,
+            evidence="Printed on top",
+            bounding_box=None,
+        )
+        exp_candidate = DateCandidate(
+            raw_text="EXP 01/09/2027",
+            date_type="expiry",
+            normalized_date="2027-09-01",
+            confidence=0.98,
+            evidence="Printed on bottom",
+            bounding_box=None,
+        )
+        scan_id = self.db.record_scan(
+            image_path="captures/dual_dates.jpg",
+            result=FoodAnalysisResult(
+                product_name="Parle-G",
+                brand="Parle",
+                food_category="Snacks",
+                analysis_status="success",
+                needs_review=False,
+                review_reason=None,
+                selected_expiry_date="2027-09-01",
+                date_candidates=[mfg_candidate, exp_candidate],
+            ),
+        )
+
+        payload = {
+            "product_name": "Parle-G",
+            "brand": "Parle",
+            "food_category": "Snacks",
+            "date_type": "expiry",
+            "normalized_date": "2027-09-01",
+            "scan_id": scan_id,
+            "notes": "Verified: MFG: 2026-09-01 (manufacturing), EXP: 2027-09-01 (expiry)",
+        }
+        response = self.client.post("/api/products", json=payload)
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertIn("date_candidates", data)
+        self.assertEqual(len(data["date_candidates"]), 2)
+        types = {c["date_type"] for c in data["date_candidates"]}
+        self.assertEqual(types, {"manufacturing", "expiry"})
+
     def test_create_product_blank_name_rejected(self):
         payload = {"product_name": "   "}
         response = self.client.post("/api/products", json=payload)

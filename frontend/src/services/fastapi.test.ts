@@ -196,5 +196,176 @@ describe('FastApiFoodSafetyService Adapter', () => {
       expect(fetchSpy).toHaveBeenCalledWith('/api/health', expect.any(Object));
     });
   });
+
+  describe('confirmDate multi-candidate handling', () => {
+    it('confirms both manufacturing and expiry dates accurately and links scanId', async () => {
+      const mockScan = {
+        id: 42,
+        timestamp: '2026-10-17T00:00:00Z',
+        image_path: 'captures/test.jpg',
+        product_name: 'Cereal Box',
+        brand: 'Kelloggs',
+        food_category: 'Grains',
+        analysis_status: 'success',
+        needs_review: false,
+        review_reason: null,
+        selected_expiry_date: '2027-08-15',
+        error_message: null,
+        raw_json: null,
+        date_candidates: [
+          {
+            id: 1,
+            raw_text: 'MFG 15/08/2026',
+            date_type: 'manufacturing',
+            normalized_date: '2026-08-15',
+            confidence: 0.95,
+            evidence: 'Printed on top',
+            created_at: '2026-10-17T00:00:00Z',
+          },
+          {
+            id: 2,
+            raw_text: 'EXP 15/08/2027',
+            date_type: 'expiry',
+            normalized_date: '2027-08-15',
+            confidence: 0.98,
+            evidence: 'Printed on bottom',
+            created_at: '2026-10-17T00:00:00Z',
+          },
+        ],
+      };
+
+      const mockCreatedProduct = {
+        id: 99,
+        product_name: 'Cereal Box',
+        brand: 'Kelloggs',
+        food_category: 'Grains',
+        date_type: 'expiry',
+        date_text: '2027-08-15',
+        normalized_date: '2027-08-15',
+        date_status: 'confirmed',
+        current_status: 'upcoming',
+        date_source: 'user_confirmed',
+        notes: 'MFG: 2026-08-15 (MFG 15/08/2026) [Verified] | EXP: 2027-08-15 (EXP 15/08/2027) [Verified]',
+        created_at: '2026-10-17T00:00:00Z',
+        updated_at: '2026-10-17T00:00:00Z',
+        date_candidates: [],
+      };
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => mockScan,
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => mockCreatedProduct,
+        } as Response);
+
+      const product = await service.confirmDate('SC-42', ['1', '2']);
+
+      expect(fetchSpy).toHaveBeenNthCalledWith(
+        2,
+        'http://127.0.0.1:8000/api/products',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            product_name: 'Cereal Box',
+            brand: 'Kelloggs',
+            food_category: 'Grains',
+            date_type: 'expiry',
+            normalized_date: '2027-08-15',
+            date_status: 'confirmed',
+            date_source: 'user_confirmed',
+            notes: 'MFG: 2026-08-15 (MFG 15/08/2026) [Verified] | EXP: 2027-08-15 (EXP 15/08/2027) [Verified]',
+            force: true,
+            scan_id: 42,
+          }),
+        })
+      );
+      expect(product.dateType).toBe('Expiry');
+      expect(product.date).toBe('2027-08-15');
+      expect(product.verified).toBe(true);
+    });
+
+    it('confirms single manufacturing date without converting it to expiry', async () => {
+      const mockScan = {
+        id: 50,
+        timestamp: '2026-10-17T00:00:00Z',
+        image_path: 'captures/test2.jpg',
+        product_name: 'Fresh Cheese',
+        brand: 'Dairy Co',
+        food_category: 'Dairy',
+        analysis_status: 'success',
+        needs_review: true,
+        review_reason: 'Only MFG date printed',
+        selected_expiry_date: null,
+        error_message: null,
+        raw_json: null,
+        date_candidates: [
+          {
+            id: 10,
+            raw_text: 'MFG 01/10/2026',
+            date_type: 'manufacturing',
+            normalized_date: '2026-10-01',
+            confidence: 0.95,
+            evidence: 'Printed on lid',
+            created_at: '2026-10-17T00:00:00Z',
+          },
+        ],
+      };
+
+      const mockCreatedProduct = {
+        id: 101,
+        product_name: 'Fresh Cheese',
+        brand: 'Dairy Co',
+        food_category: 'Dairy',
+        date_type: 'manufacturing',
+        date_text: '2026-10-01',
+        normalized_date: '2026-10-01',
+        date_status: 'confirmed',
+        current_status: 'manufactured',
+        date_source: 'user_confirmed',
+        notes: 'Manufacturing: 2026-10-01 (MFG 01/10/2026) [Verified]',
+        created_at: '2026-10-17T00:00:00Z',
+        updated_at: '2026-10-17T00:00:00Z',
+        date_candidates: [],
+      };
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => mockScan,
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => mockCreatedProduct,
+        } as Response);
+
+      const product = await service.confirmDate('SC-50', '10');
+
+      expect(fetchSpy).toHaveBeenNthCalledWith(
+        2,
+        'http://127.0.0.1:8000/api/products',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            product_name: 'Fresh Cheese',
+            brand: 'Dairy Co',
+            food_category: 'Dairy',
+            date_type: 'manufacturing',
+            normalized_date: '2026-10-01',
+            date_status: 'confirmed',
+            date_source: 'user_confirmed',
+            notes: 'Manufacturing: 2026-10-01 (MFG 01/10/2026) [Verified]',
+            force: true,
+            scan_id: 50,
+          }),
+        })
+      );
+      // Crucial: dateType is Manufacturing, NEVER converted to Expiry!
+      expect(product.dateType).toBe('Manufacturing');
+      expect(product.date).toBe('2026-10-01');
+    });
+  });
 });
 

@@ -351,8 +351,8 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     return this.mapBackendProduct(bp);
   }
 
-  async createProduct(data: ProductInput): Promise<Product> {
-    const payload = {
+  async createProduct(data: ProductInput & { scanId?: string }): Promise<Product> {
+    const payload: Record<string, any> = {
       product_name: data.name.trim(),
       brand: data.brand?.trim() || null,
       food_category: toBackendCategory(data.category),
@@ -363,6 +363,13 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       notes: data.notes?.trim() || null,
       force: true, // Allow user-driven additions from UI
     };
+    if (data.scanId) {
+      try {
+        payload.scan_id = parseId(data.scanId);
+      } catch {
+        // Ignore unparseable scanId
+      }
+    }
 
     const bp = await this.request<BackendProduct>('/api/products', {
       method: 'POST',
@@ -478,22 +485,70 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     };
   }
 
-  async confirmDate(scanId: string, candidateId: string): Promise<Product> {
+  async confirmDate(
+    scanId: string,
+    candidateIdOrIds: string | string[],
+    overrides?: {
+      name?: string;
+      brand?: string;
+      category?: Category | '';
+      quantity?: string;
+      candidates?: DateCandidate[];
+      notes?: string;
+    }
+  ): Promise<Product> {
     const scan = await this.getScanById(scanId);
-    const cand = scan.candidates.find((c) => c.id === candidateId);
-    if (!cand || cand.precision !== 'day' || !isExactDate(cand.date)) {
-      throw new Error('This evidence has no exact date. Enter a full date from the package, or leave it in review.');
+    const candidateList = overrides?.candidates || scan.candidates;
+    const ids = Array.isArray(candidateIdOrIds) ? candidateIdOrIds : [candidateIdOrIds];
+    const verifiedCands = candidateList.filter((c) => ids.includes(c.id));
+    if (!verifiedCands.length) {
+      throw new Error('Please select at least one date candidate to confirm.');
+    }
+
+    for (const c of verifiedCands) {
+      if (c.precision !== 'day' || !isExactDate(c.date)) {
+        throw new Error('This evidence has no exact date. Enter a full date from the package, or leave it in review.');
+      }
+    }
+
+    // Determine primary shelf-life date (Expiry / Use By / Best Before takes priority over Manufacturing for inventory tracking)
+    const expCandidate = verifiedCands.find((c) => ['Expiry', 'Use By', 'Best Before'].includes(c.dateType));
+    const mfgCandidate = verifiedCands.find((c) => ['Manufacturing', 'Packed On'].includes(c.dateType));
+    const primaryCandidate = expCandidate || mfgCandidate || verifiedCands[0];
+
+    // Build notes preserving all verified dates and original printed evidence
+    const notesParts: string[] = [];
+    const getTag = (c: DateCandidate) => (c.source === 'manual' ? 'Manual' : c.source === 'calculated' ? 'Calculated' : 'Verified');
+    if (mfgCandidate && expCandidate) {
+      notesParts.push(`MFG: ${mfgCandidate.date} (${mfgCandidate.printedText || 'Verified MFG'}) [${getTag(mfgCandidate)}]`);
+      notesParts.push(`EXP: ${expCandidate.date} (${expCandidate.printedText || 'Verified EXP'}) [${getTag(expCandidate)}]`);
+    } else {
+      for (const c of verifiedCands) {
+        notesParts.push(`${c.dateType}: ${c.date} (${c.printedText || 'Verified'}) [${getTag(c)}]`);
+      }
+    }
+
+    const finalName = overrides?.name?.trim() || scan.name;
+    const finalBrand = overrides?.brand !== undefined ? overrides.brand.trim() : scan.brand;
+    const finalCategory = overrides?.category ? overrides.category : (scan.category || 'Pantry Staples');
+    const finalQuantity = overrides?.quantity !== undefined ? overrides.quantity.trim() : (scan.quantity || '');
+    if (finalQuantity) {
+      notesParts.unshift(`Quantity: ${finalQuantity}`);
+    }
+    if (overrides?.notes) {
+      notesParts.push(overrides.notes.trim());
     }
 
     return this.createProduct({
-      name: scan.name,
-      brand: scan.brand,
-      category: scan.category,
-      quantity: '',
-      date: cand.date,
-      dateType: cand.dateType,
-      notes: `Original evidence: ${cand.printedText}`,
+      name: finalName,
+      brand: finalBrand,
+      category: finalCategory,
+      quantity: finalQuantity,
+      date: primaryCandidate.date,
+      dateType: primaryCandidate.dateType,
+      notes: notesParts.join(' | '),
       verified: true,
+      scanId: scan.id,
     });
   }
 
@@ -592,7 +647,17 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
   }
 
   private mapBackendScan(bs: BackendScan): ScanRecord {
-    const cat = toFrontendCategory(bs.food_category);
+    const hasCategory = Boolean(bs.food_category && bs.food_category.trim());
+    const cat: Category | '' = hasCategory ? toFrontendCategory(bs.food_category) : '';
+    let quantity = (bs as any).quantity || '';
+    if (!quantity && bs.raw_json) {
+      try {
+        const parsed = JSON.parse(bs.raw_json);
+        if (parsed.quantity) quantity = String(parsed.quantity);
+      } catch {
+        // ignore
+      }
+    }
     const candidates = (bs.date_candidates || []).map((c) => this.mapBackendCandidate(c));
 
     let reviewStatus: 'Needs Review' | 'Confirmed' = bs.needs_review ? 'Needs Review' : 'Confirmed';
@@ -607,10 +672,11 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
             : this.baseUrl
             ? `${this.baseUrl}/api/scans/${bs.id}/image`
             : `/api/scans/${bs.id}/image`)
-        : categorySvg(cat),
+        : categorySvg(cat || 'Pantry Staples'),
       name: bs.product_name || 'Unidentified Item',
       brand: bs.brand || '',
       category: cat,
+      quantity,
       analysisStatus,
       reviewStatus,
       reason: bs.review_reason || bs.error_message || undefined,
@@ -619,7 +685,11 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
   }
 
   private mapBackendCandidate(c: BackendDateCandidate): DateCandidate {
-    const isIsoDay = c.normalized_date && isExactDate(c.normalized_date);
+    const isIsoDay = Boolean(c.normalized_date && isExactDate(c.normalized_date));
+    const isCalculated = Boolean(
+      (c.evidence && (c.evidence.includes('Calculated') || c.evidence.includes('relative_shelf_life'))) ||
+      (c.raw_text && /best before \d+ months/i.test(c.raw_text))
+    );
     return {
       id: String(c.id || Math.random()),
       printedText: c.raw_text,
@@ -628,6 +698,9 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       precision: isIsoDay ? 'day' : 'month',
       confidence: c.confidence,
       reason: c.evidence,
+      isCalculated,
+      source: isCalculated ? 'calculated' : 'printed',
+      calculatedFrom: isCalculated ? (c.evidence || c.raw_text) : undefined,
     };
   }
 }

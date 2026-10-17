@@ -189,6 +189,10 @@ STRICT DATE EXTRACTION & INTERPRETATION RULES:
 5. SELECTION OF EXPIRY DATE:
    - Set 'selected_expiry_date' (YYYY-MM-DD) ONLY when supported by clear, unambiguous evidence of an explicit expiry, use-by, or calculated relative best-before date with full year, month, and day.
    - If only manufacturing dates or only month/year dates exist: set selected_expiry_date = null.
+
+6. PRODUCT DETAILS & QUANTITY:
+   - Identify product name, brand, food category, and net quantity / weight / volume (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs') if printed anywhere on the packaging.
+   - If quantity is not clearly legible or printed, set quantity = null. Never guess or hallucinate quantity.
 """
 
 
@@ -220,6 +224,10 @@ class FoodAnalysisResult(BaseModel):
     food_category: str | None = Field(
         default=None,
         description="Category: Medicine, Dairy, Beverage, Grains, Snacks, Produce, Pantry, or null.",
+    )
+    quantity: str | None = Field(
+        default=None,
+        description="Net weight, volume, or package count if visible on the packaging (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs'), or null.",
     )
     date_candidates: list[DateCandidate] = Field(
         default_factory=list,
@@ -567,12 +575,16 @@ class GeminiAnalyzer:
                     prompt_parts = [
                         "Carefully inspect this packaging image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
                         "Identify the product name, brand, food category (Medicine, Dairy, Beverage, Grains, Snacks, Produce, Pantry), "
+                        "net quantity / weight / volume if printed (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs'), "
                         "and ALL printed dates (manufacturing, packing, expiry, use-by, best-before, after-opening). "
                         "Extract each printed date into date_candidates with exact raw_text, accurate date_type, and nearby evidence. "
                         "Follow all strict date interpretation rules without hallucination."
                     ]
                     if ocr_text:
-                        prompt_parts.append(f"\nVisible text detected by local OCR:\n{ocr_text[:1200]}")
+                        prompt_parts.append(
+                            f"\nNote: Auxiliary text detected by local OCR (may be incomplete or noisy):\n{ocr_text[:1200]}\n"
+                            f"You MUST independently and thoroughly inspect the image visual pixels across the entire packaging for all dates and product details."
+                        )
                     prompt = "\n".join(prompt_parts)
 
                     response = client.models.generate_content(

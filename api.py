@@ -128,6 +128,7 @@ class ProductResponse(BaseModel):
     created_at: str
     updated_at: str
     date_candidates: list[DateCandidateItem] = []
+    quantity: str | None = None
 
 
 class ProductCreate(BaseModel):
@@ -146,7 +147,9 @@ class ProductCreate(BaseModel):
     date_status: str = Field(default="confirmed", description="Status: confirmed or unverified.")
     date_source: str = Field(default="manual", description="Source: manual, printed, user_confirmed.")
     notes: str | None = Field(default=None, description="Optional user notes.")
+    quantity: str | None = Field(default=None, description="Product quantity or net weight.")
     force: bool = Field(default=False, description="Set True to override duplicate product warnings.")
+    scan_id: int | None = Field(default=None, description="Optional scan ID to associate and attach date candidates from.")
 
     @field_validator("product_name")
     @classmethod
@@ -187,6 +190,7 @@ class ProductUpdate(BaseModel):
     product_name: str | None = None
     brand: str | None = None
     food_category: str | None = None
+    quantity: str | None = None
     notes: str | None = None
     date_type: str | None = None
     normalized_date: str | None = None
@@ -274,6 +278,7 @@ class ScanResponse(BaseModel):
     product_name: str | None = None
     brand: str | None = None
     food_category: str | None = None
+    quantity: str | None = None
     analysis_status: str
     needs_review: bool
     review_reason: str | None = None
@@ -396,11 +401,18 @@ def serialize_product(
     ref_date: datetime.date | None = None,
 ) -> ProductResponse:
     """Helper to convert ProductRecord into ProductResponse with computed live status."""
+    quantity = None
+    if p.notes:
+        import re
+        m = re.search(r"Quantity:\s*([^|\n]+)", p.notes)
+        if m:
+            quantity = m.group(1).strip()
     return ProductResponse(
         id=p.id,
         product_name=p.product_name,
         brand=p.brand,
         food_category=p.food_category,
+        quantity=quantity,
         date_type=p.date_type,
         date_text=p.date_text,
         normalized_date=p.normalized_date,
@@ -422,6 +434,14 @@ def serialize_scan(
     timing: ScanTiming | None = None,
 ) -> ScanResponse:
     """Helper to convert ScanHistoryRecord into ScanResponse with attached candidates and timing."""
+    quantity = None
+    if s.raw_json:
+        try:
+            import json
+            parsed = json.loads(s.raw_json)
+            quantity = parsed.get("quantity")
+        except Exception:
+            pass
     return ScanResponse(
         id=s.id,
         timestamp=s.timestamp,
@@ -429,6 +449,7 @@ def serialize_scan(
         product_name=s.product_name,
         brand=s.brand,
         food_category=s.food_category,
+        quantity=quantity,
         analysis_status=s.analysis_status,
         needs_review=s.needs_review,
         review_reason=s.review_reason,
@@ -710,6 +731,19 @@ def create_product(
     Add a new product to inventory.
     Guards against identical duplicates unless force=True is provided.
     """
+    candidate_dates = None
+    if payload.scan_id:
+        candidate_dates = db.get_scan_date_candidates(payload.scan_id)
+
+    notes = payload.notes
+    if payload.quantity:
+        q_str = f"Quantity: {payload.quantity}"
+        if notes:
+            if "Quantity:" not in notes:
+                notes = f"{q_str} | {notes}"
+        else:
+            notes = q_str
+
     product_id = db.add_product(
         product_name=payload.product_name,
         date_type=payload.date_type,
@@ -719,8 +753,9 @@ def create_product(
         normalized_date=payload.normalized_date,
         date_status=payload.date_status,
         date_source=payload.date_source,
-        notes=payload.notes,
+        notes=notes,
         force=payload.force,
+        candidate_dates=candidate_dates,
     )
     p = db.get_product(product_id)
     if not p:
@@ -728,7 +763,8 @@ def create_product(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve newly created product.",
         )
-    return serialize_product(p)
+    candidates = db.get_product_date_candidates(product_id)
+    return serialize_product(p, candidates=candidates)
 
 
 @app.patch("/api/products/{product_id}", response_model=ProductResponse, tags=["Products"])
@@ -1020,21 +1056,29 @@ async def create_scan(
             detail="Invalid image data. File could not be decoded as an image (JPEG, PNG, WebP supported).",
         )
 
-    # 3. Optimize image resolution for fast processing while preserving 100% OCR sharpness
+    # 3. Preserve high image resolution & sharpness for maximum date readability
     h, w = frame_bgr.shape[:2]
     max_dim = max(h, w)
-    if max_dim > 1600:
-        scale = 1600.0 / max_dim
+    if max_dim > 2560:
+        scale = 2560.0 / max_dim
         new_w = int(w * scale)
         new_h = int(h * scale)
-        frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    # Re-encode as JPEG (quality 85) for efficient disk storage and AI network transfer
-    success, encoded_jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    if success:
-        optimized_bytes = encoded_jpg.tobytes()
+        frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        success, encoded_jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+        if success:
+            optimized_bytes = encoded_jpg.tobytes()
+        else:
+            optimized_bytes = image_bytes
     else:
+        # Preserve original uncompressed image bytes to prevent compression blur on tiny date text
         optimized_bytes = image_bytes
+
+    # Detect extension
+    ext = ".jpg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext = ".png"
+    elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:12]:
+        ext = ".webp"
 
     # Save to environment-aware captures directory
     captures_dir = get_captures_dir()
@@ -1049,7 +1093,7 @@ async def create_scan(
 
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_tag = uuid.uuid4().hex[:6]
-    image_filename = f"scan_{timestamp_str}_{unique_tag}.jpg"
+    image_filename = f"scan_{timestamp_str}_{unique_tag}{ext}"
     image_path = captures_dir / image_filename
 
     cleanup_needed = should_cleanup_captures()
