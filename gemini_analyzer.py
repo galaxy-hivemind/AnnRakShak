@@ -37,6 +37,9 @@ from google.genai import errors, types
 import httpx
 from pydantic import BaseModel, Field
 
+from product_classifier import ProductClassifier, CATEGORY_MEDICINE
+from relative_expiry import RelativeExpiryResolver
+
 # Load environment variables from .env if present
 load_dotenv()
 
@@ -134,27 +137,48 @@ def parse_retry_after(exc: Exception) -> float | None:
 
 
 SYSTEM_INSTRUCTION = """\
-You are an expert food safety packaging analyst for AnnaRakshak.
-Your task is to analyze images of food packages and extract product details and printed dates with strict precision and zero hallucinations.
+You are an expert food safety and packaging date intelligence analyst for AnnaRakshak.
+Your task is to analyze images of product packages and extract product identification and printed dates with strict precision and zero hallucinations.
 
-STRICT EXTRACTION RULES:
+STRICT PRODUCT CATEGORIZATION RULES:
+1. SUPPORTED CATEGORIES:
+   - 'Medicine': Pharmaceutical products, prescription medicines, OTC drugs, cough syrups, cold suspensions, fever drops, pain relievers, antibiotics, tablets, capsules, lozenges, and oral solutions.
+     CRITICAL: A medicine or pharmaceutical product (such as cough syrup, paracetamol tablets, or amoxicillin capsules) must ALWAYS be categorized as 'Medicine' and NEVER categorized as 'Beverage' even if it is a liquid, oral syrup, or suspension!
+   - 'Beverage': Fruit juices, soft drinks, mineral waters, teas, coffees, lemonades, energy drinks, and cordials. NEVER include medicinal syrups or pharmaceuticals.
+   - 'Dairy': Milk, cheese, butter, yogurt, dahi, paneer, cream, buttermilk, chaas, and ghee.
+   - 'Grains': Bread, bakery products, biscuits, rusks, flours, rice, cereals, pasta, and noodles.
+   - 'Snacks': Chips, crisps, namkeen, popcorn, crackers, and extruded snacks.
+   - 'Produce': Fresh fruits, fresh vegetables, salads, and fresh herbs.
+   - 'Pantry': Cooking oils, salts, sugars, spices, condiments, sauces, jams, and honey.
+2. UNCERTAINTY:
+   - If evidence is insufficient, contradictory, or unreadable, set food_category = null and needs_review = true. Never guess a category.
+3. SEPARATION:
+   - Keep product category strictly separate from packaging type (bottle, blister pack, carton) and storage instructions (keep refrigerated, store in cool dry place).
+
+STRICT DATE EXTRACTION & INTERPRETATION RULES:
 1. THOROUGH VISUAL EXAMINATION:
    - Carefully inspect the ENTIRE package visible in the frame, especially small-print date areas:
      box top flap, bottom flap, bottle neck, cap/lid, crimped edges, back/side label panels,
      and ink-jet or dot-matrix printed date codes.
-   - Extract EVERY visibly printed date and all nearby label text into 'date_candidates'.
-   - Preserve the exact printed characters in 'raw_text' (e.g. '04/2026', 'EXP 03/2028', '15-OCT-2026').
+   - Extract EVERY visibly printed date and nearby label text into 'date_candidates'.
+   - Preserve exact printed characters in 'raw_text' (e.g. '04/2026', 'EXP 03/2028', 'Best before 4 months from MFG').
    - Ground 'evidence' in nearby printed words (e.g. 'Printed next to Exp.: on top label panel').
 
 2. DATE CLASSIFICATION & INDIAN PACKAGING TERMS:
    - 'manufacturing' or 'packed_on': Marked with Mfg, MFD, Mfg Date, Manufactured, PKD, Packed, Packaging Date, Batch Mfd.
      CRITICAL: NEVER classify a manufacturing or packing date as an expiry date!
    - 'expiry' or 'use_by': Marked with EXP, Exp Date, Expiry, Use By, UB, Expires, Valid Till.
-   - 'best_before': Marked with Best Before, BB, Best By, Best before X months from packaging.
-     Do NOT treat best-before as interchangeable with explicit expiry/use-by.
+   - 'best_before': Marked with Best Before, BB, Best By, Best before X months from packaging/MFG.
+   - 'after_opening': Marked with "Use within X days of opening".
    - 'unknown': A date with no legible preceding label or clear indicator.
 
-3. DATE FORMATS & AMBIGUITY:
+3. RELATIVE EXPIRY & SHELF-LIFE:
+   - If packaging says "Best before X months from MFG" or "Shelf life: X months from manufacture":
+     * If a verified manufacturing date is printed, calculate the expiry date using calendar-month addition (e.g. MFD 2026-10-10 + 4 months = 2027-02-10).
+     * If manufacturing date is missing or unverified, do NOT invent a calendar date; record raw text, set normalized_date = null, and flag needs_review = true.
+   - If packaging says "Use within 30 days of opening", record date_type = 'after_opening', normalized_date = null, and flag needs_review = true unless opening date is explicitly provided.
+
+4. DATE FORMATS & AMBIGUITY:
    - Recognize common date formats: DD/MM/YY, DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, MM/YYYY, MM-YYYY, DD MMM YYYY, MMM YYYY.
    - If Day, Month, and Year are clearly legible, set normalized_date to 'YYYY-MM-DD'.
    - If only Month and Year are printed (e.g. '03/2028' or 'OCT 2026'): do NOT guess or invent an arbitrary day (like 01 or 31).
@@ -162,15 +186,9 @@ STRICT EXTRACTION RULES:
    - Treat ambiguous numeric dates conservatively: if day vs month is ambiguous, set normalized_date = null and list in date_candidates.
    - Alphanumeric lot numbers, batch codes (e.g. 'BD0114', 'L2410'), MRP, and barcodes are NOT dates.
 
-4. SELECTION OF EXPIRY DATE:
-   - Set 'selected_expiry_date' (YYYY-MM-DD) ONLY when supported by clear, unambiguous evidence of an explicit expiry or use-by date with full year, month, and day.
-   - If only manufacturing dates, only best-before dates, or only month/year dates exist: set selected_expiry_date = null.
-
-5. REVIEW & QUALITY FLAGS:
-   - If no dates are visible on the presented portion of the package, set needs_review = true, review_reason = 'No printed expiry or manufacturing dates visible on the presented portion of the package; date panel may be on another side or out of frame.'
-   - If the label or date area is blurry, faint, smeared, or small-print is illegible, set analysis_status = 'needs_review', needs_review = true, and explain clearly in review_reason.
-   - If the object is not a food product, set analysis_status = 'not_a_food_product' and needs_review = true.
-   - If no text or label is readable, set analysis_status = 'unreadable' and needs_review = true.
+5. SELECTION OF EXPIRY DATE:
+   - Set 'selected_expiry_date' (YYYY-MM-DD) ONLY when supported by clear, unambiguous evidence of an explicit expiry, use-by, or calculated relative best-before date with full year, month, and day.
+   - If only manufacturing dates or only month/year dates exist: set selected_expiry_date = null.
 """
 
 
@@ -181,7 +199,7 @@ STRICT EXTRACTION RULES:
 class DateCandidate(BaseModel):
     """Represents a single date marking found printed on the packaging."""
     raw_text: str = Field(description="Exact date text printed on the label as seen in the image.")
-    date_type: Literal["expiry", "use_by", "best_before", "manufacturing", "packed_on", "unknown"] = Field(
+    date_type: Literal["expiry", "use_by", "best_before", "manufacturing", "packed_on", "after_opening", "unknown"] = Field(
         description="Type of date printed on the packaging."
     )
     normalized_date: str | None = Field(
@@ -201,7 +219,7 @@ class FoodAnalysisResult(BaseModel):
     brand: str | None = Field(default=None, description="Brand name or manufacturer, or null.")
     food_category: str | None = Field(
         default=None,
-        description="Category such as Dairy, Bakery, Beverage, Snacks, Produce, Grains, Canned Goods, Condiments, or null.",
+        description="Category: Medicine, Dairy, Beverage, Grains, Snacks, Produce, Pantry, or null.",
     )
     date_candidates: list[DateCandidate] = Field(
         default_factory=list,
@@ -216,6 +234,11 @@ class FoodAnalysisResult(BaseModel):
     )
     needs_review: bool = Field(description="True if human verification is required due to ambiguity, blurriness, or errors.")
     review_reason: str | None = Field(default=None, description="Concise explanation when needs_review is true, or null.")
+    timing_ms: float = Field(default=0.0, description="Latency in milliseconds for the analysis.")
+    models_attempted: list[str] = Field(default_factory=list, description="List of models attempted.")
+    retries_count: int = Field(default=0, description="Number of retries executed during analysis.")
+    classification_source: str | None = Field(default=None, description="Source of classification: rule_deterministic or ai_model.")
+    classification_evidence: str | None = Field(default=None, description="Evidence justifying category.")
 
     @property
     def summary(self) -> str:
@@ -236,14 +259,92 @@ class FoodAnalysisResult(BaseModel):
     def post_validate(cls, result: FoodAnalysisResult) -> FoodAnalysisResult:
         """
         Enforce strict programmatic post-validation on analysis results:
-        1. Validate ISO format YYYY-MM-DD for selected_expiry_date.
-        2. Ensure manufacturing or packed_on dates are NEVER selected as expiry dates.
-        3. If raw text lacks day digits (e.g. 'OCT 2026'), normalized_date must be None.
-        4. If multiple conflicting expiry dates exist, enforce needs_review = True.
+        1. Apply deterministic product classification (medicines, dairy, beverages, etc.).
+        2. Resolve relative expiry durations (e.g. Best before 4 months from MFG).
+        3. Validate ISO format YYYY-MM-DD for selected_expiry_date.
+        4. Ensure manufacturing or packed_on dates are NEVER selected as expiry dates.
+        5. If raw text lacks day digits (e.g. 'OCT 2026'), normalized_date must be None.
+        6. If multiple conflicting expiry dates exist, enforce needs_review = True.
         """
         import re
 
-        # Rule 1: Validate selected_expiry_date format
+        # Step A: Deterministic Product Categorization
+        all_candidate_text = " ".join([c.raw_text + " " + c.evidence for c in result.date_candidates])
+        classifier_res = ProductClassifier.classify(
+            product_name=result.product_name,
+            brand=result.brand,
+            label_text=all_candidate_text,
+        )
+
+        if classifier_res.source == "rule_deterministic":
+            result.food_category = classifier_res.category
+            result.classification_source = classifier_res.source
+            result.classification_evidence = classifier_res.evidence
+            # If recognized as medicine, it is definitely a supported trackable item
+            if classifier_res.category == CATEGORY_MEDICINE and result.analysis_status == "not_a_food_product":
+                result.analysis_status = "success"
+        else:
+            # AI produced a category — enforce negative invariant: medicine is NEVER beverage
+            if result.food_category and result.food_category.lower() == "beverage":
+                combined = f"{result.product_name or ''} {result.brand or ''} {all_candidate_text}".lower()
+                is_med, med_ev, _ = ProductClassifier._detect_medicine(combined)
+                if is_med:
+                    result.food_category = CATEGORY_MEDICINE
+                    result.classification_source = "rule_deterministic"
+                    result.classification_evidence = f"Overrode misclassification: {med_ev}"
+
+            if not result.food_category and classifier_res.needs_review:
+                result.needs_review = True
+                if not result.review_reason:
+                    result.review_reason = classifier_res.review_reason
+
+        # Step B: Relative Expiry & Shelf-Life Interpretation
+        # Find verified manufacturing / packed_on date if present
+        mfg_date_str = None
+        for c in result.date_candidates:
+            if c.date_type in ("manufacturing", "packed_on") and c.normalized_date:
+                mfg_date_str = c.normalized_date
+                break
+
+        # Check for relative clauses across candidate text and review reasons
+        texts_to_search = [c.raw_text for c in result.date_candidates]
+        if result.review_reason:
+            texts_to_search.append(result.review_reason)
+        full_text_for_dates = " \n ".join(texts_to_search)
+
+        relative_matches = RelativeExpiryResolver.parse_relative_clauses(
+            text=full_text_for_dates,
+            verified_mfg_date=mfg_date_str,
+        )
+
+        for rel in relative_matches:
+            # Check if this relative candidate already exists in date_candidates
+            existing = [c for c in result.date_candidates if c.raw_text == rel.raw_text]
+            if not existing:
+                result.date_candidates.append(
+                    DateCandidate(
+                        raw_text=rel.raw_text,
+                        date_type=rel.date_type,
+                        normalized_date=rel.normalized_date,
+                        confidence=rel.confidence,
+                        evidence=rel.evidence,
+                    )
+                )
+            else:
+                for ex in existing:
+                    if rel.normalized_date and not ex.normalized_date:
+                        ex.normalized_date = rel.normalized_date
+                        ex.evidence = rel.evidence
+
+            # If calculated relative date has a valid normalized date and no explicit expiry date is selected
+            if rel.is_calculated and rel.normalized_date and not result.selected_expiry_date:
+                result.selected_expiry_date = rel.normalized_date
+            elif rel.needs_review and not result.selected_expiry_date:
+                result.needs_review = True
+                if rel.review_reason and not result.review_reason:
+                    result.review_reason = rel.review_reason
+
+        # Step C: Validate selected_expiry_date format
         if result.selected_expiry_date:
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", result.selected_expiry_date):
                 result.selected_expiry_date = None
@@ -253,7 +354,7 @@ class FoodAnalysisResult(BaseModel):
                     or "Selected expiry date does not follow strict YYYY-MM-DD format."
                 )
 
-        # Rule 2: Ensure manufacturing / packed dates are NEVER selected as expiry
+        # Step D: Ensure manufacturing / packed dates are NEVER selected as expiry
         if result.selected_expiry_date:
             mfg_matches = [
                 c for c in result.date_candidates
@@ -262,7 +363,7 @@ class FoodAnalysisResult(BaseModel):
             ]
             exp_matches = [
                 c for c in result.date_candidates
-                if c.date_type in ("expiry", "use_by")
+                if c.date_type in ("expiry", "use_by", "best_before")
                 and c.normalized_date == result.selected_expiry_date
             ]
             if mfg_matches and not exp_matches:
@@ -270,7 +371,7 @@ class FoodAnalysisResult(BaseModel):
                 result.needs_review = True
                 result.review_reason = "Manufacturing or packing date was identified; not an expiry date."
 
-        # Rule 3: Check candidate dates format
+        # Step E: Check candidate dates format
         for c in result.date_candidates:
             if c.normalized_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", c.normalized_date):
                 c.normalized_date = None
@@ -280,7 +381,7 @@ class FoodAnalysisResult(BaseModel):
                     or "Date candidate does not have a valid YYYY-MM-DD date."
                 )
 
-        # Rule 4: If multiple conflicting expiry candidates exist
+        # Step F: If multiple conflicting expiry candidates exist
         exp_dates = {
             c.normalized_date for c in result.date_candidates
             if c.date_type in ("expiry", "use_by") and c.normalized_date is not None
@@ -293,7 +394,7 @@ class FoodAnalysisResult(BaseModel):
                 or f"Multiple conflicting expiry dates found ({', '.join(sorted(exp_dates))})."
             )
 
-        # Rule 5: If no unambiguous expiry date is selected, review is required
+        # Step G: If no unambiguous expiry date is selected, review is required
         if result.selected_expiry_date is None:
             result.needs_review = True
             if not result.review_reason:
@@ -301,7 +402,7 @@ class FoodAnalysisResult(BaseModel):
                     result.review_reason = "No printed expiry or date markings detected on visible packaging."
                 else:
                     has_exp = any(c.date_type in ("expiry", "use_by") for c in result.date_candidates)
-                    has_bb = any(c.date_type == "best_before" for c in result.date_candidates)
+                    has_bb = any(c.date_type in ("best_before", "after_opening") for c in result.date_candidates)
                     has_mfg = any(c.date_type in ("manufacturing", "packed_on") for c in result.date_candidates)
                     if has_exp:
                         result.review_reason = "Expiry date candidate detected but lacks precise full day or requires manual confirmation."
@@ -403,6 +504,7 @@ class GeminiAnalyzer:
         self,
         image_path: Path | str,
         on_retry: Callable[[int, int, float, str], None] | None = None,
+        ocr_text: str | None = None,
     ) -> FoodAnalysisResult:
         """
         Analyze a captured food package image.
@@ -410,6 +512,7 @@ class GeminiAnalyzer:
         Respects server Retry-After guidance when provided.
         Returns a validated FoodAnalysisResult without raising exceptions.
         """
+        t0 = time.perf_counter()
         path = Path(image_path)
 
         # Validate file
@@ -419,6 +522,7 @@ class GeminiAnalyzer:
                 analysis_status="error",
                 needs_review=True,
                 review_reason=err or "Invalid image file",
+                timing_ms=(time.perf_counter() - t0) * 1000.0,
             )
 
         # Check API client
@@ -428,6 +532,7 @@ class GeminiAnalyzer:
                 analysis_status="error",
                 needs_review=True,
                 review_reason="GEMINI_API_KEY is not configured. Set GEMINI_API_KEY in .env or environment.",
+                timing_ms=(time.perf_counter() - t0) * 1000.0,
             )
 
         # Determine MIME type
@@ -440,9 +545,14 @@ class GeminiAnalyzer:
                 models_to_try.append(fb)
 
         last_err: Exception | None = None
+        models_attempted: list[str] = []
+        total_retries = 0
 
         for current_model in models_to_try:
-            model_exhausted = False
+            if current_model not in models_attempted:
+                models_attempted.append(current_model)
+            model_failed = False
+
             for attempt in range(self.max_retries + 1):
                 try:
                     image_bytes = path.read_bytes()
@@ -454,12 +564,16 @@ class GeminiAnalyzer:
                         system_instruction=SYSTEM_INSTRUCTION,
                     )
 
-                    prompt = (
-                        "Carefully inspect this food package image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
-                        "Identify the product name, brand, food category, and ALL printed dates (manufacturing, packing, expiry, use-by, best-before). "
+                    prompt_parts = [
+                        "Carefully inspect this packaging image across all visible areas (including top, bottom, neck, cap, edges, and small print). "
+                        "Identify the product name, brand, food category (Medicine, Dairy, Beverage, Grains, Snacks, Produce, Pantry), "
+                        "and ALL printed dates (manufacturing, packing, expiry, use-by, best-before, after-opening). "
                         "Extract each printed date into date_candidates with exact raw_text, accurate date_type, and nearby evidence. "
                         "Follow all strict date interpretation rules without hallucination."
-                    )
+                    ]
+                    if ocr_text:
+                        prompt_parts.append(f"\nVisible text detected by local OCR:\n{ocr_text[:1200]}")
+                    prompt = "\n".join(prompt_parts)
 
                     response = client.models.generate_content(
                         model=current_model,
@@ -470,24 +584,32 @@ class GeminiAnalyzer:
                         config=config,
                     )
 
+                    parsed_res: FoodAnalysisResult | None = None
                     if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
-                        return FoodAnalysisResult.post_validate(response.parsed)
-
-                    if hasattr(response, "text") and response.text:
+                        parsed_res = FoodAnalysisResult.post_validate(response.parsed)
+                    elif hasattr(response, "text") and response.text:
                         res = FoodAnalysisResult.model_validate_json(response.text)
-                        return FoodAnalysisResult.post_validate(res)
+                        parsed_res = FoodAnalysisResult.post_validate(res)
+
+                    if parsed_res:
+                        parsed_res.timing_ms = (time.perf_counter() - t0) * 1000.0
+                        parsed_res.models_attempted = list(models_attempted)
+                        parsed_res.retries_count = total_retries
+                        return parsed_res
 
                     return FoodAnalysisResult(
                         analysis_status="error",
                         needs_review=True,
                         review_reason="Empty response received from Gemini API",
+                        timing_ms=(time.perf_counter() - t0) * 1000.0,
+                        models_attempted=list(models_attempted),
+                        retries_count=total_retries,
                     )
 
                 except Exception as e:
                     last_err = e
                     retryable, reason_cat = is_retryable_exception(e)
 
-                    # Check for model not found / unavailable where switching model is preferred
                     err_str = str(e)
                     is_model_unavailable = any(k in err_str for k in ("404", "NOT_FOUND", "503", "UNAVAILABLE", "high demand"))
                     if is_model_unavailable and current_model != models_to_try[-1]:
@@ -495,26 +617,26 @@ class GeminiAnalyzer:
                             "Model '%s' unavailable (%s). Switching to fallback model...",
                             current_model, err_str.split("\n")[0]
                         )
-                        model_exhausted = True
+                        model_failed = True
                         break
 
                     if not retryable:
-                        # Permanent error (e.g., auth, bad request, invalid API key) — do not retry
                         logger.warning(
                             "Non-retryable error encountered for model '%s': %s",
                             current_model, reason_cat
                         )
+                        model_failed = False
                         break
 
-                    # If we have reached the maximum retry count for this model
                     if attempt >= self.max_retries:
                         logger.warning(
                             "Retry budget exhausted (%d/%d retries) on model '%s' for reason: %s",
                             attempt, self.max_retries, current_model, reason_cat
                         )
+                        model_failed = False
                         break
 
-                    # Compute backoff with full jitter and Retry-After header consideration
+                    total_retries += 1
                     server_delay = parse_retry_after(e)
                     if server_delay is not None:
                         delay = min(server_delay, self.max_backoff)
@@ -535,8 +657,9 @@ class GeminiAnalyzer:
 
                     self._sleeper(delay)
 
-            if not model_exhausted:
-                # If we broke out without exhausting retries/models (and didn't return), break models loop
+            # If this model succeeded, it already returned above.
+            # If it failed and we broke out, continue to next fallback model if available
+            if not model_failed:
                 break
 
         err_msg = str(last_err) if last_err else "Unknown error"
@@ -559,6 +682,9 @@ class GeminiAnalyzer:
             analysis_status="error",
             needs_review=True,
             review_reason=reason,
+            timing_ms=(time.perf_counter() - t0) * 1000.0,
+            models_attempted=list(models_attempted),
+            retries_count=total_retries,
         )
 
 

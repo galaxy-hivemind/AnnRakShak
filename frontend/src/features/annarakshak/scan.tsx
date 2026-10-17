@@ -106,7 +106,11 @@ export function Scan() {
     return dataUrl;
   }
 
+  const isSubmitting = useRef(false);
+
   async function executeScan(imageData: string) {
+    if (isSubmitting.current) return;
+    isSubmitting.current = true;
     const run = ++sequence.current;
     setScan(undefined);
     setError('');
@@ -129,10 +133,13 @@ export function Scan() {
       if (run !== sequence.current) return;
       setState('Analysis Failed');
       setError(err instanceof Error ? err.message : 'Analysis failed. Please check backend connection and retry.');
+    } finally {
+      isSubmitting.current = false;
     }
   }
 
   function handleCapture() {
+    if (busy || isSubmitting.current) return;
     const frame = captureFrame();
     if (!frame) {
       setError('Could not capture frame from video stream. Please ensure camera is active and try again.');

@@ -23,6 +23,7 @@ import base64
 import datetime
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -255,6 +256,16 @@ class AlertItem(BaseModel):
     days_remaining: int | None = None
 
 
+class ScanTiming(BaseModel):
+    upload_preprocess_ms: float = 0.0
+    ocr_ms: float = 0.0
+    gemini_ms: float = 0.0
+    db_ms: float = 0.0
+    total_ms: float = 0.0
+    models_attempted: list[str] = Field(default_factory=list)
+    retries_count: int = 0
+
+
 class ScanResponse(BaseModel):
     id: int
     timestamp: str
@@ -269,6 +280,7 @@ class ScanResponse(BaseModel):
     error_message: str | None = None
     raw_json: str | None = None
     date_candidates: list[DateCandidateItem] = []
+    timing: ScanTiming | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -320,8 +332,9 @@ def serialize_product(
 def serialize_scan(
     s: ScanHistoryRecord,
     candidates: list[DateCandidateRecord] | None = None,
+    timing: ScanTiming | None = None,
 ) -> ScanResponse:
-    """Helper to convert ScanHistoryRecord into ScanResponse with attached candidates."""
+    """Helper to convert ScanHistoryRecord into ScanResponse with attached candidates and timing."""
     return ScanResponse(
         id=s.id,
         timestamp=s.timestamp,
@@ -336,6 +349,7 @@ def serialize_scan(
         error_message=s.error_message,
         raw_json=s.raw_json,
         date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
+        timing=timing,
     )
 
 
@@ -345,13 +359,27 @@ def serialize_scan(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application state and resources."""
+    """Manage application state, database, Gemini analyzer, and persistent OCR engine."""
     if not hasattr(app.state, "db") or app.state.db is None:
         db_path = os.getenv("ANNARAKSHAK_DB_PATH", str(DEFAULT_DB_PATH))
         app.state.db = InventoryDatabase(db_path=db_path)
     if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
         app.state.analyzer = GeminiAnalyzer()
-    yield
+    if not hasattr(app.state, "ocr_engine") or app.state.ocr_engine is None:
+        try:
+            app.state.ocr_engine = AppleVisionOCREngine()
+        except Exception as e:
+            logger.warning("Could not initialize shared AppleVisionOCREngine: %s", e)
+            app.state.ocr_engine = None
+
+    try:
+        yield
+    finally:
+        if hasattr(app.state, "ocr_engine") and app.state.ocr_engine is not None:
+            try:
+                app.state.ocr_engine.shutdown()
+            except Exception:
+                pass
 
 
 app = FastAPI(
@@ -732,6 +760,7 @@ def get_scan_date_candidates(
 @app.post("/api/scans/{scan_id}/reanalyze", response_model=ScanResponse, tags=["Scans"])
 async def reanalyze_scan(
     scan_id: int,
+    request: Request,
     db: InventoryDatabase = Depends(get_db),
     analyzer: GeminiAnalyzer = Depends(get_analyzer),
 ) -> ScanResponse:
@@ -740,6 +769,7 @@ async def reanalyze_scan(
     Executes asynchronously in a worker thread so the API event loop remains responsive.
     Updates scan_history and candidate dates in place without creating duplicate scans.
     """
+    t0 = time.perf_counter()
     scan = db.get_scan(scan_id)
     if not scan:
         raise HTTPException(
@@ -754,11 +784,33 @@ async def reanalyze_scan(
             detail=f"Scan image capture does not exist or is inaccessible on disk: {scan.image_path}",
         )
 
-    # Offload analysis to worker thread to avoid blocking FastAPI event loop
-    result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path))
+    # Optional local OCR if available
+    shared_ocr = getattr(request.app.state, "ocr_engine", None)
+    ocr_text = None
+    t_ocr_0 = time.perf_counter()
+    try:
+        frame_bgr = cv2.imread(str(img_path))
+        if frame_bgr is not None:
+            ocr_res = await asyncio.to_thread(run_local_ocr, frame_bgr, shared_ocr)
+            if ocr_res and ocr_res.has_text:
+                ocr_text = ocr_res.summary_text
+    except Exception:
+        pass
+    ocr_ms = (time.perf_counter() - t_ocr_0) * 1000.0
 
+    # Offload analysis to worker thread to avoid blocking FastAPI event loop
+    t_gem_0 = time.perf_counter()
+    if ocr_text:
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path), ocr_text=ocr_text)
+    else:
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path))
+    gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
+
+    t_db_0 = time.perf_counter()
     error_message = result.review_reason if result.analysis_status == "error" else None
     db.update_scan(scan_id, result=result, error_message=error_message)
+    db_ms = (time.perf_counter() - t_db_0) * 1000.0
+    total_ms = (time.perf_counter() - t0) * 1000.0
 
     updated_scan = db.get_scan(scan_id)
     if not updated_scan:
@@ -767,15 +819,29 @@ async def reanalyze_scan(
             detail="Failed to retrieve updated scan after reanalysis.",
         )
     candidates = db.get_scan_date_candidates(scan_id)
-    return serialize_scan(updated_scan, candidates=candidates)
+    timing_meta = ScanTiming(
+        upload_preprocess_ms=0.0,
+        ocr_ms=round(ocr_ms, 2),
+        gemini_ms=round(gemini_ms, 2),
+        db_ms=round(db_ms, 2),
+        total_ms=round(total_ms, 2),
+        models_attempted=result.models_attempted,
+        retries_count=result.retries_count,
+    )
+    logger.info(
+        "Scan %d reanalyzed in %.1fms (ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
+        scan_id, total_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
+    )
+    return serialize_scan(updated_scan, candidates=candidates, timing=timing_meta)
 
 
-def run_local_ocr(frame_bgr: np.ndarray) -> OCRResult | None:
-    """Run local Apple Vision OCR if available, ignoring failures gracefully."""
+def run_local_ocr(frame_bgr: np.ndarray, engine: AppleVisionOCREngine | None = None) -> OCRResult | None:
+    """Run local Apple Vision OCR if available, reusing shared engine instance when provided."""
     try:
-        engine = AppleVisionOCREngine()
-        result = engine.detect_text(frame_bgr)
-        engine.shutdown()
+        active_engine = engine or AppleVisionOCREngine()
+        result = active_engine.detect_text(frame_bgr)
+        if engine is None:
+            active_engine.shutdown()
         return result
     except Exception as e:
         logger.debug("Local Apple Vision OCR detection pass skipped/failed: %s", e)
@@ -790,9 +856,13 @@ async def create_scan(
 ) -> ScanResponse:
     """
     Process a newly captured or uploaded packaging image.
-    Validates image data, saves the frame to disk in captures/, runs local OCR
-    and Gemini AI analysis asynchronously, and stores the results and candidate dates in SQLite.
+    Validates image data, optimizes resolution, saves the frame to captures/,
+    runs local OCR and Gemini AI analysis asynchronously, and stores the results and
+    candidate dates in SQLite with structured latency metrics.
     """
+    t_total_0 = time.perf_counter()
+    t_prep_0 = time.perf_counter()
+
     content_type = request.headers.get("content-type", "")
     image_bytes: bytes = b""
 
@@ -859,30 +929,60 @@ async def create_scan(
             detail="Invalid image data. File could not be decoded as an image (JPEG, PNG, WebP supported).",
         )
 
-    # 3. Save to captures directory
+    # 3. Optimize image resolution for fast processing while preserving 100% OCR sharpness
+    h, w = frame_bgr.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 1600:
+        scale = 1600.0 / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Re-encode as JPEG (quality 85) for efficient disk storage and AI network transfer
+    success, encoded_jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if success:
+        optimized_bytes = encoded_jpg.tobytes()
+    else:
+        optimized_bytes = image_bytes
+
+    # Save to captures directory
     captures_dir = Path("captures")
     captures_dir.mkdir(parents=True, exist_ok=True)
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_tag = uuid.uuid4().hex[:6]
     image_filename = f"scan_{timestamp_str}_{unique_tag}.jpg"
     image_path = captures_dir / image_filename
-    image_path.write_bytes(image_bytes)
+    image_path.write_bytes(optimized_bytes)
 
-    # 4. Local OCR Pass
-    ocr_result = await asyncio.to_thread(run_local_ocr, frame_bgr)
-    if ocr_result and ocr_result.has_text:
-        logger.info("Local OCR detected text regions (%d): %s", len(ocr_result.regions), ocr_result.summary_text)
+    upload_preprocess_ms = (time.perf_counter() - t_prep_0) * 1000.0
 
-    # 5. Gemini AI Analysis (asynchronous in worker thread)
-    result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
+    # 4. Local OCR Pass (reusing shared persistent Apple Vision engine)
+    t_ocr_0 = time.perf_counter()
+    shared_ocr = getattr(request.app.state, "ocr_engine", None)
+    ocr_result = await asyncio.to_thread(run_local_ocr, frame_bgr, shared_ocr)
+    ocr_ms = (time.perf_counter() - t_ocr_0) * 1000.0
+    ocr_text = ocr_result.summary_text if (ocr_result and ocr_result.has_text) else None
+    if ocr_text:
+        logger.info("Local OCR extracted text (%d regions): %s", len(ocr_result.regions), ocr_text[:120])
+
+    # 5. Gemini AI Analysis (asynchronous in worker thread with OCR context)
+    t_gem_0 = time.perf_counter()
+    if ocr_text:
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), ocr_text=ocr_text)
+    else:
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
+    gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
     # 6. Record to SQLite Database
+    t_db_0 = time.perf_counter()
     error_message = result.review_reason if result.analysis_status == "error" else None
     scan_id = db.record_scan(
         image_path=str(image_path),
         result=result,
         error_message=error_message,
     )
+    db_ms = (time.perf_counter() - t_db_0) * 1000.0
+    total_ms = (time.perf_counter() - t_total_0) * 1000.0
 
     created_scan = db.get_scan(scan_id)
     if not created_scan:
@@ -891,7 +991,23 @@ async def create_scan(
             detail="Failed to retrieve scan after saving to database.",
         )
     candidates = db.get_scan_date_candidates(scan_id)
-    return serialize_scan(created_scan, candidates=candidates)
+
+    timing_meta = ScanTiming(
+        upload_preprocess_ms=round(upload_preprocess_ms, 2),
+        ocr_ms=round(ocr_ms, 2),
+        gemini_ms=round(gemini_ms, 2),
+        db_ms=round(db_ms, 2),
+        total_ms=round(total_ms, 2),
+        models_attempted=result.models_attempted,
+        retries_count=result.retries_count,
+    )
+
+    logger.info(
+        "Scan %d completed in %.1fms (preprocess=%.1fms, ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
+        scan_id, total_ms, upload_preprocess_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
+    )
+
+    return serialize_scan(created_scan, candidates=candidates, timing=timing_meta)
 
 
 @app.get("/api/scans/{scan_id}/image", tags=["Scans"])

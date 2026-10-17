@@ -210,16 +210,30 @@ class AppleVisionOCREngine(BaseOCREngine):
             )
 
     def shutdown(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        if self._proc:
             try:
-                if self._proc.stdin:
-                    self._proc.stdin.write("EXIT\n")
-                    self._proc.stdin.flush()
-                self._proc.terminate()
-                self._proc.wait(timeout=1.0)
+                if self._proc.poll() is None:
+                    if self._proc.stdin and not self._proc.stdin.closed:
+                        try:
+                            self._proc.stdin.write("EXIT\n")
+                            self._proc.stdin.flush()
+                        except Exception:
+                            pass
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=1.0)
+                    except Exception:
+                        self._proc.kill()
             except Exception:
                 pass
-            self._proc = None
+            finally:
+                for pipe in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                    if pipe and not getattr(pipe, "closed", True):
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+                self._proc = None
 
         try:
             shutil.rmtree(self._temp_dir, ignore_errors=True)

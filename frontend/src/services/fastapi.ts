@@ -109,6 +109,10 @@ const categoryMap: Record<string, Category> = {
   'canned goods': 'Pantry Staples',
   produce: 'Fresh Produce',
   'fresh produce': 'Fresh Produce',
+  medicine: 'Pantry Staples',
+  medicines: 'Pantry Staples',
+  pharmaceutical: 'Pantry Staples',
+  pharmaceuticals: 'Pantry Staples',
 };
 
 export function toFrontendCategory(raw: string | null | undefined): Category {
@@ -138,7 +142,7 @@ export function toBackendCategory(cat: Category): string {
 export function toFrontendDateType(raw: string | null | undefined): DateType {
   const clean = (raw || '').trim().toLowerCase();
   if (clean === 'use_by' || clean === 'use by') return 'Use By';
-  if (clean === 'best_before' || clean === 'best before') return 'Best Before';
+  if (clean === 'best_before' || clean === 'best before' || clean === 'after_opening') return 'Best Before';
   if (clean === 'manufacturing') return 'Manufacturing';
   if (clean === 'packed_on' || clean === 'packed on') return 'Packed On';
   return 'Expiry';
