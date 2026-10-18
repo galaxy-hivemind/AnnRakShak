@@ -38,6 +38,7 @@ import numpy as np
 from pydantic import BaseModel, Field, field_validator
 
 from gemini_analyzer import FoodAnalysisResult, GeminiAnalyzer
+from confidence_evaluator import evaluate_scan_confidence, ConfidenceAssessment
 from ocr_engine import AppleVisionOCREngine, OCRResult
 from inventory_db import (
     DEFAULT_DB_PATH,
@@ -289,6 +290,9 @@ class ScanResponse(BaseModel):
     date_candidates: list[DateCandidateItem] = []
     timing: ScanTiming | None = None
     product_id: int | None = None
+    auto_saved: bool = False
+    confidence_score: float | None = None
+    decision_reason: str | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -435,6 +439,9 @@ def serialize_scan(
     s: ScanHistoryRecord,
     candidates: list[DateCandidateRecord] | None = None,
     timing: ScanTiming | None = None,
+    auto_saved: bool | None = None,
+    confidence_score: float | None = None,
+    decision_reason: str | None = None,
 ) -> ScanResponse:
     """Helper to convert ScanHistoryRecord into ScanResponse with attached candidates and timing."""
     quantity = None
@@ -445,6 +452,24 @@ def serialize_scan(
             quantity = parsed.get("quantity")
         except Exception:
             pass
+
+    cand_items = [DateCandidateItem(**c.to_dict()) for c in (candidates or [])]
+
+    if auto_saved is None:
+        auto_saved = bool(s.product_id is not None and not s.needs_review)
+
+    if confidence_score is None:
+        if cand_items:
+            confidence_score = round(max((c.confidence for c in cand_items), default=0.5), 2)
+        else:
+            confidence_score = 0.95 if auto_saved else 0.5
+
+    if decision_reason is None:
+        if auto_saved:
+            decision_reason = "High confidence: automatically saved to inventory."
+        else:
+            decision_reason = s.review_reason or s.error_message or "Manual review required"
+
     return ScanResponse(
         id=s.id,
         timestamp=s.timestamp,
@@ -459,9 +484,12 @@ def serialize_scan(
         selected_expiry_date=s.selected_expiry_date,
         error_message=s.error_message,
         raw_json=s.raw_json,
-        date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
+        date_candidates=cand_items,
         timing=timing,
         product_id=s.product_id,
+        auto_saved=auto_saved,
+        confidence_score=confidence_score,
+        decision_reason=decision_reason,
     )
 
 
@@ -790,7 +818,19 @@ def update_product(
             detail=f"Product with ID {product_id} not found.",
         )
 
-    # 1. Update date if normalized_date or date_type is provided
+    # 1. Prepare notes with quantity if quantity is updated
+    current_notes = payload.notes if payload.notes is not None else (existing.notes or "")
+    if payload.quantity is not None:
+        q_str = f"Quantity: {payload.quantity.strip()}"
+        if "Quantity:" in current_notes:
+            parts = [p.strip() for p in current_notes.split("|") if p.strip()]
+            parts = [p for p in parts if not p.lower().startswith("quantity:")]
+            parts.insert(0, q_str)
+            current_notes = " | ".join(parts)
+        else:
+            current_notes = f"{q_str} | {current_notes}" if current_notes else q_str
+
+    # 2. Update date if normalized_date or date_type is provided
     date_changed = (payload.normalized_date is not None) or (payload.date_type is not None)
     if date_changed:
         target_norm = payload.normalized_date if payload.normalized_date is not None else existing.normalized_date
@@ -799,10 +839,10 @@ def update_product(
             product_id=product_id,
             normalized_date=target_norm,
             date_type=target_type,
-            notes=payload.notes,
+            notes=current_notes or None,
         )
 
-    # 2. Update descriptive metadata
+    # 3. Update descriptive metadata
     update_fields: dict[str, Any] = {}
     if payload.product_name is not None:
         update_fields["product_name"] = payload.product_name
@@ -812,9 +852,8 @@ def update_product(
         update_fields["food_category"] = payload.food_category
     if payload.image_path is not None:
         update_fields["image_path"] = payload.image_path
-    if payload.notes is not None and not date_changed:
-        # If date wasn't updated, update notes directly
-        update_fields["notes"] = payload.notes
+    if (payload.notes is not None or payload.quantity is not None) and not date_changed:
+        update_fields["notes"] = current_notes or None
 
     if update_fields:
         db.update_product(product_id, **update_fields)
@@ -900,6 +939,12 @@ def delete_scan(
     optionally the inventory product created from this scan.
     Safe against already-deleted records.
     """
+    scan = db.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan with ID {scan_id} not found.",
+        )
     success, deleted_prod_id = db.delete_scan(scan_id=scan_id, delete_associated_product=delete_product)
     if not success:
         return DeleteResponse(
@@ -966,9 +1011,67 @@ async def reanalyze_scan(
         result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path))
     gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
+    # Assess confidence and auto-save eligibility
+    assessment = evaluate_scan_confidence(result)
+    existing_product_id = scan.product_id
+
     t_db_0 = time.perf_counter()
-    error_message = result.review_reason if result.analysis_status == "error" else None
-    db.update_scan(scan_id, result=result, error_message=error_message)
+    if assessment.should_auto_save:
+        result.needs_review = False
+        result.review_reason = None
+        if assessment.primary_date:
+            result.selected_expiry_date = assessment.primary_date
+
+        db.update_scan(scan_id, result=result, error_message=None)
+        cand_records = db.get_scan_date_candidates(scan_id)
+
+        notes_parts = []
+        if result.quantity:
+            notes_parts.append(f"Quantity: {result.quantity}")
+        if assessment.primary_date:
+            notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+        notes_str = " | ".join(notes_parts) if notes_parts else None
+
+        if existing_product_id:
+            db.update_product(
+                existing_product_id,
+                product_name=result.product_name,
+                brand=result.brand,
+                food_category=result.food_category,
+                date_type=assessment.primary_date_type or "expiry",
+                normalized_date=assessment.primary_date,
+                notes=notes_str,
+            )
+        else:
+            db.add_product(
+                product_name=result.product_name,
+                brand=result.brand,
+                food_category=result.food_category,
+                date_type=assessment.primary_date_type or "expiry",
+                date_text=None,
+                normalized_date=assessment.primary_date,
+                date_status="confirmed",
+                date_source="printed",
+                analysis_status="success",
+                image_path=str(img_path),
+                notes=notes_str,
+                candidate_dates=cand_records,
+                force=True,
+                scan_id=scan_id,
+            )
+        auto_saved = True
+        decision_reason = assessment.decision_reason
+    else:
+        result.needs_review = True
+        result.review_reason = assessment.decision_reason
+        db.update_scan(
+            scan_id,
+            result=result,
+            error_message=assessment.decision_reason if result.analysis_status == "error" else None,
+        )
+        auto_saved = False
+        decision_reason = assessment.decision_reason
+
     db_ms = (time.perf_counter() - t_db_0) * 1000.0
     total_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -989,10 +1092,17 @@ async def reanalyze_scan(
         retries_count=result.retries_count,
     )
     logger.info(
-        "Scan %d reanalyzed in %.1fms (ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
-        scan_id, total_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
+        "Scan %d reanalyzed in %.1fms (ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d, auto_saved=%s)",
+        scan_id, total_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count, auto_saved
     )
-    return serialize_scan(updated_scan, candidates=candidates, timing=timing_meta)
+    return serialize_scan(
+        updated_scan,
+        candidates=candidates,
+        timing=timing_meta,
+        auto_saved=auto_saved,
+        confidence_score=assessment.confidence_score,
+        decision_reason=decision_reason,
+    )
 
 
 def run_local_ocr(frame_bgr: np.ndarray, engine: AppleVisionOCREngine | None = None) -> OCRResult | None:
@@ -1155,14 +1265,74 @@ async def create_scan(
             result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
         gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
+        # Assess confidence and auto-save eligibility
+        assessment = evaluate_scan_confidence(result)
+
         # 6. Record to Database
         t_db_0 = time.perf_counter()
-        error_message = result.review_reason if result.analysis_status == "error" else None
-        scan_id = db.record_scan(
-            image_path=str(image_path),
-            result=result,
-            error_message=error_message,
-        )
+        if assessment.should_auto_save:
+            # Path A: High-confidence scan - automatic save
+            result.needs_review = False
+            result.review_reason = None
+            if assessment.primary_date:
+                result.selected_expiry_date = assessment.primary_date
+
+            scan_id = db.record_scan(
+                image_path=str(image_path),
+                result=result,
+                error_message=None,
+            )
+            cand_records = db.get_scan_date_candidates(scan_id)
+
+            notes_parts = []
+            if result.quantity:
+                notes_parts.append(f"Quantity: {result.quantity}")
+            if assessment.primary_date:
+                notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+            notes_str = " | ".join(notes_parts) if notes_parts else None
+
+            try:
+                product_id = db.add_product(
+                    product_name=result.product_name,
+                    brand=result.brand,
+                    food_category=result.food_category,
+                    date_type=assessment.primary_date_type or "expiry",
+                    date_text=None,
+                    normalized_date=assessment.primary_date,
+                    date_status="confirmed",
+                    date_source="printed",
+                    analysis_status="success",
+                    image_path=str(image_path),
+                    notes=notes_str,
+                    candidate_dates=cand_records,
+                    force=True,
+                    scan_id=scan_id,
+                )
+                auto_saved = True
+                decision_reason = assessment.decision_reason
+            except Exception as e:
+                logger.error("Auto-save failed to persist product for scan %d: %s", scan_id, e)
+                auto_saved = False
+                decision_reason = f"Failed to save product to inventory: {e}"
+                db.update_scan(scan_id, error_message=decision_reason)
+                with db._get_connection() as conn:
+                    conn.execute(
+                        "UPDATE scan_history SET needs_review = 1, review_reason = ? WHERE id = ?",
+                        (decision_reason, scan_id),
+                    )
+        else:
+            # Path B: Low-confidence or uncertain scan - manual review
+            # Do NOT create an inventory product automatically
+            result.needs_review = True
+            result.review_reason = assessment.decision_reason
+            scan_id = db.record_scan(
+                image_path=str(image_path),
+                result=result,
+                error_message=assessment.decision_reason if result.analysis_status == "error" else None,
+            )
+            auto_saved = False
+            decision_reason = assessment.decision_reason
+
         db_ms = (time.perf_counter() - t_db_0) * 1000.0
         total_ms = (time.perf_counter() - t_total_0) * 1000.0
 
@@ -1185,11 +1355,18 @@ async def create_scan(
         )
 
         logger.info(
-            "Scan %d completed in %.1fms (preprocess=%.1fms, ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d)",
-            scan_id, total_ms, upload_preprocess_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count
+            "Scan %d completed in %.1fms (preprocess=%.1fms, ocr=%.1fms, gemini=%.1fms, db=%.1fms, models=%s, retries=%d, auto_saved=%s)",
+            scan_id, total_ms, upload_preprocess_ms, ocr_ms, gemini_ms, db_ms, result.models_attempted, result.retries_count, auto_saved
         )
 
-        return serialize_scan(created_scan, candidates=candidates, timing=timing_meta)
+        return serialize_scan(
+            created_scan,
+            candidates=candidates,
+            timing=timing_meta,
+            auto_saved=auto_saved,
+            confidence_score=assessment.confidence_score,
+            decision_reason=decision_reason,
+        )
     finally:
         if cleanup_needed and image_written:
             _safe_remove_file(image_path)

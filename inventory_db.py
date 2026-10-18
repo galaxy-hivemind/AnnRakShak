@@ -875,7 +875,35 @@ class InventoryDatabase:
                             scan_id,
                         ),
                     )
-                    if candidate_dates:
+                    if scan_id is not None:
+                        existing_cands = conn.execute(
+                            "SELECT COUNT(*) FROM date_candidates WHERE scan_id = ?",
+                            (scan_id,),
+                        ).fetchone()
+                        count = existing_cands[0] if existing_cands else 0
+                        if count > 0:
+                            conn.execute(
+                                "UPDATE date_candidates SET product_id = ? WHERE scan_id = ?",
+                                (prod_id, scan_id),
+                            )
+                        elif candidate_dates:
+                            conn.execute("DELETE FROM date_candidates WHERE product_id = ?", (prod_id,))
+                            for c in candidate_dates:
+                                raw_text = getattr(c, "raw_text", str(c))
+                                c_type = getattr(c, "date_type", "unknown")
+                                c_norm = getattr(c, "normalized_date", None)
+                                c_conf = float(getattr(c, "confidence", 1.0))
+                                c_evid = getattr(c, "evidence", "")
+                                conn.execute(
+                                    """
+                                    INSERT INTO date_candidates (
+                                        product_id, scan_id, raw_text, date_type,
+                                        normalized_date, confidence, evidence, created_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (prod_id, scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                                )
+                    elif candidate_dates:
                         conn.execute("DELETE FROM date_candidates WHERE product_id = ?", (prod_id,))
                         for c in candidate_dates:
                             raw_text = getattr(c, "raw_text", str(c))
@@ -883,6 +911,7 @@ class InventoryDatabase:
                             c_norm = getattr(c, "normalized_date", None)
                             c_conf = float(getattr(c, "confidence", 1.0))
                             c_evid = getattr(c, "evidence", "")
+                            c_scan = getattr(c, "scan_id", None)
                             conn.execute(
                                 """
                                 INSERT INTO date_candidates (
@@ -890,7 +919,7 @@ class InventoryDatabase:
                                     normalized_date, confidence, evidence, created_at
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
-                                (prod_id, scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                                (prod_id, c_scan, raw_text, c_type, c_norm, c_conf, c_evid, now),
                             )
                     return prod_id
 
@@ -983,15 +1012,42 @@ class InventoryDatabase:
                     ),
                 )
 
-            # Attach candidate dates if provided
-            if candidate_dates:
+            # Attach or link candidate dates
+            if scan_id is not None:
+                existing_cands = conn.execute(
+                    "SELECT COUNT(*) FROM date_candidates WHERE scan_id = ?",
+                    (scan_id,),
+                ).fetchone()
+                count = existing_cands[0] if existing_cands else 0
+                if count > 0:
+                    conn.execute(
+                        "UPDATE date_candidates SET product_id = ? WHERE scan_id = ?",
+                        (product_id, scan_id),
+                    )
+                elif candidate_dates:
+                    for c in candidate_dates:
+                        raw_text = getattr(c, "raw_text", str(c))
+                        c_type = getattr(c, "date_type", "unknown")
+                        c_norm = getattr(c, "normalized_date", None)
+                        c_conf = float(getattr(c, "confidence", 1.0))
+                        c_evid = getattr(c, "evidence", "")
+                        conn.execute(
+                            """
+                            INSERT INTO date_candidates (
+                                product_id, scan_id, raw_text, date_type,
+                                normalized_date, confidence, evidence, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (product_id, scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                        )
+            elif candidate_dates:
                 for c in candidate_dates:
                     raw_text = getattr(c, "raw_text", str(c))
                     c_type = getattr(c, "date_type", "unknown")
                     c_norm = getattr(c, "normalized_date", None)
                     c_conf = float(getattr(c, "confidence", 1.0))
                     c_evid = getattr(c, "evidence", "")
-                    c_scan_id = scan_id or getattr(c, "scan_id", None)
+                    c_scan = getattr(c, "scan_id", None)
                     conn.execute(
                         """
                         INSERT INTO date_candidates (
@@ -999,7 +1055,7 @@ class InventoryDatabase:
                             normalized_date, confidence, evidence, created_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (product_id, c_scan_id, raw_text, c_type, c_norm, c_conf, c_evid, now),
+                        (product_id, c_scan, raw_text, c_type, c_norm, c_conf, c_evid, now),
                     )
 
             return product_id
@@ -1114,9 +1170,19 @@ class InventoryDatabase:
     def update_product(self, product_id: int, **fields: Any) -> bool:
         """
         Update editable product fields.
-        Accepts: product_name, brand, food_category, notes, image_path.
+        Accepts: product_name, brand, food_category, notes, image_path, date_type, normalized_date, date_status.
+        Synchronizes linked scan_history record if scan_id exists.
         """
-        allowed = {"product_name", "brand", "food_category", "notes", "image_path"}
+        allowed = {
+            "product_name",
+            "brand",
+            "food_category",
+            "notes",
+            "image_path",
+            "date_type",
+            "normalized_date",
+            "date_status",
+        }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return False
@@ -1138,6 +1204,30 @@ class InventoryDatabase:
             )
             if res.rowcount == 0:
                 raise ProductNotFoundError(f"Product ID {product_id} not found.")
+
+            # Synchronize linked scan_history row if this product originated from a scan
+            p_row = conn.execute("SELECT scan_id FROM products WHERE id = ?", (product_id,)).fetchone()
+            scan_id = p_row["scan_id"] if p_row and hasattr(p_row, "keys") else (p_row[0] if p_row else None)
+            if scan_id:
+                scan_updates = {}
+                if "product_name" in updates:
+                    scan_updates["product_name"] = updates["product_name"]
+                if "brand" in updates:
+                    scan_updates["brand"] = updates["brand"]
+                if "food_category" in updates:
+                    scan_updates["food_category"] = updates["food_category"]
+                if "normalized_date" in updates:
+                    scan_updates["selected_expiry_date"] = updates["normalized_date"]
+
+                if scan_updates:
+                    scan_clauses = [f"{k} = ?" for k in scan_updates.keys()]
+                    scan_vals = list(scan_updates.values())
+                    scan_vals.append(scan_id)
+                    conn.execute(
+                        f"UPDATE scan_history SET {', '.join(scan_clauses)} WHERE id = ?",
+                        scan_vals,
+                    )
+
             return True
 
     def confirm_product_date(
@@ -1186,6 +1276,16 @@ class InventoryDatabase:
                 """,
                 (clean_normalized, clean_date_type, new_notes, now, product_id),
             )
+
+            # Synchronize linked scan_history row if this product originated from a scan
+            p_row = conn.execute("SELECT scan_id FROM products WHERE id = ?", (product_id,)).fetchone()
+            scan_id = p_row["scan_id"] if p_row and hasattr(p_row, "keys") else (p_row[0] if p_row else None)
+            if scan_id and clean_normalized:
+                conn.execute(
+                    "UPDATE scan_history SET selected_expiry_date = ? WHERE id = ?",
+                    (clean_normalized, scan_id),
+                )
+
             return res.rowcount > 0
 
     def delete_product(self, product_id: int) -> bool:

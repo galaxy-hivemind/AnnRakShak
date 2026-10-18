@@ -90,6 +90,9 @@ interface BackendScan {
   raw_json: string | null;
   date_candidates: BackendDateCandidate[];
   product_id?: number | null;
+  auto_saved?: boolean;
+  confidence_score?: number | null;
+  decision_reason?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +393,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       date_type: toBackendDateType(data.dateType),
       normalized_date: data.date && isExactDate(data.date) ? data.date : null,
       notes: data.notes?.trim() || null,
+      quantity: data.quantity?.trim() || null,
     };
 
     const bp = await this.request<BackendProduct>(`/api/products/${numericId}`, {
@@ -737,6 +741,9 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       analysisStatus,
       reviewStatus,
       productId: bs.product_id ? `PR-${bs.product_id}` : undefined,
+      autoSaved: bs.auto_saved ?? (Boolean(bs.product_id) && !bs.needs_review),
+      confidenceScore: bs.confidence_score ?? undefined,
+      decisionReason: bs.decision_reason || bs.review_reason || undefined,
       reason: bs.review_reason || bs.error_message || undefined,
       candidates,
     };

@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, X } from 'lucide-react';
+import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, X, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -60,7 +60,16 @@ export function AnalysisPanel({
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  // Auto-saved product edit state
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveErrorMessage, setSaveErrorMessage] = useState('');
+  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
+
   const qc = useQueryClient();
+
+  const isConfirmed = scan.reviewStatus === 'Confirmed';
+  const hasLinkedProduct = Boolean(scan.productId);
 
   const verifiedList = candidates.filter((c) => verifiedCandidates[c.id]);
   const hasVerified = verifiedList.length > 0;
@@ -74,22 +83,92 @@ export function AnalysisPanel({
     }));
   };
 
+  async function persistSavedProductEdits(overrides?: {
+    name?: string;
+    brand?: string;
+    category?: Category | '';
+    quantity?: string;
+    candidates?: DateCandidate[];
+  }) {
+    if (!scan.productId) return;
+    setSaveStatus('saving');
+    setSaveErrorMessage('');
+    try {
+      const nameVal = overrides?.name !== undefined ? overrides.name : productName;
+      const brandVal = overrides?.brand !== undefined ? overrides.brand : brand;
+      const categoryVal = overrides?.category !== undefined ? overrides.category : category;
+      const quantityVal = overrides?.quantity !== undefined ? overrides.quantity : quantity;
+      const cList = overrides?.candidates !== undefined ? overrides.candidates : candidates;
+
+      const expCand = cList.find((c) => ['Expiry', 'Use By', 'Best Before'].includes(c.dateType) && isExactDate(c.date));
+      const mfgCand = cList.find((c) => ['Manufacturing', 'Packed On'].includes(c.dateType) && isExactDate(c.date));
+      const primary = expCand || mfgCand || cList[0];
+
+      await service.updateProduct(scan.productId, {
+        name: nameVal.trim() || scan.name,
+        brand: brandVal.trim(),
+        category: (categoryVal || scan.category || 'Pantry Staples') as Category,
+        quantity: quantityVal.trim(),
+        date: primary?.date && isExactDate(primary.date) ? primary.date : '',
+        dateType: primary?.dateType || 'Expiry',
+        notes: quantityVal.trim() ? `Quantity: ${quantityVal.trim()}` : '',
+        verified: true,
+      });
+
+      onChange({
+        ...scan,
+        name: nameVal.trim() || scan.name,
+        brand: brandVal.trim(),
+        category: categoryVal,
+        quantity: quantityVal.trim(),
+        candidates: cList,
+      });
+
+      await qc.invalidateQueries();
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus('idle'), 3000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to update product in inventory';
+      setSaveStatus('error');
+      setSaveErrorMessage(msg);
+      toast.error(msg);
+    }
+  }
+
+  const triggerDebouncedSave = (overrides?: {
+    name?: string;
+    brand?: string;
+    category?: Category | '';
+    quantity?: string;
+    candidates?: DateCandidate[];
+  }) => {
+    if (!hasLinkedProduct) return;
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+    debounceTimer.current = setTimeout(() => {
+      void persistSavedProductEdits(overrides);
+    }, 600);
+  };
+
   const handleDateChange = (id: string, newDate: string) => {
-    setCandidates((prev) =>
-      prev.map((c) => {
-        if (c.id !== id) return c;
-        const valid = isExactDate(newDate);
-        return {
-          ...c,
-          date: newDate,
-          precision: valid ? 'day' : c.precision,
-          source: 'manual',
-          isCalculated: false,
-        };
-      })
-    );
+    const updatedCandidates = candidates.map((c) => {
+      if (c.id !== id) return c;
+      const valid = isExactDate(newDate);
+      return {
+        ...c,
+        date: newDate,
+        precision: valid ? ('day' as const) : c.precision,
+        source: 'manual' as const,
+        isCalculated: false,
+      };
+    });
+    setCandidates(updatedCandidates);
     if (isExactDate(newDate)) {
       setVerifiedCandidates((prev) => ({ ...prev, [id]: true }));
+    }
+    if (hasLinkedProduct) {
+      void persistSavedProductEdits({ candidates: updatedCandidates });
     }
   };
 
@@ -104,15 +183,14 @@ export function AnalysisPanel({
       source: 'manual',
       isCalculated: false,
     };
-    setCandidates((prev) => [...prev, newCandidate]);
+    const updated = [...candidates, newCandidate];
+    setCandidates(updated);
     setEditingDateId(newId);
   };
 
   const hasMfgCandidate = candidates.some((c) => ['Manufacturing', 'Packed On'].includes(c.dateType));
   const hasExpCandidate = candidates.some((c) => ['Expiry', 'Use By', 'Best Before'].includes(c.dateType));
 
-  // Determine if missing buttons should appear:
-  // Show button only if field is currently empty AND not explicitly revealed by user
   const showBrandInput = Boolean(brand.trim() || revealedFields.brand);
   const showCategoryInput = Boolean(category || revealedFields.category);
   const showQuantityInput = Boolean(quantity.trim() || revealedFields.quantity);
@@ -137,7 +215,7 @@ export function AnalysisPanel({
         productId: product?.id || updated.productId,
       });
       await qc.invalidateQueries();
-      toast.success('Date confirmed · Product added to inventory');
+      toast.success('Product saved to inventory');
       onConfirmed?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Confirmation failed.');
@@ -161,7 +239,7 @@ export function AnalysisPanel({
       setConfirmed(false);
       setEditingDateId(null);
       await qc.invalidateQueries();
-      toast.success('Analysis completed. Date confirmation is still required.');
+      toast.success('Analysis completed.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Analysis failed.');
     } finally {
@@ -171,10 +249,78 @@ export function AnalysisPanel({
 
   return (
     <div className="analysis-body space-y-4">
-      <div className="flex items-center gap-2 mb-2">
-        <StatusBadge status={scan.analysisStatus} />
-        <StatusBadge status={scan.reviewStatus} />
+      {/* Top Status & Confidence Overview */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2">
+          <StatusBadge status={scan.analysisStatus} />
+          <StatusBadge status={scan.reviewStatus} />
+        </div>
+        {hasLinkedProduct && (
+          <div className="flex items-center gap-1.5 text-xs text-safe font-medium" id="save-status-indicator">
+            {saveStatus === 'saving' ? (
+              <>
+                <LoaderCircle size={13} className="animate-spin text-primary" />
+                <span className="text-muted-foreground">Saving changes…</span>
+              </>
+            ) : saveStatus === 'saved' ? (
+              <>
+                <Check size={13} className="text-safe" />
+                <span>Saved to inventory</span>
+              </>
+            ) : saveStatus === 'error' ? (
+              <>
+                <AlertCircle size={13} className="text-destructive" />
+                <span className="text-destructive">Failed to save changes</span>
+              </>
+            ) : (
+              <>
+                <Check size={13} className="text-safe" />
+                <span>Saved to inventory</span>
+              </>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Path A vs Path B Explanatory Card */}
+      {isConfirmed ? (
+        <div className="p-3 bg-safe/10 border border-safe/30 rounded-lg text-xs space-y-1">
+          <div className="font-semibold text-safe flex items-center gap-1.5">
+            <Check size={14} />
+            <span>
+              {scan.autoSaved
+                ? `Saved to inventory${scan.confidenceScore ? ` · ${Math.round(scan.confidenceScore * 100)}% confidence` : ''}`
+                : 'Saved to inventory'}
+            </span>
+          </div>
+          <p className="text-muted-foreground">
+            {scan.decisionReason || 'Product is stored in your kitchen inventory. Edits made below update your inventory item directly.'}
+          </p>
+        </div>
+      ) : (
+        <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs space-y-1">
+          <div className="font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+            <CircleHelp size={14} />
+            <span>Manual Review Required</span>
+          </div>
+          <p className="text-muted-foreground">
+            {scan.decisionReason || scan.reason || 'This scan has uncertain evidence or missing information. Please review and confirm the details below to add it to your inventory.'}
+          </p>
+        </div>
+      )}
+
+      {saveErrorMessage && (
+        <div className="form-error text-xs" role="alert">
+          {saveErrorMessage}
+          <button
+            type="button"
+            className="ml-2 underline font-semibold cursor-pointer"
+            onClick={() => void persistSavedProductEdits()}
+          >
+            Retry save
+          </button>
+        </div>
+      )}
 
       {/* Direct Inline Product Metadata Editor */}
       <div className="p-3 bg-muted/30 border border-border rounded-lg space-y-3">
@@ -187,8 +333,13 @@ export function AnalysisPanel({
             type="text"
             className="text-sm font-medium"
             value={productName}
-            disabled={scan.reviewStatus === 'Confirmed'}
-            onChange={(e) => setProductName(e.target.value)}
+            onChange={(e) => {
+              setProductName(e.target.value);
+              triggerDebouncedSave({ name: e.target.value });
+            }}
+            onBlur={() => {
+              if (hasLinkedProduct) void persistSavedProductEdits({ name: productName });
+            }}
             placeholder="e.g. Fresh Toned Milk"
           />
         </div>
@@ -217,8 +368,13 @@ export function AnalysisPanel({
                 type="text"
                 className="text-xs"
                 value={brand}
-                disabled={scan.reviewStatus === 'Confirmed'}
-                onChange={(e) => setBrand(e.target.value)}
+                onChange={(e) => {
+                  setBrand(e.target.value);
+                  triggerDebouncedSave({ brand: e.target.value });
+                }}
+                onBlur={() => {
+                  if (hasLinkedProduct) void persistSavedProductEdits({ brand });
+                }}
                 placeholder="e.g. Amul"
               />
             </div>
@@ -246,8 +402,11 @@ export function AnalysisPanel({
                 id="inline-category"
                 className="text-xs"
                 value={category}
-                disabled={scan.reviewStatus === 'Confirmed'}
-                onChange={(e) => setCategory(e.target.value as Category)}
+                onChange={(e) => {
+                  const cat = e.target.value as Category;
+                  setCategory(cat);
+                  if (hasLinkedProduct) void persistSavedProductEdits({ category: cat });
+                }}
               >
                 <option value="">Select category…</option>
                 {categories.map((c) => (
@@ -282,8 +441,13 @@ export function AnalysisPanel({
                 type="text"
                 className="text-xs"
                 value={quantity}
-                disabled={scan.reviewStatus === 'Confirmed'}
-                onChange={(e) => setQuantity(e.target.value)}
+                onChange={(e) => {
+                  setQuantity(e.target.value);
+                  triggerDebouncedSave({ quantity: e.target.value });
+                }}
+                onBlur={() => {
+                  if (hasLinkedProduct) void persistSavedProductEdits({ quantity });
+                }}
                 placeholder="e.g. 500 ml or 2 packs"
               />
             </div>
@@ -291,7 +455,7 @@ export function AnalysisPanel({
         </div>
 
         {/* Missing information buttons row */}
-        {(!showBrandInput || !showCategoryInput || !showQuantityInput) && scan.reviewStatus !== 'Confirmed' && (
+        {(!showBrandInput || !showCategoryInput || !showQuantityInput) && (
           <div className="flex flex-wrap items-center gap-1.5 pt-1 text-xs">
             <span className="text-[11px] text-muted-foreground mr-1">Missing details:</span>
             {!showBrandInput && (
@@ -341,42 +505,38 @@ export function AnalysisPanel({
             <CircleHelp size={14} />
             Package Date Evidence · {candidates.length} candidates
           </div>
-          {scan.reviewStatus !== 'Confirmed' && (
-            <div className="flex gap-1">
-              {!hasMfgCandidate && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  id="add-mfg-btn"
-                  className="h-6 text-[10px] px-1.5 py-0"
-                  onClick={() => addDateCandidate('Manufacturing')}
-                >
-                  + Add MFG
-                </Button>
-              )}
-              {!hasExpCandidate && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  id="add-exp-btn"
-                  className="h-6 text-[10px] px-1.5 py-0"
-                  onClick={() => addDateCandidate('Expiry')}
-                >
-                  + Add Expiry
-                </Button>
-              )}
-            </div>
-          )}
+          <div className="flex gap-1">
+            {!hasMfgCandidate && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                id="add-mfg-btn"
+                className="h-6 text-[10px] px-1.5 py-0.5"
+                onClick={() => addDateCandidate('Manufacturing')}
+              >
+                + Add Manufacturing
+              </Button>
+            )}
+            {!hasExpCandidate && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                id="add-exp-btn"
+                className="h-6 text-[10px] px-1.5 py-0.5"
+                onClick={() => addDateCandidate('Expiry')}
+              >
+                + Add Expiry
+              </Button>
+            )}
+          </div>
         </div>
 
-        {scan.reason && <p className="text-xs text-warning">{scan.reason}</p>}
-
-        {!candidates.length ? (
-          <div className="evidence">
-            <p>No readable date evidence was returned. Add a date candidate above or retry the analysis.</p>
-          </div>
+        {candidates.length === 0 ? (
+          <p className="text-xs text-muted-foreground p-3 border border-dashed rounded-md text-center">
+            No printed dates detected yet. Use the buttons above to add one manually.
+          </p>
         ) : (
           candidates.map((c) => {
             const isChecked = !!verifiedCandidates[c.id];
@@ -395,7 +555,7 @@ export function AnalysisPanel({
                     name={`candidate-verify-${c.id}`}
                     id={`verify-${c.id}`}
                     checked={isChecked}
-                    disabled={scan.reviewStatus === 'Confirmed'}
+                    disabled={isConfirmed}
                     onChange={() => toggleCandidate(c.id)}
                     className="mt-1 shrink-0 cursor-pointer"
                   />
@@ -404,18 +564,16 @@ export function AnalysisPanel({
                       <label htmlFor={`verify-${c.id}`} className="font-semibold text-sm cursor-pointer">
                         {formatDateTypeLabel(c.dateType)}: {c.date ? displayDate(c.date) : 'Unset'}
                       </label>
-                      {scan.reviewStatus !== 'Confirmed' && (
-                        <button
-                          type="button"
-                          id={`calendar-btn-${c.id}`}
-                          aria-label={`Edit ${c.dateType} date with calendar`}
-                          onClick={() => setEditingDateId(isEditingThisDate ? null : c.id)}
-                          className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border border-border bg-card hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer"
-                        >
-                          <Calendar size={12} />
-                          {isEditingThisDate ? 'Close picker' : 'Pick date'}
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        id={`calendar-btn-${c.id}`}
+                        aria-label={`Edit ${c.dateType} date with calendar`}
+                        onClick={() => setEditingDateId(isEditingThisDate ? null : c.id)}
+                        className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border border-border bg-card hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer"
+                      >
+                        <Calendar size={12} />
+                        {isEditingThisDate ? 'Close picker' : 'Pick date'}
+                      </button>
                     </div>
 
                     {/* Inline Calendar / Date Input */}
@@ -493,8 +651,8 @@ export function AnalysisPanel({
         </div>
       )}
 
-      {/* Confirmation & Actions */}
-      {scan.reviewStatus !== 'Confirmed' && (
+      {/* Path B: Manual Review Confirmation & Actions */}
+      {!isConfirmed && (
         <>
           <label className="flex gap-2 items-start mt-4 text-xs font-normal leading-relaxed cursor-pointer">
             <input
@@ -502,7 +660,7 @@ export function AnalysisPanel({
               id="overall-confirm-checkbox"
               className="mt-1 shrink-0 cursor-pointer"
               checked={confirmed}
-              disabled={scan.reviewStatus === 'Confirmed'}
+              disabled={isConfirmed}
               onChange={(e) => setConfirmed(e.target.checked)}
             />
             <span>I have checked the printed evidence and confirm this exact date and date type.</span>
@@ -539,11 +697,12 @@ export function AnalysisPanel({
         </>
       )}
 
-      {scan.reviewStatus === 'Confirmed' && (
-        <p className="text-xs text-safe mt-4">
-          Date explicitly confirmed by you.{' '}
-          {scan.productId ? 'Linked to your inventory.' : 'Inventory product has been removed; scan history is retained.'}
-        </p>
+      {/* Path A & Confirmed Status Display */}
+      {isConfirmed && (
+        <div className="flex items-center gap-2 text-xs text-safe font-medium mt-4 p-2.5 bg-safe/10 border border-safe/30 rounded-md">
+          <Check size={14} className="shrink-0" />
+          <span>Saved to inventory · Linked to your kitchen items.</span>
+        </div>
       )}
     </div>
   );
