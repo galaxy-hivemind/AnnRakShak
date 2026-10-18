@@ -231,7 +231,7 @@ class ScanHistoryRecord:
 # Database Schemas & Connection Wrappers
 # ---------------------------------------------------------------------------
 
-SQLITE_SCHEMA = """
+SQLITE_BASE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scan_id INTEGER,
@@ -281,7 +281,9 @@ SQLITE_SCHEMA = """
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
         FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
     );
+"""
 
+SQLITE_INDEXES = """
     CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
     CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
     CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
@@ -292,10 +294,13 @@ SQLITE_SCHEMA = """
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
 """
 
-POSTGRES_SCHEMA = """
+SQLITE_SCHEMA = f"""{SQLITE_BASE_SCHEMA}
+{SQLITE_INDEXES}"""
+
+POSTGRES_BASE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY,
-        scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL,
+        scan_id INTEGER,
         product_name TEXT NOT NULL,
         brand TEXT,
         food_category TEXT,
@@ -313,7 +318,7 @@ POSTGRES_SCHEMA = """
 
     CREATE TABLE IF NOT EXISTS scan_history (
         id SERIAL PRIMARY KEY,
-        product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+        product_id INTEGER,
         timestamp TEXT NOT NULL,
         image_path TEXT NOT NULL,
         product_name TEXT,
@@ -329,8 +334,8 @@ POSTGRES_SCHEMA = """
 
     CREATE TABLE IF NOT EXISTS date_candidates (
         id SERIAL PRIMARY KEY,
-        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
-        scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL,
+        product_id INTEGER,
+        scan_id INTEGER,
         raw_text TEXT NOT NULL,
         date_type TEXT NOT NULL,
         normalized_date TEXT,
@@ -338,7 +343,41 @@ POSTGRES_SCHEMA = """
         evidence TEXT,
         created_at TEXT NOT NULL
     );
+"""
 
+POSTGRES_MIGRATIONS = """
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id INTEGER;
+    ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS product_id INTEGER;
+    ALTER TABLE date_candidates ADD COLUMN IF NOT EXISTS scan_id INTEGER;
+    ALTER TABLE date_candidates ADD COLUMN IF NOT EXISTS product_id INTEGER;
+"""
+
+POSTGRES_CONSTRAINTS = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_products_scan') THEN
+            ALTER TABLE products ADD CONSTRAINT fk_products_scan
+                FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL NOT VALID;
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_scan_history_product') THEN
+            ALTER TABLE scan_history ADD CONSTRAINT fk_scan_history_product
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL NOT VALID;
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_date_candidates_product') THEN
+            ALTER TABLE date_candidates ADD CONSTRAINT fk_date_candidates_product
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE NOT VALID;
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_date_candidates_scan') THEN
+            ALTER TABLE date_candidates ADD CONSTRAINT fk_date_candidates_scan
+                FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL NOT VALID;
+        END IF;
+    END $$;
+"""
+
+POSTGRES_INDEXES = """
     CREATE INDEX IF NOT EXISTS idx_products_name ON products(product_name);
     CREATE INDEX IF NOT EXISTS idx_products_date ON products(normalized_date);
     CREATE INDEX IF NOT EXISTS idx_products_category ON products(food_category);
@@ -348,6 +387,11 @@ POSTGRES_SCHEMA = """
     CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
 """
+
+POSTGRES_SCHEMA = f"""{POSTGRES_BASE_SCHEMA}
+{POSTGRES_MIGRATIONS}
+{POSTGRES_CONSTRAINTS}
+{POSTGRES_INDEXES}"""
 
 
 class PostgresConnectionWrapper:
@@ -498,15 +542,35 @@ class InventoryDatabase:
             finally:
                 conn.close()
 
+    @staticmethod
+    def _migrate_sqlite_columns(conn: Any) -> None:
+        """Ensure all required columns exist in SQLite tables before creating indexes."""
+        def column_exists(table: str, col: str) -> bool:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            return any(r[1] == col for r in rows)
+
+        if not column_exists("products", "scan_id"):
+            conn.execute("ALTER TABLE products ADD COLUMN scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
+        if not column_exists("scan_history", "product_id"):
+            conn.execute("ALTER TABLE scan_history ADD COLUMN product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
+        if not column_exists("date_candidates", "scan_id"):
+            conn.execute("ALTER TABLE date_candidates ADD COLUMN scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
+
     def init_db(self) -> None:
         """Create tables and indexes idempotently, and migrate existing schemas."""
         if self.is_postgres:
             with self._get_connection() as conn:
-                conn.executescript(POSTGRES_SCHEMA)
-                with contextlib.suppress(Exception):
-                    conn.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
-                with contextlib.suppress(Exception):
-                    conn.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
+                # 1. Base table creation (idempotent, no circular foreign keys in CREATE TABLE)
+                conn.executescript(POSTGRES_BASE_SCHEMA)
+                # 2. Schema migrations (add missing columns to existing tables BEFORE indexes)
+                conn.executescript(POSTGRES_MIGRATIONS)
+                # 3. Foreign key constraints (idempotently add FKs after all tables exist)
+                try:
+                    conn.executescript(POSTGRES_CONSTRAINTS)
+                except Exception as e:
+                    logger.warning("Could not apply PostgreSQL foreign key constraints: %s", e)
+                # 4. Indexes (created after all columns are guaranteed to exist)
+                conn.executescript(POSTGRES_INDEXES)
         else:
             assert self.db_path is not None
             try:
@@ -514,11 +578,12 @@ class InventoryDatabase:
             except OSError as e:
                 logger.warning("Could not create parent directory for %s: %s", self.db_path, e)
             with self._get_connection() as conn:
-                conn.executescript(SQLITE_SCHEMA)
-                with contextlib.suppress(Exception):
-                    conn.execute("ALTER TABLE products ADD COLUMN scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
-                with contextlib.suppress(Exception):
-                    conn.execute("ALTER TABLE scan_history ADD COLUMN product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
+                # 1. Base table creation
+                conn.executescript(SQLITE_BASE_SCHEMA)
+                # 2. Column migrations (run before indexes)
+                self._migrate_sqlite_columns(conn)
+                # 3. Indexes (created after columns exist)
+                conn.executescript(SQLITE_INDEXES)
 
     def close(self) -> None:
         """Release open connections and connection pools."""

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import sqlite3
 from inventory_db import (
     DEFAULT_DB_PATH,
     DateCandidateRecord,
@@ -19,6 +20,14 @@ from inventory_db import (
     PostgresConnectionWrapper,
     ProductNotFoundError,
     mask_database_url,
+    SQLITE_SCHEMA,
+    SQLITE_BASE_SCHEMA,
+    SQLITE_INDEXES,
+    POSTGRES_SCHEMA,
+    POSTGRES_BASE_SCHEMA,
+    POSTGRES_MIGRATIONS,
+    POSTGRES_CONSTRAINTS,
+    POSTGRES_INDEXES,
 )
 import api
 
@@ -213,6 +222,170 @@ class TestDatabasePersistence(unittest.TestCase):
                 self.assertTrue(db.is_postgres)
                 self.assertEqual(db.database_url, test_url)
                 db.close()
+
+    def test_sqlite_migration_from_legacy_schema(self) -> None:
+        """
+        Verify that opening an existing SQLite database created with an old schema
+        (lacking scan_id on products, product_id on scan_history, and scan_id on date_candidates)
+        automatically and safely migrates the columns and creates all indexes without data loss.
+        """
+        legacy_path = Path(self.temp_dir.name) / "legacy_test.db"
+        conn = sqlite3.connect(str(legacy_path))
+        conn.executescript("""
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_name TEXT NOT NULL,
+                brand TEXT,
+                food_category TEXT,
+                date_type TEXT NOT NULL,
+                date_text TEXT,
+                normalized_date TEXT,
+                date_status TEXT NOT NULL DEFAULT 'unverified',
+                date_source TEXT NOT NULL DEFAULT 'printed',
+                analysis_status TEXT,
+                image_path TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                image_path TEXT NOT NULL,
+                product_name TEXT,
+                brand TEXT,
+                food_category TEXT,
+                analysis_status TEXT NOT NULL,
+                needs_review INTEGER NOT NULL DEFAULT 0,
+                review_reason TEXT,
+                selected_expiry_date TEXT,
+                error_message TEXT,
+                raw_json TEXT
+            );
+            CREATE TABLE date_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                raw_text TEXT NOT NULL,
+                date_type TEXT NOT NULL,
+                normalized_date TEXT,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                evidence TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO products (product_name, date_type, created_at, updated_at)
+            VALUES ('Legacy Apple', 'expiry', '2026-01-01', '2026-01-01');
+            INSERT INTO scan_history (timestamp, image_path, analysis_status)
+            VALUES ('2026-01-01', 'captures/legacy.jpg', 'success');
+            INSERT INTO date_candidates (product_id, raw_text, date_type, created_at)
+            VALUES (1, 'EXP 2026-12-31', 'expiry', '2026-01-01');
+        """)
+        conn.close()
+
+        # Initialize InventoryDatabase against the legacy database
+        db = InventoryDatabase(db_path=legacy_path)
+
+        # 1. Verify data preserved
+        prod = db.get_product(1)
+        self.assertIsNotNone(prod)
+        self.assertEqual(prod.product_name, "Legacy Apple")
+        self.assertIsNone(prod.scan_id)
+
+        scan = db.get_scan(1)
+        self.assertIsNotNone(scan)
+        self.assertEqual(scan.image_path, "captures/legacy.jpg")
+        self.assertIsNone(scan.product_id)
+
+        # 2. Verify table info has the new columns
+        with sqlite3.connect(str(legacy_path)) as c:
+            p_cols = [r[1] for r in c.execute("PRAGMA table_info(products)").fetchall()]
+            s_cols = [r[1] for r in c.execute("PRAGMA table_info(scan_history)").fetchall()]
+            d_cols = [r[1] for r in c.execute("PRAGMA table_info(date_candidates)").fetchall()]
+            self.assertIn("scan_id", p_cols)
+            self.assertIn("product_id", s_cols)
+            self.assertIn("scan_id", d_cols)
+
+            # Verify all indexes were created
+            idx_names = [r[1] for r in c.execute("SELECT * FROM pragma_index_list('products')").fetchall()]
+            self.assertIn("idx_products_scan", idx_names)
+
+        # 3. Verify new operations with scan_id work seamlessly
+        new_p_id = db.add_product(
+            product_name="New Banana",
+            date_type="expiry",
+            scan_id=1,
+            force=True,
+        )
+        new_prod = db.get_product(new_p_id)
+        self.assertIsNotNone(new_prod)
+        self.assertEqual(new_prod.scan_id, 1)
+
+        db.close()
+
+    def test_postgres_schema_ordering_and_no_circular_references(self) -> None:
+        """
+        Verify that POSTGRES_SCHEMA avoids circular references in CREATE TABLE
+        and ensures migrations run before indexes.
+        """
+        # 1. products CREATE TABLE must NOT have inline REFERENCES scan_history(id)
+        # to ensure table creation order does not fail on fresh databases
+        self.assertNotIn(
+            "scan_id INTEGER REFERENCES scan_history",
+            POSTGRES_BASE_SCHEMA,
+            "Base table creation should not contain circular inline REFERENCES"
+        )
+
+        # 2. POSTGRES_MIGRATIONS must add scan_id, product_id
+        self.assertIn("ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id", POSTGRES_MIGRATIONS)
+        self.assertIn("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS product_id", POSTGRES_MIGRATIONS)
+        self.assertIn("ALTER TABLE date_candidates ADD COLUMN IF NOT EXISTS scan_id", POSTGRES_MIGRATIONS)
+
+        # 3. In POSTGRES_SCHEMA, the migration MUST appear BEFORE the index on scan_id
+        pos_migration = POSTGRES_SCHEMA.find("ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id")
+        pos_index = POSTGRES_SCHEMA.find("CREATE INDEX IF NOT EXISTS idx_products_scan ON products(scan_id)")
+        self.assertTrue(pos_migration < pos_index, "Column migration must appear BEFORE index creation")
+
+    @patch("inventory_db.ThreadedConnectionPool")
+    def test_postgres_initialization_executes_in_safe_sequence(self, mock_pool_cls: MagicMock) -> None:
+        """
+        Verify that PostgreSQL initialization executes statements in the safe sequence:
+        base tables -> migrations -> constraints -> indexes.
+        """
+        mock_pool = MagicMock()
+        mock_pool_cls.return_value = mock_pool
+        mock_conn = MagicMock()
+        mock_conn.closed = False
+        mock_pool.getconn.return_value = mock_conn
+
+        executed_scripts: list[str] = []
+        mock_cur = MagicMock()
+        mock_cur.__enter__.return_value = mock_cur
+        mock_conn.cursor.return_value = mock_cur
+
+        def fake_execute(sql: str, params: Any = None) -> None:
+            executed_scripts.append(sql)
+
+        mock_cur.execute.side_effect = fake_execute
+
+        db_url = "postgresql://user:pass@ep-neon.us-east-2.aws.neon.tech/neondb"
+        db = InventoryDatabase(database_url=db_url)
+        self.assertTrue(db.is_postgres)
+
+        # Verify execution order:
+        # 1. Base table creation must be called
+        self.assertTrue(any("CREATE TABLE IF NOT EXISTS products" in s for s in executed_scripts))
+        # 2. Migrations must be called
+        self.assertTrue(any("ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id" in s for s in executed_scripts))
+        # 3. Constraints must be called
+        self.assertTrue(any("fk_products_scan" in s for s in executed_scripts))
+        # 4. Indexes must be called
+        self.assertTrue(any("CREATE INDEX IF NOT EXISTS idx_products_scan" in s for s in executed_scripts))
+
+        # Check sequence: migration script is executed before index script
+        mig_idx = next(i for i, s in enumerate(executed_scripts) if "ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id" in s)
+        idx_idx = next(i for i, s in enumerate(executed_scripts) if "CREATE INDEX IF NOT EXISTS idx_products_scan" in s)
+        self.assertLess(mig_idx, idx_idx, "Migration must execute before index creation")
+
+        db.close()
 
 
 if __name__ == "__main__":
