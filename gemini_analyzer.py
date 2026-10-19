@@ -229,6 +229,10 @@ class FoodAnalysisResult(BaseModel):
         default=None,
         description="Net weight, volume, or package count if visible on the packaging (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs'), or null.",
     )
+    barcode: str | None = Field(
+        default=None,
+        description="Scanned or visually read barcode/GTIN number if clearly visible, or null.",
+    )
     date_candidates: list[DateCandidate] = Field(
         default_factory=list,
         description="List of all date candidates identified on the package.",

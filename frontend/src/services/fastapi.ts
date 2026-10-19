@@ -35,6 +35,8 @@ interface BackendProduct {
   updated_at: string;
   date_candidates: BackendDateCandidate[];
   scan_id?: number | null;
+  barcode?: string | null;
+  image_metadata?: Record<string, any> | null;
 }
 
 interface BackendDateCandidate {
@@ -94,6 +96,8 @@ interface BackendScan {
   confidence_score?: number | null;
   decision_reason?: string | null;
   supplementary_images?: string[];
+  barcode?: string | null;
+  image_metadata?: Record<string, any> | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +767,19 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       dateType: toFrontendDateType(bp.date_type),
       notes: bp.notes || '',
       verified: bp.date_status === 'confirmed',
-      image: resolveFoodImage({ name: bp.product_name, category: cat, image: bp.image_path || undefined }),
+      image: (() => {
+        let prodImg = bp.image_path || undefined;
+        if (prodImg && (prodImg.startsWith('http://') || prodImg.startsWith('https://') || prodImg.startsWith('data:'))) {
+          // Direct remote or data URL
+        } else if (prodImg && !prodImg.startsWith('/captures/') && !prodImg.includes('/assets/')) {
+          prodImg = typeof process !== 'undefined' && process.env?.FASTAPI_URL && this.baseUrl === process.env.FASTAPI_URL
+            ? `/api/products/${bp.id}/image`
+            : this.baseUrl
+            ? `${this.baseUrl}/api/products/${bp.id}/image`
+            : `/api/products/${bp.id}/image`;
+        }
+        return resolveFoodImage({ name: bp.product_name, category: cat, image: prodImg });
+      })(),
       scanId: bp.scan_id ? `SC-${bp.scan_id}` : (bp.date_candidates?.[0]?.scan_id ? `SC-${bp.date_candidates[0].scan_id}` : undefined),
     };
   }

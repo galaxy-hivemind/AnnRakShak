@@ -226,6 +226,7 @@ class ScanHistoryRecord:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["supplementary_images"] = self.supplementary_images
+        d["image_metadata"] = self.image_metadata
         return d
 
     @property
@@ -240,6 +241,19 @@ class ScanHistoryRecord:
             return val if isinstance(val, list) else []
         except Exception:
             return []
+
+    @property
+    def image_metadata(self) -> dict[str, Any] | None:
+        """Return image resolution metadata associated with this scan."""
+        if not self.raw_json:
+            return None
+        try:
+            import json
+            parsed = json.loads(self.raw_json)
+            val = parsed.get("image_metadata")
+            return val if isinstance(val, dict) else None
+        except Exception:
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +631,7 @@ class InventoryDatabase:
         image_path: str,
         result: Any | None = None,
         error_message: str | None = None,
+        image_metadata: dict[str, Any] | None = None,
     ) -> int:
         """
         Record a scan attempt from Gemini analyzer into scan_history.
@@ -642,9 +657,22 @@ class InventoryDatabase:
             needs_review = 1 if getattr(result, "needs_review", True) else 0
             review_reason = getattr(result, "review_reason", None)
             selected_expiry_date = getattr(result, "selected_expiry_date", None)
-            if hasattr(result, "model_dump_json"):
+            if hasattr(result, "model_dump"):
+                try:
+                    dumped = result.model_dump()
+                    if image_metadata is not None:
+                        dumped["image_metadata"] = image_metadata
+                    import json
+                    raw_json = json.dumps(dumped)
+                except Exception:
+                    if hasattr(result, "model_dump_json"):
+                        raw_json = result.model_dump_json()
+            elif hasattr(result, "model_dump_json"):
                 raw_json = result.model_dump_json()
             candidates = getattr(result, "date_candidates", []) or []
+        elif image_metadata is not None:
+            import json
+            raw_json = json.dumps({"image_metadata": image_metadata})
 
         with self._get_connection() as conn:
             if self.is_postgres:
@@ -773,6 +801,7 @@ class InventoryDatabase:
         result: Any | None = None,
         error_message: str | None = None,
         supplementary_image_path: str | None = None,
+        image_metadata: dict[str, Any] | None = None,
     ) -> bool:
         """
         Update an existing scan history record and its candidate dates after reanalysis or supplementary capture.
@@ -792,6 +821,9 @@ class InventoryDatabase:
         raw_json = None
         candidates = []
 
+        # Retain existing image_metadata if a new one is not explicitly supplied
+        effective_image_meta = image_metadata if image_metadata is not None else existing.image_metadata
+
         if result is not None:
             product_name = getattr(result, "product_name", None)
             brand = getattr(result, "brand", None)
@@ -810,6 +842,8 @@ class InventoryDatabase:
                 try:
                     dumped = result.model_dump()
                     dumped["supplementary_images"] = existing_supp
+                    if effective_image_meta is not None:
+                        dumped["image_metadata"] = effective_image_meta
                     import json
                     raw_json = json.dumps(dumped)
                 except Exception:
@@ -819,6 +853,21 @@ class InventoryDatabase:
                 raw_json = result.model_dump_json()
 
             candidates = getattr(result, "date_candidates", []) or []
+        elif effective_image_meta is not None or supplementary_image_path is not None:
+            import json
+            base = {}
+            if existing.raw_json:
+                try:
+                    base = json.loads(existing.raw_json)
+                except Exception:
+                    base = {}
+            existing_supp = list(existing.supplementary_images)
+            if supplementary_image_path and str(supplementary_image_path) not in existing_supp:
+                existing_supp.append(str(supplementary_image_path))
+            base["supplementary_images"] = existing_supp
+            if effective_image_meta is not None:
+                base["image_metadata"] = effective_image_meta
+            raw_json = json.dumps(base)
 
         with self._get_connection() as conn:
             conn.execute(

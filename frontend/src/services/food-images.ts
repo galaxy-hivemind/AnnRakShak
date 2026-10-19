@@ -50,6 +50,7 @@ export function resolveFoodImage(item?: {
     !item.image.endsWith('.svg') &&
     (item.image.startsWith('data:') ||
       item.image.startsWith('/captures/') ||
+      item.image.startsWith('/api/') ||
       item.image.startsWith('http') ||
       item.image.includes('/assets/'))
   ) {

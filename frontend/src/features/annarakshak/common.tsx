@@ -34,7 +34,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { settingsQuery, scansQuery, service, dashboardQuery } from '@/services/api';
 import { displayDate, productStatus, daysFromToday } from '@/services/dates';
 import type { Product, ProductStatus } from '@/services/types';
-import { resolveFoodImage } from '@/services/food-images';
+import { resolveFoodImage, categoryImages, tomatoesImg } from '@/services/food-images';
 
 export const primaryNav = [
   { to: '/', name: 'Overview', icon: LayoutGrid },
@@ -359,6 +359,7 @@ export function InventoryPhotoCard({
   const urgent = d <= 2;
   const isSafe = d > 2;
   const imgSrc = resolveFoodImage(product);
+  const fallbackSrc = categoryImages[product.category || 'Pantry Staples'] || tomatoesImg;
   const formattedExpiry = new Date(`${product.date}T00:00:00`).toLocaleDateString('en-GB', {
     day: 'numeric',
     month: 'short',
@@ -371,7 +372,19 @@ export function InventoryPhotoCard({
       aria-label={`Open ${product.name}`}
     >
       <div className="inv-img">
-        <img src={imgSrc} alt="" width={320} height={240} loading="lazy" />
+        <img
+          src={imgSrc}
+          alt=""
+          width={320}
+          height={240}
+          loading="lazy"
+          onError={(e) => {
+            const target = e.currentTarget;
+            if (target.src !== fallbackSrc && !target.src.endsWith(fallbackSrc)) {
+              target.src = fallbackSrc;
+            }
+          }}
+        />
         <span className="cat-chip">{shortCategory(product)}</span>
       </div>
       <div className="inv-body">
@@ -403,9 +416,23 @@ export function InventoryPhotoCard({
 
 export function ProductCell({ product }: { product: Pick<Product, 'image' | 'name' | 'brand' | 'category'> }) {
   const imgSrc = resolveFoodImage(product);
+  const fallbackSrc = categoryImages[product.category || 'Pantry Staples'] || tomatoesImg;
   return (
     <div className="product-cell">
-      <img src={imgSrc} width={44} height={48} alt="" className="product-thumb" loading="lazy" />
+      <img
+        src={imgSrc}
+        width={44}
+        height={48}
+        alt=""
+        className="product-thumb"
+        loading="lazy"
+        onError={(e) => {
+          const target = e.currentTarget;
+          if (target.src !== fallbackSrc && !target.src.endsWith(fallbackSrc)) {
+            target.src = fallbackSrc;
+          }
+        }}
+      />
       <div>
         <div className="product-name">{product.name}</div>
         <div className="product-brand">{product.brand || 'No brand specified'}</div>

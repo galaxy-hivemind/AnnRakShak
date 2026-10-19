@@ -290,11 +290,19 @@ def merge_scan_results(
         if m not in combined_models:
             combined_models.append(m)
 
+    # Barcode merging
+    final_barcode = (
+        overrides.get("barcode")
+        or getattr(original, "barcode", None)
+        or getattr(supplementary, "barcode", None)
+    )
+
     merged = FoodAnalysisResult(
         product_name=final_name,
         brand=final_brand,
         food_category=final_category,
         quantity=final_quantity,
+        barcode=final_barcode,
         date_candidates=combined_candidates,
         selected_expiry_date=final_selected_expiry,
         analysis_status=final_status,

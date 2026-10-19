@@ -41,6 +41,8 @@ from gemini_analyzer import FoodAnalysisResult, GeminiAnalyzer
 from confidence_evaluator import evaluate_scan_confidence, ConfidenceAssessment
 from evidence_merger import merge_scan_results
 from ocr_engine import AppleVisionOCREngine, OCRResult
+from barcode_detector import resolve_scanned_barcode
+from product_image_resolver import get_image_resolver, ProductImageResolver
 from inventory_db import (
     DEFAULT_DB_PATH,
     DEFAULT_WARNING_DAYS,
@@ -132,6 +134,8 @@ class ProductResponse(BaseModel):
     date_candidates: list[DateCandidateItem] = []
     quantity: str | None = None
     scan_id: int | None = None
+    barcode: str | None = None
+    image_metadata: dict[str, Any] | None = None
 
 
 class ProductCreate(BaseModel):
@@ -295,6 +299,8 @@ class ScanResponse(BaseModel):
     confidence_score: float | None = None
     decision_reason: str | None = None
     supplementary_images: list[str] = Field(default_factory=list)
+    barcode: str | None = None
+    image_metadata: dict[str, Any] | None = None
 
 
 class DeleteResponse(BaseModel):
@@ -407,6 +413,8 @@ def serialize_product(
     p: ProductRecord,
     candidates: list[DateCandidateRecord] | None = None,
     ref_date: datetime.date | None = None,
+    barcode: str | None = None,
+    image_metadata: dict[str, Any] | None = None,
 ) -> ProductResponse:
     """Helper to convert ProductRecord into ProductResponse with computed live status."""
     quantity = None
@@ -415,6 +423,11 @@ def serialize_product(
         m = re.search(r"Quantity:\s*([^|\n]+)", p.notes)
         if m:
             quantity = m.group(1).strip()
+        if barcode is None:
+            m_bar = re.search(r"Barcode:\s*([0-9A-Za-z]+)", p.notes)
+            if m_bar:
+                barcode = m_bar.group(1).strip()
+
     return ProductResponse(
         id=p.id,
         product_name=p.product_name,
@@ -434,6 +447,8 @@ def serialize_product(
         updated_at=p.updated_at,
         date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
         scan_id=p.scan_id,
+        barcode=barcode,
+        image_metadata=image_metadata,
     )
 
 
@@ -444,16 +459,26 @@ def serialize_scan(
     auto_saved: bool | None = None,
     confidence_score: float | None = None,
     decision_reason: str | None = None,
+    barcode: str | None = None,
+    image_metadata: dict[str, Any] | None = None,
 ) -> ScanResponse:
     """Helper to convert ScanHistoryRecord into ScanResponse with attached candidates and timing."""
     quantity = None
-    if s.raw_json:
-        try:
-            import json
-            parsed = json.loads(s.raw_json)
-            quantity = parsed.get("quantity")
-        except Exception:
-            pass
+    if barcode is None or image_metadata is None or quantity is None:
+        if s.raw_json:
+            try:
+                import json
+                parsed = json.loads(s.raw_json)
+                if quantity is None:
+                    quantity = parsed.get("quantity")
+                if barcode is None:
+                    barcode = parsed.get("barcode")
+                if image_metadata is None:
+                    image_metadata = parsed.get("image_metadata")
+            except Exception:
+                pass
+    if image_metadata is None:
+        image_metadata = s.image_metadata
 
     cand_items = [DateCandidateItem(**c.to_dict()) for c in (candidates or [])]
 
@@ -493,6 +518,8 @@ def serialize_scan(
         confidence_score=confidence_score,
         decision_reason=decision_reason,
         supplementary_images=list(s.supplementary_images),
+        barcode=barcode,
+        image_metadata=image_metadata,
     )
 
 
@@ -754,7 +781,71 @@ def get_product(
             detail=f"Product with ID {product_id} not found.",
         )
     candidates = db.get_product_date_candidates(product_id)
-    return serialize_product(p, candidates=candidates)
+    image_meta = None
+    barcode = None
+    if p.scan_id:
+        scan = db.get_scan(p.scan_id)
+        if scan:
+            image_meta = scan.image_metadata
+            if scan.raw_json:
+                try:
+                    import json
+                    parsed = json.loads(scan.raw_json)
+                    barcode = parsed.get("barcode")
+                except Exception:
+                    pass
+    return serialize_product(p, candidates=candidates, barcode=barcode, image_metadata=image_meta)
+
+
+@app.get("/api/products/{product_id}/image", tags=["Products"])
+def get_product_image(
+    product_id: int,
+    db: InventoryDatabase = Depends(get_db),
+):
+    """
+    Retrieve or redirect to the verified display image for an inventory product.
+    If product has a remote verified HTTPS URL, redirects via 307.
+    If product has a local file path that exists, serves it via FileResponse.
+    Otherwise, checks if linked scan has an image file to serve.
+    If none available, returns 404.
+    """
+    p = db.get_product(product_id)
+    if not p:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Product with ID {product_id} not found.",
+        )
+    if p.image_path:
+        if p.image_path.startswith("http://") or p.image_path.startswith("https://"):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=p.image_path, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        img_path = Path(p.image_path)
+        if img_path.exists() and img_path.is_file():
+            ext = img_path.suffix.lower()
+            media_type = "image/jpeg"
+            if ext == ".png":
+                media_type = "image/png"
+            elif ext == ".webp":
+                media_type = "image/webp"
+            return FileResponse(path=img_path, media_type=media_type)
+
+    if p.scan_id:
+        scan = db.get_scan(p.scan_id)
+        if scan and scan.image_path:
+            scan_img = Path(scan.image_path)
+            if scan_img.exists() and scan_img.is_file():
+                ext = scan_img.suffix.lower()
+                media_type = "image/jpeg"
+                if ext == ".png":
+                    media_type = "image/png"
+                elif ext == ".webp":
+                    media_type = "image/webp"
+                return FileResponse(path=scan_img, media_type=media_type)
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"No display image available for product {product_id}.",
+    )
 
 
 @app.post("/api/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED, tags=["Products"])
@@ -765,10 +856,28 @@ def create_product(
     """
     Add a new product to inventory.
     Guards against identical duplicates unless force=True is provided.
+    Preserves verified web image and barcode from associated scan.
     """
     candidate_dates = None
+    scan = None
+    barcode = None
+    image_meta = None
+    disp_img = None
+
     if payload.scan_id:
+        scan = db.get_scan(payload.scan_id)
         candidate_dates = db.get_scan_date_candidates(payload.scan_id)
+        if scan:
+            image_meta = scan.image_metadata
+            if image_meta and image_meta.get("image_status") == "verified_web_image":
+                disp_img = image_meta.get("image_url") or image_meta.get("local_path")
+            if scan.raw_json:
+                try:
+                    import json
+                    parsed = json.loads(scan.raw_json)
+                    barcode = parsed.get("barcode")
+                except Exception:
+                    pass
 
     notes = payload.notes
     if payload.quantity:
@@ -778,6 +887,8 @@ def create_product(
                 notes = f"{q_str} | {notes}"
         else:
             notes = q_str
+    if barcode and (not notes or "Barcode:" not in notes):
+        notes = f"Barcode: {barcode} | {notes}" if notes else f"Barcode: {barcode}"
 
     product_id = db.add_product(
         product_name=payload.product_name,
@@ -788,6 +899,7 @@ def create_product(
         normalized_date=payload.normalized_date,
         date_status=payload.date_status,
         date_source=payload.date_source,
+        image_path=disp_img,
         notes=notes,
         force=payload.force,
         candidate_dates=candidate_dates,
@@ -800,7 +912,7 @@ def create_product(
             detail="Failed to retrieve newly created product.",
         )
     candidates = db.get_product_date_candidates(product_id)
-    return serialize_product(p, candidates=candidates)
+    return serialize_product(p, candidates=candidates, barcode=barcode, image_metadata=image_meta)
 
 
 @app.patch("/api/products/{product_id}", response_model=ProductResponse, tags=["Products"])
@@ -1018,6 +1130,40 @@ async def reanalyze_scan(
     assessment = evaluate_scan_confidence(result)
     existing_product_id = scan.product_id
 
+    # Barcode detection from frame or OCR
+    barcode = None
+    if frame_bgr is not None:
+        barcode = await asyncio.to_thread(
+            resolve_scanned_barcode,
+            frame_bgr,
+            ocr_text=ocr_text,
+            ai_barcode=result.barcode,
+        )
+    if barcode and not result.barcode:
+        result.barcode = barcode
+
+    # Intelligent image discovery with deduplication
+    image_meta = None
+    try:
+        image_resolver = get_image_resolver()
+        image_meta = await asyncio.to_thread(
+            image_resolver.resolve_product_image,
+            product_name=result.product_name,
+            brand=result.brand,
+            barcode=barcode or result.barcode,
+            category=result.food_category,
+            existing_metadata=scan.image_metadata,
+            is_supplementary=False,
+        )
+    except Exception as e:
+        logger.warning("Product image resolution failed gracefully during reanalyze: %s", e)
+
+    image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
+
+    disp_img: str | None = None
+    if image_meta and image_meta.get("image_status") == "verified_web_image":
+        disp_img = image_meta.get("image_url") or image_meta.get("local_path")
+
     t_db_0 = time.perf_counter()
     if assessment.should_auto_save:
         result.needs_review = False
@@ -1025,7 +1171,7 @@ async def reanalyze_scan(
         if assessment.primary_date:
             result.selected_expiry_date = assessment.primary_date
 
-        db.update_scan(scan_id, result=result, error_message=None)
+        db.update_scan(scan_id, result=result, error_message=None, image_metadata=image_meta_dict)
         cand_records = db.get_scan_date_candidates(scan_id)
 
         notes_parts = []
@@ -1033,11 +1179,12 @@ async def reanalyze_scan(
             notes_parts.append(f"Quantity: {result.quantity}")
         if assessment.primary_date:
             notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+        if (barcode or result.barcode):
+            notes_parts.append(f"Barcode: {barcode or result.barcode}")
         notes_str = " | ".join(notes_parts) if notes_parts else None
 
         if existing_product_id:
-            db.update_product(
-                existing_product_id,
+            update_kw = dict(
                 product_name=result.product_name,
                 brand=result.brand,
                 food_category=result.food_category,
@@ -1045,6 +1192,9 @@ async def reanalyze_scan(
                 normalized_date=assessment.primary_date,
                 notes=notes_str,
             )
+            if disp_img:
+                update_kw["image_path"] = disp_img
+            db.update_product(existing_product_id, **update_kw)
         else:
             db.add_product(
                 product_name=result.product_name,
@@ -1056,7 +1206,7 @@ async def reanalyze_scan(
                 date_status="confirmed",
                 date_source="printed",
                 analysis_status="success",
-                image_path=str(img_path),
+                image_path=disp_img,
                 notes=notes_str,
                 candidate_dates=cand_records,
                 force=True,
@@ -1071,6 +1221,7 @@ async def reanalyze_scan(
             scan_id,
             result=result,
             error_message=assessment.decision_reason if result.analysis_status == "error" else None,
+            image_metadata=image_meta_dict,
         )
         auto_saved = False
         decision_reason = assessment.decision_reason
@@ -1105,6 +1256,8 @@ async def reanalyze_scan(
         auto_saved=auto_saved,
         confidence_score=assessment.confidence_score,
         decision_reason=decision_reason,
+        barcode=barcode or result.barcode,
+        image_metadata=image_meta_dict,
     )
 
 
@@ -1265,6 +1418,16 @@ async def add_supplementary_scan(
             )
         gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
+        # 5b. Barcode detection on supplementary frame
+        supp_barcode = await asyncio.to_thread(
+            resolve_scanned_barcode,
+            frame_bgr,
+            ocr_text=ocr_text,
+            ai_barcode=supp_result.barcode,
+        )
+        if supp_barcode and not supp_result.barcode:
+            supp_result.barcode = supp_barcode
+
         # 6. Reconstruct original analysis result
         orig_result: FoodAnalysisResult | None = None
         if scan.raw_json:
@@ -1301,6 +1464,31 @@ async def add_supplementary_scan(
         # 7. Deterministic Evidence Merging
         merge_outcome = merge_scan_results(orig_result, supp_result, user_overrides=overrides)
         merged_res = merge_outcome.merged_result
+        orig_barcode = getattr(orig_result, "barcode", None)
+        merged_barcode = merged_res.barcode or supp_barcode or orig_barcode
+        merged_res.barcode = merged_barcode
+
+        # 7b. Image Resolution (concurrency-safe deduplication: reuses existing verified image or runs justified lookup if barcode is newly discovered)
+        image_meta = None
+        try:
+            image_resolver = get_image_resolver()
+            image_meta = await asyncio.to_thread(
+                image_resolver.resolve_product_image,
+                product_name=merged_res.product_name,
+                brand=merged_res.brand,
+                barcode=merged_barcode,
+                category=merged_res.food_category,
+                existing_metadata=scan.image_metadata,
+                is_supplementary=True,
+            )
+        except Exception as e:
+            logger.warning("Product image resolution failed gracefully during supplementary scan: %s", e)
+
+        image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
+
+        disp_img: str | None = None
+        if image_meta and image_meta.get("image_status") == "verified_web_image":
+            disp_img = image_meta.get("image_url") or image_meta.get("local_path")
 
         # 8. Re-assess confidence and auto-save eligibility
         assessment = evaluate_scan_confidence(merged_res)
@@ -1319,6 +1507,7 @@ async def add_supplementary_scan(
                 result=merged_res,
                 error_message=None,
                 supplementary_image_path=str(image_path),
+                image_metadata=image_meta_dict,
             )
             cand_records = db.get_scan_date_candidates(scan_id)
 
@@ -1327,12 +1516,13 @@ async def add_supplementary_scan(
                 notes_parts.append(f"Quantity: {merged_res.quantity}")
             if assessment.primary_date:
                 notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+            if merged_barcode:
+                notes_parts.append(f"Barcode: {merged_barcode}")
             notes_str = " | ".join(notes_parts) if notes_parts else None
 
             if scan.product_id:
                 # Update existing product atomically
-                db.update_product(
-                    scan.product_id,
+                update_fields = dict(
                     product_name=merged_res.product_name,
                     brand=merged_res.brand,
                     food_category=merged_res.food_category,
@@ -1340,6 +1530,9 @@ async def add_supplementary_scan(
                     normalized_date=assessment.primary_date,
                     notes=notes_str,
                 )
+                if disp_img:
+                    update_fields["image_path"] = disp_img
+                db.update_product(scan.product_id, **update_fields)
             else:
                 # Create product and link to scan
                 db.add_product(
@@ -1352,7 +1545,7 @@ async def add_supplementary_scan(
                     date_status="confirmed",
                     date_source="printed",
                     analysis_status="success",
-                    image_path=str(scan.image_path),
+                    image_path=disp_img,
                     notes=notes_str,
                     candidate_dates=cand_records,
                     force=True,
@@ -1368,6 +1561,7 @@ async def add_supplementary_scan(
                 result=merged_res,
                 error_message=assessment.decision_reason if merged_res.analysis_status == "error" else None,
                 supplementary_image_path=str(image_path),
+                image_metadata=image_meta_dict,
             )
             auto_saved = False
             decision_reason = assessment.decision_reason
@@ -1405,6 +1599,8 @@ async def add_supplementary_scan(
             auto_saved=auto_saved,
             confidence_score=assessment.confidence_score,
             decision_reason=decision_reason,
+            barcode=merged_barcode,
+            image_metadata=image_meta_dict,
         )
     except HTTPException:
         raise
@@ -1578,6 +1774,36 @@ async def create_scan(
             result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
         gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
+        # 5b. Barcode detection (from cv2 image, local OCR, or AI model result)
+        detected_barcode = await asyncio.to_thread(
+            resolve_scanned_barcode,
+            frame_bgr,
+            ocr_text=ocr_text,
+            ai_barcode=result.barcode,
+        )
+        if detected_barcode and not result.barcode:
+            result.barcode = detected_barcode
+
+        # 5c. Intelligent Product Image Discovery & Validation
+        image_meta = None
+        try:
+            image_resolver = get_image_resolver()
+            image_meta = await asyncio.to_thread(
+                image_resolver.resolve_product_image,
+                product_name=result.product_name,
+                brand=result.brand,
+                barcode=detected_barcode or result.barcode,
+                category=result.food_category,
+                is_supplementary=False,
+            )
+        except Exception as e:
+            logger.warning("Product image resolution failed gracefully during create_scan: %s", e)
+
+        product_display_image: str | None = None
+        image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
+        if image_meta and image_meta.get("image_status") == "verified_web_image":
+            product_display_image = image_meta.get("image_url") or image_meta.get("local_path")
+
         # Assess confidence and auto-save eligibility
         assessment = evaluate_scan_confidence(result)
 
@@ -1594,6 +1820,7 @@ async def create_scan(
                 image_path=str(image_path),
                 result=result,
                 error_message=None,
+                image_metadata=image_meta_dict,
             )
             cand_records = db.get_scan_date_candidates(scan_id)
 
@@ -1602,6 +1829,8 @@ async def create_scan(
                 notes_parts.append(f"Quantity: {result.quantity}")
             if assessment.primary_date:
                 notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+            if detected_barcode or result.barcode:
+                notes_parts.append(f"Barcode: {detected_barcode or result.barcode}")
             notes_str = " | ".join(notes_parts) if notes_parts else None
 
             try:
@@ -1615,7 +1844,7 @@ async def create_scan(
                     date_status="confirmed",
                     date_source="printed",
                     analysis_status="success",
-                    image_path=str(image_path),
+                    image_path=product_display_image,
                     notes=notes_str,
                     candidate_dates=cand_records,
                     force=True,
@@ -1642,6 +1871,7 @@ async def create_scan(
                 image_path=str(image_path),
                 result=result,
                 error_message=assessment.decision_reason if result.analysis_status == "error" else None,
+                image_metadata=image_meta_dict,
             )
             auto_saved = False
             decision_reason = assessment.decision_reason
@@ -1679,6 +1909,8 @@ async def create_scan(
             auto_saved=auto_saved,
             confidence_score=assessment.confidence_score,
             decision_reason=decision_reason,
+            barcode=detected_barcode or result.barcode,
+            image_metadata=image_meta_dict,
         )
     finally:
         if cleanup_needed and image_written:
