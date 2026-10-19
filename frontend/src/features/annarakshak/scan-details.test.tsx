@@ -382,4 +382,69 @@ describe('AnalysisPanel Date Verification UX & Direct Inline Editing', () => {
       expect(onConfirmed).toHaveBeenCalled();
     });
   });
+
+  it('15. Displays Capture More Info button when scan is in review or missing fields', () => {
+    renderPanel(mockScanWithDualDates);
+    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    expect(captureMoreBtn).toBeInTheDocument();
+    expect(captureMoreBtn).toHaveAttribute('id', 'capture-more-info-btn');
+  });
+
+  it('16. Does NOT display Capture More Info button when scan is fully resolved and confirmed', () => {
+    const fullyResolvedScan: ScanRecord = {
+      id: 'SC-102',
+      timestamp: '2026-10-18T10:00:00Z',
+      image: '/water.jpg',
+      name: 'Mineral Water',
+      brand: 'Bisleri',
+      category: 'Beverages',
+      quantity: '1 L',
+      analysisStatus: 'Successful',
+      reviewStatus: 'Confirmed',
+      productId: 'P-500',
+      candidates: [
+        {
+          id: 'c-exp',
+          printedText: 'EXP 12/2026',
+          date: '2026-12-15',
+          dateType: 'Expiry',
+          precision: 'day',
+          confidence: 0.99,
+          source: 'printed',
+        },
+      ],
+    };
+
+    renderPanel(fullyResolvedScan);
+    expect(screen.queryByRole('button', { name: /Capture More Info/i })).toBeNull();
+  });
+
+  it('17. Clicking Capture More Info calls onCaptureMoreInfo callback with inline edited fields', () => {
+    const onCaptureMoreInfo = vi.fn();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AnalysisPanel
+          scan={mockScanWithDualDates}
+          onChange={vi.fn()}
+          onCaptureMoreInfo={onCaptureMoreInfo}
+        />
+      </QueryClientProvider>
+    );
+
+    const nameInput = screen.getByLabelText(/Product name/i);
+    fireEvent.change(nameInput, { target: { value: 'Edited Packaging Name' } });
+
+    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    fireEvent.click(captureMoreBtn);
+
+    expect(onCaptureMoreInfo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'Edited Packaging Name',
+        brand: 'Farm Fresh',
+        category: 'Grains & Cereals',
+        quantity: '1 kg',
+      })
+    );
+  });
 });
+

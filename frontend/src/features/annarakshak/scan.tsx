@@ -19,6 +19,13 @@ export function Scan() {
   const [cameraError, setCameraError] = useState('');
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const [isSupplementary, setIsSupplementary] = useState(false);
+  const pendingOverrides = useRef<{
+    name?: string;
+    brand?: string;
+    category?: any;
+    quantity?: string;
+  }>({});
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -50,11 +57,14 @@ export function Scan() {
     }
   }, [state]);
 
-  async function startCamera() {
+  async function startCamera(forSupplementary = false) {
     setCameraError('');
     setError('');
-    setScan(undefined);
-    setCapturedImage('');
+    if (!forSupplementary) {
+      setScan(undefined);
+      setCapturedImage('');
+      setIsSupplementary(false);
+    }
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError('Camera access is not supported in this browser environment. Please upload an image instead.');
@@ -111,13 +121,55 @@ export function Scan() {
 
   const isSubmitting = useRef(false);
 
+  async function handleCaptureMoreInfo(edits?: {
+    name?: string;
+    brand?: string;
+    category?: any;
+    quantity?: string;
+  }) {
+    if (edits) {
+      pendingOverrides.current = edits;
+    }
+    setIsSupplementary(true);
+    setError('');
+    setCameraError('');
+    await startCamera(true);
+  }
+
   async function executeScan(imageData: string) {
     if (isSubmitting.current) return;
     isSubmitting.current = true;
     const run = ++sequence.current;
-    setScan(undefined);
     setError('');
     setCameraError('');
+
+    if (isSupplementary && scan) {
+      setState('Analyzing');
+
+      try {
+        if (!service.addSupplementaryImage) {
+          throw new Error('Supplementary scanning is not supported by the current service.');
+        }
+        const updated = await service.addSupplementaryImage(scan.id, imageData, pendingOverrides.current);
+        if (run !== sequence.current) return;
+        setScan(updated);
+        setIsSupplementary(false);
+        setState('Complete');
+        toast.success('Supplementary image analyzed and consolidated!');
+        await qc.invalidateQueries();
+      } catch (err: unknown) {
+        if (run !== sequence.current) return;
+        setIsSupplementary(false);
+        setState('Complete');
+        setError(err instanceof Error ? err.message : 'Supplementary scan analysis failed. Original details retained.');
+        toast.error('Supplementary scan failed. Original details preserved.');
+      } finally {
+        isSubmitting.current = false;
+      }
+      return;
+    }
+
+    setScan(undefined);
     setCapturedImage(imageData);
     setState('Analyzing');
 
@@ -152,6 +204,10 @@ export function Scan() {
   }
 
   function handleRetake() {
+    if (isSupplementary) {
+      void startCamera(true);
+      return;
+    }
     setCapturedImage('');
     setScan(undefined);
     setError('');
@@ -162,6 +218,11 @@ export function Scan() {
   function handleCancel() {
     sequence.current++;
     stopCamera();
+    if (isSupplementary && scan) {
+      setIsSupplementary(false);
+      setState('Complete');
+      return;
+    }
     setCapturedImage('');
     setScan(undefined);
     setError('');
@@ -237,10 +298,12 @@ export function Scan() {
 
           <div className="capture-indicator" aria-live="polite">
             {busy && <LoaderCircle size={13} className="animate-spin" />}
-            {state === 'Streaming'
+            {isSupplementary && state === 'Streaming'
+              ? `Supplementary capture active · Capture another side of ${scan?.name || 'packaging'}`
+              : state === 'Streaming'
               ? 'Camera active · Live preview'
               : state === 'Analyzing'
-              ? 'Analyzing with OCR & Gemini…'
+              ? (isSupplementary ? 'Analyzing supplementary image & merging evidence…' : 'Analyzing with OCR & Gemini…')
               : scan?.reviewStatus === 'Confirmed'
               ? 'Scan completed · Product saved to inventory'
               : state === 'Complete'
@@ -263,10 +326,10 @@ export function Scan() {
                 <div className="absolute inset-0 pointer-events-none flex items-center justify-center p-6">
                   <div className="w-full max-w-[280px] h-[260px] border-2 border-white/70 border-dashed rounded-lg flex flex-col justify-between p-3 text-white text-[11px] font-medium shadow-[0_0_0_9999px_rgba(0,0,0,0.4)]">
                     <span className="bg-black/60 backdrop-blur-sm px-2 py-0.5 rounded self-start">
-                      Align packaging & date label
+                      {isSupplementary ? 'Capture additional label / dates' : 'Align packaging & date label'}
                     </span>
                     <span className="bg-black/60 backdrop-blur-sm px-2 py-0.5 rounded self-center text-[10px] text-white/90">
-                      Hold steady for clearest capture
+                      {isSupplementary ? `Adding evidence to ${scan?.name || 'current scan'}` : 'Hold steady for clearest capture'}
                     </span>
                   </div>
                 </div>
@@ -368,8 +431,9 @@ export function Scan() {
           )}
           {scan ? (
             <AnalysisPanel
-              key={scan.id}
+              key={`${scan.id}-${scan.supplementaryImages?.length || 0}`}
               scan={scan}
+              onCaptureMoreInfo={handleCaptureMoreInfo}
               onChange={(s) => {
                 setScan(s);
                 setState(s.analysisStatus === 'Failed' ? 'Analysis Failed' : 'Complete');

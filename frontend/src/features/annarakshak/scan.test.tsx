@@ -13,6 +13,7 @@ vi.mock('@/services/api', () => ({
     getScanById: vi.fn(),
     reanalyzeScan: vi.fn(),
     correctScan: vi.fn(),
+    addSupplementaryImage: vi.fn(),
   },
 }));
 
@@ -316,4 +317,107 @@ describe('Scan Page Completion & Persistence Flow', () => {
       expect(screen.queryByAltText('Captured packaging preview')).not.toBeInTheDocument();
     });
   });
+
+  it('Scenario 9: Supplementary capture executes using the same scan ID and merges details', async () => {
+    vi.mocked(service.startScan).mockResolvedValueOnce(mockUnconfirmedScan);
+
+    const consolidatedScan: ScanRecord = {
+      ...mockUnconfirmedScan,
+      name: 'Fresh Whole Milk Extra Vitamin D',
+      reviewStatus: 'Needs Review',
+      supplementaryImages: ['/api/scans/200/image?index=1'],
+      candidates: [
+        ...mockUnconfirmedScan.candidates,
+        {
+          id: 'c-mfg',
+          printedText: 'MFG 10/10/2026',
+          date: '2026-10-10',
+          dateType: 'Manufacturing',
+          precision: 'day',
+          confidence: 0.95,
+          source: 'printed',
+        },
+      ],
+    };
+    vi.mocked(service.addSupplementaryImage).mockResolvedValueOnce(consolidatedScan);
+
+    renderScan();
+
+    const fileInput = screen.getByLabelText('Upload packaging image');
+    fireEvent.change(fileInput, { target: { files: [new File(['first-image'], 'pkg1.jpg', { type: 'image/jpeg' })] } });
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('Fresh Whole Milk')).toBeInTheDocument();
+    });
+
+    // Capture More Info button should be available
+    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    expect(captureMoreBtn).toBeInTheDocument();
+
+    // Click Capture More Info
+    fireEvent.click(captureMoreBtn);
+
+    // Check camera error or indicator
+    await waitFor(() => {
+      expect(screen.getByText(/Camera access is not supported/i)).toBeInTheDocument();
+    });
+
+    // Upload supplementary image using file input
+    const fileInput2 = screen.getByLabelText('Upload packaging image') as HTMLInputElement;
+    const secondFile = new File(['second-image'], 'pkg2.jpg', { type: 'image/jpeg' });
+    Object.defineProperty(fileInput2, 'files', {
+      value: [secondFile],
+      configurable: true,
+      writable: true,
+    });
+    fireEvent.input(fileInput2, { target: { files: [secondFile] } });
+    fireEvent.change(fileInput2, { target: { files: [secondFile] } });
+
+    await waitFor(() => {
+      expect(service.addSupplementaryImage).toHaveBeenCalledWith(
+        'SC-200',
+        expect.any(String),
+        expect.objectContaining({
+          name: 'Fresh Whole Milk',
+        })
+      );
+      expect(screen.getByDisplayValue('Fresh Whole Milk Extra Vitamin D')).toBeInTheDocument();
+    });
+  });
+
+  it('Scenario 10: Failed supplementary capture retains original scan details and displays error', async () => {
+    vi.mocked(service.startScan).mockResolvedValueOnce(mockUnconfirmedScan);
+    vi.mocked(service.addSupplementaryImage).mockRejectedValueOnce(new Error('Supplementary OCR failed: blurry image'));
+
+    renderScan();
+
+    const fileInput = screen.getByLabelText('Upload packaging image');
+    fireEvent.change(fileInput, { target: { files: [new File(['first-image'], 'pkg1.jpg', { type: 'image/jpeg' })] } });
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('Fresh Whole Milk')).toBeInTheDocument();
+    });
+
+    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    fireEvent.click(captureMoreBtn);
+
+    const fileInput2 = screen.getByLabelText('Upload packaging image') as HTMLInputElement;
+    const secondFile = new File(['second-image'], 'pkg2.jpg', { type: 'image/jpeg' });
+    Object.defineProperty(fileInput2, 'files', {
+      value: [secondFile],
+      configurable: true,
+      writable: true,
+    });
+    fireEvent.input(fileInput2, { target: { files: [secondFile] } });
+    fireEvent.change(fileInput2, { target: { files: [secondFile] } });
+
+    await waitFor(() => {
+      expect(screen.getByText('Supplementary OCR failed: blurry image')).toBeInTheDocument();
+    });
+
+    // Original scan data must be preserved and still visible
+    expect(screen.getByDisplayValue('Fresh Whole Milk')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Capture More Info/i })).toBeInTheDocument();
+  });
 });
+

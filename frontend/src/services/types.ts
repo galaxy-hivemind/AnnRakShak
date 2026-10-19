@@ -8,7 +8,7 @@ export interface Product extends ProductInput { id: string; image: string; scanI
 export interface WasteEntry { id: string; name: string; quantity: string; value: number; reason: string; date: string; }
 export interface WasteInput { name: string; quantity: string; value: number; reason: string; date: string; }
 export interface DateCandidate { id: string; printedText: string; date: string; dateType: DateType; precision: 'day' | 'month' | 'unknown'; reason?: string; confidence?: number; isCalculated?: boolean; source?: 'printed' | 'calculated' | 'manual'; calculatedFrom?: string; }
-export interface ScanRecord { id: string; timestamp: string; image: string; name: string; brand: string; category: Category | ''; quantity?: string; analysisStatus: 'Successful' | 'Failed' | 'Analyzing'; reviewStatus: 'Needs Review' | 'Confirmed'; reason?: string; candidates: DateCandidate[]; productId?: string; autoSaved?: boolean; confidenceScore?: number; decisionReason?: string; }
+export interface ScanRecord { id: string; timestamp: string; image: string; name: string; brand: string; category: Category | ''; quantity?: string; analysisStatus: 'Successful' | 'Failed' | 'Analyzing'; reviewStatus: 'Needs Review' | 'Confirmed'; reason?: string; candidates: DateCandidate[]; productId?: string; autoSaved?: boolean; confidenceScore?: number; decisionReason?: string; supplementaryImages?: string[]; }
 export interface DashboardSummary { total: number; verified: number; expired: number; today: number; soon: number; review: number; expiring: Product[]; reviewScans: ScanRecord[]; recent: ScanRecord[]; categories: { name: Category; count: number }[]; inventoryValue: number; pricedCount: number; wasteThisMonth: number; wasteEntries: number; }
 export interface ApiError { code: string; message: string; }
 export interface Settings { alertWindow: number; compact: boolean; dateFormat: 'short' | 'long'; }
@@ -23,6 +23,16 @@ export interface FoodSafetyService {
  getScanById(id: string): Promise<ScanRecord>;
  deleteScan(id: string): Promise<void>;
  startScan(image?: string): Promise<ScanRecord>;
+ addSupplementaryImage?(
+   scanId: string,
+   image: string,
+   overrides?: {
+     name?: string;
+     brand?: string;
+     category?: Category | '';
+     quantity?: string;
+   }
+ ): Promise<ScanRecord>;
  reanalyzeScan(id: string): Promise<ScanRecord>;
  simulateAnalysisFailure(id: string): Promise<ScanRecord>;
  getDateCandidates(scanId: string): Promise<DateCandidate[]>;

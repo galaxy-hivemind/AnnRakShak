@@ -366,6 +366,59 @@ describe('FastApiFoodSafetyService Adapter', () => {
       expect(product.dateType).toBe('Manufacturing');
       expect(product.date).toBe('2026-10-01');
     });
+
+    it('submits supplementary image with overrides to /api/scans/{id}/supplementary and maps supplementary_images', async () => {
+      const mockBackendScan = {
+        id: 50,
+        product_name: 'Consolidated Water',
+        brand: 'Aquafina',
+        food_category: 'Beverage',
+        quantity: '1 L',
+        needs_review: true,
+        image_path: 'uploads/scans/50.jpg',
+        supplementary_images: ['uploads/scans/50_supp_1.jpg'],
+        date_candidates: [
+          {
+            id: 1,
+            raw_text: 'EXP 10/2027',
+            date_type: 'expiry',
+            normalized_date: '2027-10-15',
+            confidence: 0.95,
+          },
+        ],
+        created_at: '2026-10-17T00:00:00Z',
+      };
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockBackendScan,
+      } as Response);
+
+      const result = await service.addSupplementaryImage('SC-50', 'data:image/jpeg;base64,abc123mock', {
+        name: 'User Edited Name',
+        brand: 'Aquafina',
+        category: 'Beverages',
+        quantity: '1 L',
+      });
+
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'http://127.0.0.1:8000/api/scans/50/supplementary',
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.any(FormData),
+        })
+      );
+
+      const calledBody = fetchSpy.mock.calls[0][1]?.body as FormData;
+      expect(calledBody.get('product_name')).toBe('User Edited Name');
+      expect(calledBody.get('brand')).toBe('Aquafina');
+      expect(calledBody.get('food_category')).toBe('Beverages');
+      expect(calledBody.get('quantity')).toBe('1 L');
+
+      expect(result.id).toBe('SC-50');
+      expect(result.supplementaryImages).toEqual(['http://127.0.0.1:8000/api/scans/50/image?index=1']);
+      expect(result.name).toBe('Consolidated Water');
+    });
   });
 });
 

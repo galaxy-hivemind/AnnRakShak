@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from gemini_analyzer import FoodAnalysisResult, GeminiAnalyzer
 from confidence_evaluator import evaluate_scan_confidence, ConfidenceAssessment
+from evidence_merger import merge_scan_results
 from ocr_engine import AppleVisionOCREngine, OCRResult
 from inventory_db import (
     DEFAULT_DB_PATH,
@@ -293,6 +294,7 @@ class ScanResponse(BaseModel):
     auto_saved: bool = False
     confidence_score: float | None = None
     decision_reason: str | None = None
+    supplementary_images: list[str] = Field(default_factory=list)
 
 
 class DeleteResponse(BaseModel):
@@ -490,6 +492,7 @@ def serialize_scan(
         auto_saved=auto_saved,
         confidence_score=confidence_score,
         decision_reason=decision_reason,
+        supplementary_images=list(s.supplementary_images),
     )
 
 
@@ -1105,6 +1108,316 @@ async def reanalyze_scan(
     )
 
 
+@app.post("/api/scans/{scan_id}/supplementary", response_model=ScanResponse, tags=["Scans"])
+async def add_supplementary_scan(
+    scan_id: int,
+    request: Request,
+    db: InventoryDatabase = Depends(get_db),
+    analyzer: GeminiAnalyzer = Depends(get_analyzer),
+) -> ScanResponse:
+    """
+    Process an additional supplementary image of the SAME physical product package.
+    Extracts supplementary evidence via OCR and Gemini, merges it with the original scan,
+    re-assesses confidence, and updates scan history and inventory without creating duplicate scans or products.
+    """
+    t_total_0 = time.perf_counter()
+    scan = db.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan with ID {scan_id} not found.",
+        )
+
+    t_prep_0 = time.perf_counter()
+    content_type = request.headers.get("content-type", "")
+    image_bytes: bytes = b""
+    overrides: dict[str, Any] = {}
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        uploaded_file = form.get("image") or form.get("file")
+        if not uploaded_file or not hasattr(uploaded_file, "read"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Multipart request must include an 'image' or 'file' field.",
+            )
+        image_bytes = await uploaded_file.read()
+        for field_name in ("product_name", "brand", "food_category", "quantity"):
+            val = form.get(field_name)
+            if val is not None and str(val).strip():
+                overrides[field_name] = str(val).strip()
+    elif "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Malformed JSON body.",
+            )
+        raw_val = body.get("image") or body.get("image_base64") or body.get("image_data")
+        if not raw_val or not isinstance(raw_val, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="JSON request must contain an 'image' or 'image_base64' string.",
+            )
+        if "base64," in raw_val:
+            raw_val = raw_val.split("base64,")[1]
+        try:
+            image_bytes = base64.b64decode(raw_val)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid base64 image data: {e}",
+            )
+        for field_name in ("product_name", "brand", "food_category", "quantity"):
+            val = body.get(field_name)
+            if val is not None and str(val).strip():
+                overrides[field_name] = str(val).strip()
+    else:
+        body = await request.body()
+        if body:
+            image_bytes = body
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Request must be multipart/form-data with 'image' file or application/json with 'image' string.",
+            )
+
+    # 1. Size Validation (Max 15 MB)
+    if len(image_bytes) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded supplementary image is empty (0 bytes).",
+        )
+    max_size = 15 * 1024 * 1024
+    if len(image_bytes) > max_size:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Image file too large. Maximum allowed size is 15 MB.",
+        )
+
+    # 2. Image Decode & Validation
+    frame_bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if frame_bgr is None or frame_bgr.size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image data. File could not be decoded as an image (JPEG, PNG, WebP supported).",
+        )
+
+    # 3. Optimize resolution
+    h, w = frame_bgr.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 2560:
+        scale = 2560.0 / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        success, encoded_jpg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+        optimized_bytes = encoded_jpg.tobytes() if success else image_bytes
+    else:
+        optimized_bytes = image_bytes
+
+    ext = ".jpg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext = ".png"
+    elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:12]:
+        ext = ".webp"
+
+    captures_dir = get_captures_dir()
+    try:
+        captures_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unable to initialize image capture directory: {e}",
+        )
+
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_tag = uuid.uuid4().hex[:6]
+    supp_index = len(scan.supplementary_images) + 1
+    image_filename = f"scan_{timestamp_str}_{unique_tag}_supp{supp_index}{ext}"
+    image_path = captures_dir / image_filename
+
+    image_written = False
+    cleanup_needed = should_cleanup_captures()
+
+    try:
+        image_path.write_bytes(optimized_bytes)
+        image_written = True
+        upload_preprocess_ms = (time.perf_counter() - t_prep_0) * 1000.0
+
+        # 4. Local OCR on supplementary frame
+        t_ocr_0 = time.perf_counter()
+        shared_ocr = getattr(request.app.state, "ocr_engine", None)
+        ocr_result = await asyncio.to_thread(run_local_ocr, frame_bgr, shared_ocr)
+        ocr_ms = (time.perf_counter() - t_ocr_0) * 1000.0
+        ocr_text = ocr_result.summary_text if (ocr_result and ocr_result.has_text) else None
+
+        # 5. Supplementary Gemini AI analysis
+        t_gem_0 = time.perf_counter()
+        if ocr_text:
+            supp_result: FoodAnalysisResult = await asyncio.to_thread(
+                analyzer.analyze_image, str(image_path), ocr_text=ocr_text
+            )
+        else:
+            supp_result: FoodAnalysisResult = await asyncio.to_thread(
+                analyzer.analyze_image, str(image_path)
+            )
+        gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
+
+        # 6. Reconstruct original analysis result
+        orig_result: FoodAnalysisResult | None = None
+        if scan.raw_json:
+            try:
+                orig_result = FoodAnalysisResult.model_validate_json(scan.raw_json)
+            except Exception:
+                orig_result = None
+
+        if orig_result is None:
+            cands = db.get_scan_date_candidates(scan_id)
+            from gemini_analyzer import DateCandidate
+            orig_cands = [
+                DateCandidate(
+                    raw_text=c.raw_text,
+                    date_type=c.date_type if c.date_type in ("expiry", "use_by", "best_before", "manufacturing", "packed_on", "after_opening", "unknown") else "unknown",
+                    normalized_date=c.normalized_date,
+                    confidence=c.confidence,
+                    evidence=c.evidence,
+                )
+                for c in cands
+            ]
+            orig_result = FoodAnalysisResult(
+                product_name=scan.product_name,
+                brand=scan.brand,
+                food_category=scan.food_category,
+                quantity=None,
+                date_candidates=orig_cands,
+                selected_expiry_date=scan.selected_expiry_date,
+                analysis_status="success" if scan.analysis_status == "success" else "needs_review",
+                needs_review=scan.needs_review,
+                review_reason=scan.review_reason,
+            )
+
+        # 7. Deterministic Evidence Merging
+        merge_outcome = merge_scan_results(orig_result, supp_result, user_overrides=overrides)
+        merged_res = merge_outcome.merged_result
+
+        # 8. Re-assess confidence and auto-save eligibility
+        assessment = evaluate_scan_confidence(merged_res)
+        if merge_outcome.has_conflicts:
+            assessment.should_auto_save = False
+
+        t_db_0 = time.perf_counter()
+        if assessment.should_auto_save:
+            merged_res.needs_review = False
+            merged_res.review_reason = None
+            if assessment.primary_date:
+                merged_res.selected_expiry_date = assessment.primary_date
+
+            db.update_scan(
+                scan_id,
+                result=merged_res,
+                error_message=None,
+                supplementary_image_path=str(image_path),
+            )
+            cand_records = db.get_scan_date_candidates(scan_id)
+
+            notes_parts = []
+            if merged_res.quantity:
+                notes_parts.append(f"Quantity: {merged_res.quantity}")
+            if assessment.primary_date:
+                notes_parts.append(f"EXP: {assessment.primary_date} [Auto-Saved]")
+            notes_str = " | ".join(notes_parts) if notes_parts else None
+
+            if scan.product_id:
+                # Update existing product atomically
+                db.update_product(
+                    scan.product_id,
+                    product_name=merged_res.product_name,
+                    brand=merged_res.brand,
+                    food_category=merged_res.food_category,
+                    date_type=assessment.primary_date_type or "expiry",
+                    normalized_date=assessment.primary_date,
+                    notes=notes_str,
+                )
+            else:
+                # Create product and link to scan
+                db.add_product(
+                    product_name=merged_res.product_name,
+                    brand=merged_res.brand,
+                    food_category=merged_res.food_category,
+                    date_type=assessment.primary_date_type or "expiry",
+                    date_text=None,
+                    normalized_date=assessment.primary_date,
+                    date_status="confirmed",
+                    date_source="printed",
+                    analysis_status="success",
+                    image_path=str(scan.image_path),
+                    notes=notes_str,
+                    candidate_dates=cand_records,
+                    force=True,
+                    scan_id=scan_id,
+                )
+            auto_saved = True
+            decision_reason = assessment.decision_reason
+        else:
+            merged_res.needs_review = True
+            merged_res.review_reason = assessment.decision_reason
+            db.update_scan(
+                scan_id,
+                result=merged_res,
+                error_message=assessment.decision_reason if merged_res.analysis_status == "error" else None,
+                supplementary_image_path=str(image_path),
+            )
+            auto_saved = False
+            decision_reason = assessment.decision_reason
+
+        db_ms = (time.perf_counter() - t_db_0) * 1000.0
+        total_ms = (time.perf_counter() - t_total_0) * 1000.0
+
+        updated_scan = db.get_scan(scan_id)
+        if not updated_scan:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to retrieve scan after supplementary analysis.",
+            )
+        candidates = db.get_scan_date_candidates(scan_id)
+
+        timing_meta = ScanTiming(
+            upload_preprocess_ms=round(upload_preprocess_ms, 2),
+            ocr_ms=round(ocr_ms, 2),
+            gemini_ms=round(gemini_ms, 2),
+            db_ms=round(db_ms, 2),
+            total_ms=round(total_ms, 2),
+            models_attempted=merged_res.models_attempted,
+            retries_count=merged_res.retries_count,
+        )
+
+        logger.info(
+            "Supplementary scan for scan %d completed in %.1fms (auto_saved=%s, conflicts=%s)",
+            scan_id, total_ms, auto_saved, merge_outcome.has_conflicts
+        )
+
+        return serialize_scan(
+            updated_scan,
+            candidates=candidates,
+            timing=timing_meta,
+            auto_saved=auto_saved,
+            confidence_score=assessment.confidence_score,
+            decision_reason=decision_reason,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Supplementary capture analysis failed for scan %d: %s", scan_id, e)
+        if image_written and cleanup_needed:
+            _safe_remove_file(image_path)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Supplementary scan analysis failed: {e}",
+        )
+
+
 def run_local_ocr(frame_bgr: np.ndarray, engine: AppleVisionOCREngine | None = None) -> OCRResult | None:
     """Run local Apple Vision OCR if available, reusing shared engine instance when provided."""
     try:
@@ -1375,20 +1688,33 @@ async def create_scan(
 @app.get("/api/scans/{scan_id}/image", tags=["Scans"])
 def get_scan_image(
     scan_id: int,
+    index: int = Query(default=0, ge=0, description="0 for primary image, 1+ for supplementary captures"),
     db: InventoryDatabase = Depends(get_db),
 ) -> FileResponse:
-    """Retrieve the original captured image file for a given scan."""
+    """Retrieve the captured image file for a given scan (primary or supplementary)."""
     scan = db.get_scan(scan_id)
     if not scan:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan with ID {scan_id} not found.",
         )
-    img_path = Path(scan.image_path)
+    if index == 0:
+        target_path_str = scan.image_path
+    else:
+        supp_list = scan.supplementary_images
+        if index <= len(supp_list):
+            target_path_str = supp_list[index - 1]
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Supplementary image index {index} not found for scan {scan_id}.",
+            )
+
+    img_path = Path(target_path_str)
     if not img_path.exists() or not img_path.is_file():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Scan image file not found on disk: {scan.image_path}",
+            detail=f"Scan image file not found on disk: {target_path_str}",
         )
     ext = img_path.suffix.lower()
     media_type = "image/jpeg"

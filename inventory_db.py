@@ -224,7 +224,22 @@ class ScanHistoryRecord:
     product_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["supplementary_images"] = self.supplementary_images
+        return d
+
+    @property
+    def supplementary_images(self) -> list[str]:
+        """Return list of supplementary image paths associated with this scan."""
+        if not self.raw_json:
+            return []
+        try:
+            import json
+            parsed = json.loads(self.raw_json)
+            val = parsed.get("supplementary_images", [])
+            return val if isinstance(val, list) else []
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -757,9 +772,10 @@ class InventoryDatabase:
         scan_id: int,
         result: Any | None = None,
         error_message: str | None = None,
+        supplementary_image_path: str | None = None,
     ) -> bool:
         """
-        Update an existing scan history record and its candidate dates after reanalysis.
+        Update an existing scan history record and its candidate dates after reanalysis or supplementary capture.
         """
         existing = self.get_scan(scan_id)
         if not existing:
@@ -784,8 +800,24 @@ class InventoryDatabase:
             needs_review = 1 if getattr(result, "needs_review", True) else 0
             review_reason = getattr(result, "review_reason", None)
             selected_expiry_date = getattr(result, "selected_expiry_date", None)
-            if hasattr(result, "model_dump_json"):
+            
+            # Preserve existing supplementary images and append newly captured one if supplied
+            existing_supp = list(existing.supplementary_images)
+            if supplementary_image_path and str(supplementary_image_path) not in existing_supp:
+                existing_supp.append(str(supplementary_image_path))
+
+            if hasattr(result, "model_dump"):
+                try:
+                    dumped = result.model_dump()
+                    dumped["supplementary_images"] = existing_supp
+                    import json
+                    raw_json = json.dumps(dumped)
+                except Exception:
+                    if hasattr(result, "model_dump_json"):
+                        raw_json = result.model_dump_json()
+            elif hasattr(result, "model_dump_json"):
                 raw_json = result.model_dump_json()
+
             candidates = getattr(result, "date_candidates", []) or []
 
         with self._get_connection() as conn:
@@ -1372,7 +1404,7 @@ class InventoryDatabase:
         Returns (success, deleted_product_id).
         """
         with self._get_connection() as conn:
-            cursor = conn.execute("SELECT id, image_path, product_id FROM scan_history WHERE id = ?", (scan_id,))
+            cursor = conn.execute("SELECT id, image_path, product_id, raw_json FROM scan_history WHERE id = ?", (scan_id,))
             scan_row = cursor.fetchone()
             if not scan_row:
                 # Check if a product still references this scan_id even if scan_history record is gone
@@ -1386,6 +1418,7 @@ class InventoryDatabase:
 
             image_path = scan_row["image_path"] if hasattr(scan_row, "keys") else scan_row[1]
             prod_id = scan_row["product_id"] if hasattr(scan_row, "keys") else scan_row[2]
+            raw_json = scan_row["raw_json"] if hasattr(scan_row, "keys") else (scan_row[3] if len(scan_row) > 3 else None)
 
             if prod_id is None:
                 p_row = conn.execute("SELECT id FROM products WHERE scan_id = ?", (scan_id,)).fetchone()
@@ -1408,6 +1441,22 @@ class InventoryDatabase:
                         p.unlink()
                 except Exception as e:
                     logger.debug("Could not remove capture file %s: %s", image_path, e)
+
+            if raw_json:
+                try:
+                    import json
+                    parsed = json.loads(raw_json)
+                    supp_list = parsed.get("supplementary_images", [])
+                    if isinstance(supp_list, list):
+                        for sp_path in supp_list:
+                            try:
+                                sp = Path(sp_path)
+                                if sp.exists() and sp.is_file():
+                                    sp.unlink()
+                            except Exception as e:
+                                logger.debug("Could not remove supplementary capture file %s: %s", sp_path, e)
+                except Exception:
+                    pass
 
             return True, deleted_prod_id
 

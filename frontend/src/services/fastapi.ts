@@ -93,6 +93,7 @@ interface BackendScan {
   auto_saved?: boolean;
   confidence_score?: number | null;
   decision_reason?: string | null;
+  supplementary_images?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +490,66 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     return this.mapBackendScan(createdScan);
   }
 
+  async addSupplementaryImage(
+    scanId: string | number,
+    image: string,
+    overrides?: {
+      name?: string;
+      brand?: string;
+      category?: Category | '';
+      quantity?: string;
+    }
+  ): Promise<ScanRecord> {
+    const rawId = typeof scanId === 'string' && scanId.startsWith('SC-') ? scanId.replace('SC-', '') : String(scanId);
+    if (!image) {
+      throw new Error('Please capture or select an image for supplementary scanning.');
+    }
+
+    const formData = new FormData();
+    if (image.startsWith('data:')) {
+      const [header, base64] = image.split(',');
+      const mime = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
+      const binary = atob(base64);
+      const array = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        array[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([array], { type: mime });
+      formData.append('image', blob, 'supplementary_capture.jpg');
+    } else {
+      formData.append('image', image);
+    }
+
+    if (overrides) {
+      if (overrides.name) formData.append('product_name', overrides.name);
+      if (overrides.brand !== undefined) formData.append('brand', overrides.brand);
+      if (overrides.category) formData.append('food_category', overrides.category);
+      if (overrides.quantity !== undefined) formData.append('quantity', overrides.quantity);
+    }
+
+    const url = this.baseUrl ? `${this.baseUrl}/api/scans/${rawId}/supplementary` : `/api/scans/${rawId}/supplementary`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      let errorDetail = `Supplementary scanning failed with status ${response.status}`;
+      try {
+        const errData = await response.json();
+        if (errData && errData.detail) {
+          errorDetail = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+        }
+      } catch {
+        // Not JSON
+      }
+      throw new Error(errorDetail);
+    }
+
+    const updatedScan = (await response.json()) as BackendScan;
+    return this.mapBackendScan(updatedScan);
+  }
+
   async simulateAnalysisFailure(id: string): Promise<ScanRecord> {
     const scan = await this.getScanById(id);
     return {
@@ -724,6 +785,14 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
     let reviewStatus: 'Needs Review' | 'Confirmed' = bs.needs_review ? 'Needs Review' : 'Confirmed';
     let analysisStatus: 'Successful' | 'Failed' | 'Analyzing' = bs.analysis_status === 'error' ? 'Failed' : 'Successful';
 
+    const supplementaryImages = (bs.supplementary_images || []).map((_, idx) =>
+      typeof process !== 'undefined' && process.env?.FASTAPI_URL && this.baseUrl === process.env.FASTAPI_URL
+        ? `/api/scans/${bs.id}/image?index=${idx + 1}`
+        : this.baseUrl
+        ? `${this.baseUrl}/api/scans/${bs.id}/image?index=${idx + 1}`
+        : `/api/scans/${bs.id}/image?index=${idx + 1}`
+    );
+
     return {
       id: `SC-${bs.id}`,
       timestamp: bs.timestamp,
@@ -746,6 +815,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       decisionReason: bs.decision_reason || bs.review_reason || undefined,
       reason: bs.review_reason || bs.error_message || undefined,
       candidates,
+      supplementaryImages,
     };
   }
 

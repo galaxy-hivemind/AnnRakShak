@@ -1,6 +1,6 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, X, AlertCircle } from 'lucide-react';
+import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, X, AlertCircle, Camera } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -29,14 +29,46 @@ export function formatDateTypeLabel(type: string): string {
   }
 }
 
+export function isScanFullyResolved(scan: ScanRecord): boolean {
+  if (scan.reviewStatus === 'Needs Review' || scan.analysisStatus === 'Failed') {
+    return false;
+  }
+  if (!scan.name || scan.name.trim().length < 2 || scan.name === 'Unidentified Item') {
+    return false;
+  }
+  if (!scan.brand || scan.brand.trim().length === 0) {
+    return false;
+  }
+  if (!scan.category) {
+    return false;
+  }
+  if (!scan.quantity || scan.quantity.trim().length === 0) {
+    return false;
+  }
+  const hasExactExpiry = (scan.candidates || []).some(
+    (c) => ['Expiry', 'Use By', 'Best Before'].includes(c.dateType) && isExactDate(c.date)
+  );
+  if (!hasExactExpiry) {
+    return false;
+  }
+  return true;
+}
+
 export function AnalysisPanel({
   scan,
   onChange,
   onConfirmed,
+  onCaptureMoreInfo,
 }: {
   scan: ScanRecord;
   onChange: (s: ScanRecord) => void;
   onConfirmed?: () => void;
+  onCaptureMoreInfo?: (currentEdits: {
+    name?: string;
+    brand?: string;
+    category?: Category | '';
+    quantity?: string;
+  }) => void;
 }) {
   // Inline editable fields
   const [productName, setProductName] = useState(scan.name || '');
@@ -54,6 +86,15 @@ export function AnalysisPanel({
   // Date candidates editable state
   const [candidates, setCandidates] = useState<DateCandidate[]>(scan.candidates || []);
   const [editingDateId, setEditingDateId] = useState<string | null>(null);
+
+  // Sync state if scan updates (e.g. from supplementary scan consolidation)
+  useEffect(() => {
+    setProductName(scan.name || '');
+    setBrand(scan.brand || '');
+    setCategory(scan.category || '');
+    setQuantity(scan.quantity || '');
+    setCandidates(scan.candidates || []);
+  }, [scan.id, scan.name, scan.brand, scan.category, scan.quantity, scan.candidates]);
 
   // Verification & Confirmation state
   const [verifiedCandidates, setVerifiedCandidates] = useState<Record<string, boolean>>({});
@@ -247,8 +288,73 @@ export function AnalysisPanel({
     }
   }
 
+  const isFullyResolved = isScanFullyResolved(scan);
+  const showCaptureMoreInfo = !isFullyResolved;
+
+  const suppInputRef = useRef<HTMLInputElement>(null);
+  const [suppBusy, setSuppBusy] = useState(false);
+
+  const handleCaptureMoreInfo = () => {
+    if (onCaptureMoreInfo) {
+      onCaptureMoreInfo({
+        name: productName,
+        brand,
+        category,
+        quantity,
+      });
+    } else {
+      suppInputRef.current?.click();
+    }
+  };
+
+  const handleSupplementaryFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setSuppBusy(true);
+    try {
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const base64 = reader.result as string;
+          if (service.addSupplementaryImage) {
+            const updated = await service.addSupplementaryImage(scan.id, base64, {
+              name: productName,
+              brand,
+              category,
+              quantity,
+            });
+            onChange(updated);
+            toast.success('Supplementary image analyzed and consolidated!');
+          }
+        } catch (err: unknown) {
+          toast.error(err instanceof Error ? err.message : 'Supplementary analysis failed.');
+        } finally {
+          setSuppBusy(false);
+          if (suppInputRef.current) suppInputRef.current.value = '';
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch {
+      setSuppBusy(false);
+    }
+  };
+
   return (
     <div className="analysis-body space-y-4">
+      {/* Supplementary captures indicator if present */}
+      {scan.supplementaryImages && scan.supplementaryImages.length > 0 && (
+        <div className="flex items-center gap-2 mb-2 pb-2 border-b border-border/50 text-xs">
+          <span className="text-muted-foreground font-medium">Captures:</span>
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium text-[11px]">
+            Primary front
+          </span>
+          {scan.supplementaryImages.map((_, i) => (
+            <span key={i} className="inline-flex items-center px-1.5 py-0.5 rounded bg-secondary text-secondary-foreground font-medium text-[11px]">
+              +{i + 1} Supplementary
+            </span>
+          ))}
+        </div>
+      )}
       {/* Top Status & Confidence Overview */}
       <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2">
@@ -684,12 +790,23 @@ export function AnalysisPanel({
             <Button
               id="confirm-details-btn"
               onClick={() => void confirm()}
-              disabled={busy || !confirmed || !isVerificationComplete}
+              disabled={busy || suppBusy || !confirmed || !isVerificationComplete}
             >
               {busy ? <LoaderCircle className="animate-spin" /> : <Check />}
               Confirm Details
             </Button>
-            <Button variant="ghost" onClick={() => void retry()} disabled={busy}>
+            {showCaptureMoreInfo && (
+              <Button
+                id="capture-more-info-btn"
+                variant="outline"
+                onClick={handleCaptureMoreInfo}
+                disabled={busy || suppBusy}
+              >
+                {suppBusy ? <LoaderCircle className="animate-spin" /> : <Camera />}
+                Capture More Info
+              </Button>
+            )}
+            <Button variant="ghost" onClick={() => void retry()} disabled={busy || suppBusy}>
               <RotateCcw />
               Retry Analysis
             </Button>
@@ -699,11 +816,36 @@ export function AnalysisPanel({
 
       {/* Path A & Confirmed Status Display */}
       {isConfirmed && (
-        <div className="flex items-center gap-2 text-xs text-safe font-medium mt-4 p-2.5 bg-safe/10 border border-safe/30 rounded-md">
-          <Check size={14} className="shrink-0" />
-          <span>Saved to inventory · Linked to your kitchen items.</span>
-        </div>
+        <>
+          <div className="flex items-center gap-2 text-xs text-safe font-medium mt-4 p-2.5 bg-safe/10 border border-safe/30 rounded-md">
+            <Check size={14} className="shrink-0" />
+            <span>Saved to inventory · Linked to your kitchen items.</span>
+          </div>
+          {showCaptureMoreInfo && (
+            <div className="mt-3">
+              <Button
+                id="capture-more-info-btn"
+                variant="outline"
+                size="sm"
+                onClick={handleCaptureMoreInfo}
+                disabled={busy || suppBusy}
+              >
+                {suppBusy ? <LoaderCircle className="animate-spin" /> : <Camera />}
+                Capture More Info
+              </Button>
+            </div>
+          )}
+        </>
       )}
+
+      <input
+        ref={suppInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        aria-label="Upload supplementary packaging image"
+        onChange={handleSupplementaryFile}
+      />
     </div>
   );
 }
@@ -712,10 +854,17 @@ export function ScanDetailDialog({
   scan,
   onClose,
   onChange,
+  onCaptureMoreInfo,
 }: {
   scan: ScanRecord;
   onClose: () => void;
   onChange: (s: ScanRecord) => void;
+  onCaptureMoreInfo?: (currentEdits: {
+    name?: string;
+    brand?: string;
+    category?: Category | '';
+    quantity?: string;
+  }) => void;
 }) {
   return (
     <Dialog
@@ -729,16 +878,26 @@ export function ScanDetailDialog({
         <DialogDescription>
           Scan · {new Date(scan.timestamp).toLocaleString()} · Original evidence retained.
         </DialogDescription>
-        <div className="flex justify-center bg-muted rounded-md p-3">
+        <div className="flex flex-wrap justify-center gap-2 bg-muted rounded-md p-3">
           <img
             src={scan.image}
             width={100}
             height={110}
             alt={`Capture for ${scan.name}`}
-            className="h-28 object-contain"
+            className="h-28 object-contain rounded border border-border"
           />
+          {scan.supplementaryImages?.map((imgUrl, idx) => (
+            <img
+              key={idx}
+              src={imgUrl}
+              width={100}
+              height={110}
+              alt={`Supplementary capture ${idx + 1} for ${scan.name}`}
+              className="h-28 object-contain rounded border border-border"
+            />
+          ))}
         </div>
-        <AnalysisPanel key={scan.id} scan={scan} onChange={onChange} />
+        <AnalysisPanel key={scan.id} scan={scan} onChange={onChange} onCaptureMoreInfo={onCaptureMoreInfo} />
       </DialogContent>
     </Dialog>
   );
