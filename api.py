@@ -23,6 +23,7 @@ import base64
 import datetime
 import logging
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -43,7 +44,11 @@ from evidence_merger import merge_scan_results
 from ocr_engine import AppleVisionOCREngine, OCRResult
 from barcode_detector import resolve_scanned_barcode
 from product_image_resolver import get_image_resolver, ProductImageResolver
-from image_job_worker import process_due_image_jobs, process_image_discovery_job
+from image_job_worker import (
+    DEFAULT_SERVERLESS_TIME_BUDGET_SECONDS,
+    process_due_image_jobs,
+    process_image_discovery_job,
+)
 from inventory_db import (
     DEFAULT_DB_PATH,
     DEFAULT_WARNING_DAYS,
@@ -1090,13 +1095,77 @@ def get_product_image_job(
     }
 
 
-@app.post("/api/jobs/process-pending", tags=["Jobs"])
+def verify_cron_secret(request: Request) -> None:
+    """
+    Authenticate cron and background job processing requests.
+    Validates Authorization: Bearer <CRON_SECRET> header using constant-time comparison.
+    Rejects missing or invalid credentials before any jobs are processed.
+    Raises:
+      - 500 Internal Server Error if CRON_SECRET is not configured on the server.
+      - 401 Unauthorized if Authorization header is missing or not a Bearer token.
+      - 401 Unauthorized if the token does not match CRON_SECRET.
+    """
+    cron_secret = os.getenv("CRON_SECRET")
+    if not cron_secret or not cron_secret.strip():
+        logger.error("CRON_SECRET environment variable is not configured on the server.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: CRON_SECRET is not configured.",
+        )
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization scheme. Bearer token required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not secrets.compare_digest(token.strip(), cron_secret.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.post("/api/jobs/process-pending", tags=["Jobs"], dependencies=[Depends(verify_cron_secret)])
 def process_pending_jobs(
-    limit: int = Query(default=10, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=50, description="Maximum number of due jobs to process"),
+    max_duration_seconds: float = Query(
+        default=DEFAULT_SERVERLESS_TIME_BUDGET_SECONDS,
+        ge=1.0,
+        le=60.0,
+        description="Maximum execution time budget in seconds before stopping claims",
+    ),
     db: InventoryDatabase = Depends(get_db),
 ) -> dict[str, Any]:
-    """Process due background image discovery jobs (for cron or manual execution)."""
-    count = process_due_image_jobs(db, limit=limit)
+    """Process due background image discovery jobs (for authenticated manual or POST execution)."""
+    count = process_due_image_jobs(db, limit=limit, time_budget_seconds=max_duration_seconds)
+    return {"status": "ok", "processed": count}
+
+
+@app.get("/api/jobs/process-pending", tags=["Jobs"], dependencies=[Depends(verify_cron_secret)])
+def process_pending_jobs_cron(
+    limit: int = Query(default=10, ge=1, le=50, description="Maximum number of due jobs to process"),
+    max_duration_seconds: float = Query(
+        default=DEFAULT_SERVERLESS_TIME_BUDGET_SECONDS,
+        ge=1.0,
+        le=60.0,
+        description="Maximum execution time budget in seconds before stopping claims",
+    ),
+    db: InventoryDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Scheduled entrypoint for Vercel Cron (which invokes endpoints via HTTP GET with CRON_SECRET)."""
+    count = process_due_image_jobs(db, limit=limit, time_budget_seconds=max_duration_seconds)
     return {"status": "ok", "processed": count}
 
 

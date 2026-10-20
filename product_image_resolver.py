@@ -52,7 +52,8 @@ logger = logging.getLogger("AnnaRakshak.ImageResolver")
 
 # Timeouts, Limits & SSRF Controls
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
-DOWNLOAD_TIMEOUT_SECONDS = 8.0
+DOWNLOAD_TIMEOUT_SECONDS = 5.0
+MAX_CATALOG_SEARCH_REQUESTS = 6
 MIN_IMAGE_DIMENSION = 100
 MAX_IMAGE_DIMENSION = 5000
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -783,6 +784,7 @@ class ProductImageResolver:
         category: str | None = None,
         existing_metadata: dict[str, Any] | None = None,
         is_supplementary: bool = False,
+        deadline: float | None = None,
     ) -> ImageMetadata:
         """
         Main entry point for resolving a product's display image.
@@ -870,7 +872,10 @@ class ProductImageResolver:
                 clean_bc = re.sub(r"\D", "", str(barcode))
                 if is_valid_gtin_checksum(clean_bc):
                     logger.info("Attempting Stage 1: Barcode lookup on product catalogs for %s", clean_bc)
-                    meta = self._lookup_open_food_facts_barcode(clean_bc, identity_str, client)
+                    if deadline is not None:
+                        meta = self._lookup_open_food_facts_barcode(clean_bc, identity_str, client, deadline=deadline)
+                    else:
+                        meta = self._lookup_open_food_facts_barcode(clean_bc, identity_str, client)
                     if meta and meta.is_verified:
                         self.cache_result(clean_bc, product_name, brand, meta)
                         return meta
@@ -880,13 +885,19 @@ class ProductImageResolver:
             # 5. Mandatory Priority: Stage 2 — Name & Brand progressive search across product catalogs and public sources
             if product_name and product_name.strip():
                 logger.info("Attempting Stage 2: Name & Brand search across catalogs for '%s' ('%s')", product_name, brand or "")
-                meta = self._lookup_open_food_facts_search(product_name, brand, barcode, identity_str, client)
+                if deadline is not None:
+                    meta = self._lookup_open_food_facts_search(product_name, brand, barcode, identity_str, client, deadline=deadline)
+                else:
+                    meta = self._lookup_open_food_facts_search(product_name, brand, barcode, identity_str, client)
                 if meta and meta.is_verified:
                     self.cache_result(barcode, product_name, brand, meta)
                     return meta
 
             # 6. Stage 3 — Optional General Web Search Provider (if configured)
-            meta = self._lookup_optional_web_search(product_name, brand, barcode, identity_str, client)
+            if deadline is not None:
+                meta = self._lookup_optional_web_search(product_name, brand, barcode, identity_str, client, deadline=deadline)
+            else:
+                meta = self._lookup_optional_web_search(product_name, brand, barcode, identity_str, client)
             if meta and meta.is_verified:
                 self.cache_result(barcode, product_name, brand, meta)
                 return meta
@@ -914,6 +925,7 @@ class ProductImageResolver:
         barcode: str,
         identity_str: str,
         client: httpx.Client,
+        deadline: float | None = None,
     ) -> ImageMetadata | None:
         """Query product catalogs by barcode (OFF, OBF, OPF)."""
         clean_bc = barcode.strip()
@@ -924,8 +936,12 @@ class ProductImageResolver:
         ]
 
         for source_name, url_template in catalog_endpoints:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Execution budget exceeded during barcode lookup")
             url = url_template.format(barcode=clean_bc)
             for attempt in range(2):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Execution budget exceeded during barcode lookup")
                 try:
                     resp = client.get(url)
                     if resp.status_code in (502, 503, 504) and attempt == 0:
@@ -948,6 +964,8 @@ class ProductImageResolver:
                         break
 
                     # Download & Validate candidate image
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Execution budget exceeded during barcode image download")
                     success, _, meta_dict, err = download_and_validate_web_image(
                         img_url,
                         target_dir=self.cache_dir,
@@ -987,6 +1005,7 @@ class ProductImageResolver:
         barcode: str | None,
         identity_str: str,
         client: httpx.Client,
+        deadline: float | None = None,
     ) -> ImageMetadata | None:
         """Progressively search product catalogs (OFF, OBF, OPF) with candidate ranking."""
         queries = generate_search_queries(product_name, brand)
@@ -1012,7 +1031,12 @@ class ProductImageResolver:
                 ("open_products_facts", OPF_SEARCH_URL),
             ]
 
-        for query in queries:
+        catalog_requests_count = 0
+
+        for query in queries[:4]:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Execution budget exceeded during catalog search")
+
             params = {
                 "search_terms": query,
                 "search_simple": 1,
@@ -1023,8 +1047,18 @@ class ProductImageResolver:
             }
 
             for cat_name, cat_url in catalogs:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Execution budget exceeded during catalog search")
+
+                if catalog_requests_count >= MAX_CATALOG_SEARCH_REQUESTS:
+                    logger.debug("Reached maximum catalog search requests (%d); stopping broader catalog scan.", MAX_CATALOG_SEARCH_REQUESTS)
+                    break
+                catalog_requests_count += 1
+
                 products = []
                 for attempt in range(2):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Execution budget exceeded during catalog search")
                     try:
                         resp = client.get(cat_url, params=params)
                         if resp.status_code in (502, 503, 504) and attempt == 0:
@@ -1064,6 +1098,8 @@ class ProductImageResolver:
 
                 # Try downloading and validating in rank order
                 for score, cand, img_url in ranked_candidates:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Execution budget exceeded during candidate image download")
                     success, _, meta_dict, err = download_and_validate_web_image(
                         img_url,
                         target_dir=self.cache_dir,
@@ -1088,7 +1124,7 @@ class ProductImageResolver:
                         logger.info("Candidate image %s failed validation: %s; trying next candidate", img_url, err)
 
         # Fallback to Wikipedia / Wikimedia image search if catalogs found no suitable image
-        wiki_meta = self._lookup_wikipedia_search(product_name, brand, barcode, identity_str, client)
+        wiki_meta = self._lookup_wikipedia_search(product_name, brand, barcode, identity_str, client, deadline=deadline)
         if wiki_meta and wiki_meta.is_verified:
             return wiki_meta
 
@@ -1101,6 +1137,7 @@ class ProductImageResolver:
         barcode: str | None,
         identity_str: str,
         client: httpx.Client,
+        deadline: float | None = None,
     ) -> ImageMetadata | None:
         """Search Wikipedia/Wikimedia for authoritative brand or packaging images."""
         queries = generate_search_queries(product_name, brand)
@@ -1110,6 +1147,8 @@ class ProductImageResolver:
         min_threshold = 45.0 if (brand and brand.strip()) else 25.0
 
         for query in queries[:3]:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Execution budget exceeded during Wikipedia search")
             params = {
                 "action": "query",
                 "format": "json",
@@ -1135,6 +1174,8 @@ class ProductImageResolver:
                     img_url = thumb.get("source") or (page.get("original") or {}).get("source")
                     if not img_url:
                         continue
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Execution budget exceeded during candidate image download")
                     success, _, meta_dict, err = download_and_validate_web_image(
                         img_url,
                         target_dir=self.cache_dir,
@@ -1166,12 +1207,16 @@ class ProductImageResolver:
         barcode: str | None,
         identity_str: str,
         client: httpx.Client,
+        deadline: float | None = None,
     ) -> ImageMetadata | None:
         """
         Optional Stage 3: General web image search if API keys are configured.
         Supports Google Custom Search API if GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX are present.
         If not configured, returns None silently.
         """
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Execution budget exceeded during web search")
+
         api_key = os.environ.get("GOOGLE_CSE_API_KEY") or os.environ.get("IMAGE_SEARCH_API_KEY")
         cx = os.environ.get("GOOGLE_CSE_CX")
         if not api_key or not cx or not product_name:
@@ -1189,12 +1234,16 @@ class ProductImageResolver:
         }
 
         try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Execution budget exceeded during web search")
             resp = client.get(search_url, params=params)
             if resp.status_code != 200:
                 return None
 
             items = resp.json().get("items", [])
             for item in items:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Execution budget exceeded during web image download")
                 img_url = item.get("link")
                 if not img_url:
                     continue

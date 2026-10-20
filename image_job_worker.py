@@ -65,7 +65,7 @@ def is_transient_error(exc: Exception) -> tuple[bool, float | None]:
     Classify whether an exception is a transient retryable failure.
     Returns (is_retryable, retry_after_seconds_or_none).
     """
-    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, TimeoutError)):
         return True, None
 
     if isinstance(exc, httpx.HTTPStatusError):
@@ -107,6 +107,7 @@ def process_image_discovery_job(
     job_id: int,
     db: InventoryDatabase,
     resolver: ProductImageResolver | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """
     Process a single image discovery job.
@@ -156,6 +157,7 @@ def process_image_discovery_job(
             barcode=barcode,
             category=product.food_category,
             is_supplementary=False,
+            deadline=deadline,
         )
 
         if meta.is_verified and (meta.image_url or meta.local_path):
@@ -194,17 +196,25 @@ def process_image_discovery_job(
         return False
 
 
+DEFAULT_SERVERLESS_TIME_BUDGET_SECONDS = 8.0
+MIN_JOB_BUDGET_SECONDS = 2.0
+
+
 def process_due_image_jobs(
     db: InventoryDatabase,
     limit: int = 10,
     resolver: ProductImageResolver | None = None,
+    time_budget_seconds: float | None = None,
+    min_job_budget_seconds: float = MIN_JOB_BUDGET_SECONDS,
 ) -> int:
     """
     Query and process all due image discovery jobs up to limit.
     Also triggers recovery for stalled jobs.
+    If time_budget_seconds is specified, stops claiming new jobs when the
+    elapsed time leaves less than min_job_budget_seconds in the budget.
     Returns the number of jobs processed.
     """
-    # Recover stalled jobs
+    # 1. Recover stalled jobs
     try:
         recovered = db.recover_stalled_jobs(stalled_seconds=STALLED_JOB_TIMEOUT_SECONDS)
         if recovered > 0:
@@ -212,14 +222,36 @@ def process_due_image_jobs(
     except Exception as e:
         logger.warning("Error recovering stalled image jobs: %s", e)
 
+    start_time = time.monotonic()
+
     due_jobs = db.get_due_image_jobs(limit=limit)
     if not due_jobs:
         return 0
 
     processed_count = 0
     for job in due_jobs:
+        job_deadline = None
+        # Check remaining time budget before claiming the next job
+        if time_budget_seconds is not None:
+            elapsed = time.monotonic() - start_time
+            remaining = time_budget_seconds - elapsed
+            if remaining < min_job_budget_seconds:
+                logger.info(
+                    "Time budget reached (%.2fs elapsed / %.2fs budget, %.2fs remaining < %.2fs threshold). "
+                    "Processed %d of %d due jobs; stopping before claiming job %d.",
+                    elapsed,
+                    time_budget_seconds,
+                    remaining,
+                    min_job_budget_seconds,
+                    processed_count,
+                    len(due_jobs),
+                    job.id,
+                )
+                break
+            job_deadline = start_time + time_budget_seconds
+
         try:
-            process_image_discovery_job(job.id, db, resolver=resolver)
+            process_image_discovery_job(job.id, db, resolver=resolver, deadline=job_deadline)
             processed_count += 1
         except Exception as e:
             logger.error("Unhandled error processing image job %d: %s", job.id, e, exc_info=True)

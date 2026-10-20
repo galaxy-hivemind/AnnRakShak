@@ -1602,6 +1602,40 @@ class TestReliableWebImageDiscoveryAndFraming(unittest.TestCase):
         self.assertEqual(resp.headers.get("content-type"), "image/jpeg")
         self.assertEqual(len(resp.content), len(self.dummy_bottle))
 
+    def test_resolver_deadline_raises_timeouterror(self):
+        """When resolver is invoked with an expired deadline, it immediately raises TimeoutError."""
+        import time
+        mock_client = MagicMock()
+        with patch.object(self.resolver, "_get_client", return_value=mock_client):
+            with self.assertRaises(TimeoutError):
+                self.resolver.resolve_product_image(
+                    product_name="Test Product",
+                    brand="Test Brand",
+                    deadline=time.monotonic() - 0.05,
+                )
+            # No network requests should have been made
+            mock_client.get.assert_not_called()
+
+    def test_resolver_max_catalog_requests_bounded(self):
+        """Resolver limits sequential catalog lookups per search to MAX_CATALOG_SEARCH_REQUESTS."""
+        from product_image_resolver import MAX_CATALOG_SEARCH_REQUESTS
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"products": []}
+        mock_client.get.return_value = mock_resp
+
+        with patch.object(self.resolver, "_get_client", return_value=mock_client), \
+             patch.object(self.resolver, "_lookup_wikipedia_search", return_value=None):
+            meta = self.resolver.resolve_product_image(
+                product_name="Very Obscure Local Product With Long Name",
+                brand="Obscure Brand",
+            )
+            self.assertIsNotNone(meta)
+            self.assertFalse(meta.is_verified)
+            # Total catalog requests made must not exceed MAX_CATALOG_SEARCH_REQUESTS
+            self.assertLessEqual(mock_client.get.call_count, MAX_CATALOG_SEARCH_REQUESTS)
+
 
 if __name__ == "__main__":
     unittest.main()

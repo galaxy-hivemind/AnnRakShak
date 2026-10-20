@@ -561,6 +561,162 @@ class TestBackgroundImageDiscovery(unittest.TestCase):
         self.assertGreater(score_exact, score_diff)
         self.assertGreater(score_exact, 80.0)
 
+    # -------------------------------------------------------------------------
+    # Production-Readiness Task 1 & 2: Cron Endpoint Authentication & GET Route
+    # -------------------------------------------------------------------------
+    def test_21_cron_endpoint_missing_server_secret(self):
+        """When CRON_SECRET is not configured on server, return 500 configuration error."""
+        with patch.dict(os.environ, {}, clear=False):
+            if "CRON_SECRET" in os.environ:
+                del os.environ["CRON_SECRET"]
+            resp = self.client.post("/api/jobs/process-pending")
+            self.assertEqual(resp.status_code, 500)
+            self.assertIn("CRON_SECRET is not configured", resp.json()["detail"])
+
+    def test_22_cron_endpoint_missing_authorization_header(self):
+        """When CRON_SECRET is set, reject unauthenticated requests with 401 and do not process jobs."""
+        prod_id = self.db.add_product(product_name="Granola Bar", brand="Nature Valley")
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Nature Valley Granola Bar")
+
+        with patch.dict(os.environ, {"CRON_SECRET": "test_super_secret_cron_token_12345"}):
+            # POST without header
+            resp = self.client.post("/api/jobs/process-pending")
+            self.assertEqual(resp.status_code, 401)
+            self.assertIn("Authorization header is required", resp.json()["detail"])
+
+            # Job is untouched and still pending
+            job = self.db.get_image_job(job_id)
+            self.assertEqual(job.status, "pending")
+            self.assertEqual(job.attempt_count, 0)
+
+    def test_23_cron_endpoint_invalid_authorization_token(self):
+        """When token does not match, reject with 401 and do not process jobs."""
+        prod_id = self.db.add_product(product_name="Dark Chocolate", brand="Amul")
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Amul Dark Chocolate")
+
+        with patch.dict(os.environ, {"CRON_SECRET": "expected_secret_token"}):
+            headers = {"Authorization": "Bearer wrong_token_xyz"}
+            resp = self.client.post("/api/jobs/process-pending", headers=headers)
+            self.assertEqual(resp.status_code, 401)
+            self.assertIn("Invalid authorization token", resp.json()["detail"])
+
+            # Job is untouched
+            job = self.db.get_image_job(job_id)
+            self.assertEqual(job.status, "pending")
+
+    @patch("api.process_due_image_jobs")
+    def test_24_cron_endpoint_valid_credentials_post(self, mock_process):
+        """Valid Bearer token allows POST /api/jobs/process-pending and executes job processor."""
+        mock_process.return_value = 3
+        with patch.dict(os.environ, {"CRON_SECRET": "production_secret_98765"}):
+            headers = {"Authorization": "Bearer production_secret_98765"}
+            resp = self.client.post("/api/jobs/process-pending?limit=15&max_duration_seconds=12", headers=headers)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["processed"], 3)
+            mock_process.assert_called_once()
+            _, kwargs = mock_process.call_args
+            self.assertEqual(kwargs.get("limit"), 15)
+            self.assertEqual(kwargs.get("time_budget_seconds"), 12.0)
+
+    @patch("api.process_due_image_jobs")
+    def test_25_cron_endpoint_valid_credentials_get_for_vercel(self, mock_process):
+        """Vercel Cron uses GET requests; verify GET /api/jobs/process-pending works with valid auth."""
+        mock_process.return_value = 1
+        with patch.dict(os.environ, {"CRON_SECRET": "vercel_cron_token_abc"}):
+            headers = {"Authorization": "Bearer vercel_cron_token_abc"}
+            resp = self.client.get("/api/jobs/process-pending", headers=headers)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["processed"], 1)
+
+    # -------------------------------------------------------------------------
+    # Production-Readiness Task 3: Bounded Serverless Execution Time
+    # -------------------------------------------------------------------------
+    def test_26_serverless_execution_time_budget_stops_before_claiming(self):
+        """Worker stops claiming new jobs when time budget is nearly exhausted, leaving remaining jobs pending."""
+        p1 = self.db.add_product(product_name="Product A", brand="Brand A")
+        p2 = self.db.add_product(product_name="Product B", brand="Brand B")
+        j1 = self.db.create_image_job(product_id=p1, normalized_identity="Brand A Product A")
+        j2 = self.db.create_image_job(product_id=p2, normalized_identity="Brand B Product B")
+
+        # Mock process_image_discovery_job to take 0.15s per job
+        def mock_process(job_id, db, resolver=None, **kwargs):
+            time.sleep(0.15)
+            return True
+
+        # Provide a very small time budget (0.1s) with min_job_budget_seconds=0.1
+        # It should process at most 0 or 1 job, and definitely stop before claiming j2
+        with patch("image_job_worker.process_image_discovery_job", side_effect=mock_process):
+            processed = process_due_image_jobs(
+                self.db,
+                limit=10,
+                time_budget_seconds=0.12,
+                min_job_budget_seconds=0.10,
+            )
+            self.assertEqual(processed, 1)
+
+        # Job 2 was never processed and is still pending in the DB
+        job2 = self.db.get_image_job(j2)
+        self.assertEqual(job2.status, "pending")
+        self.assertEqual(job2.attempt_count, 0)
+
+    def test_27_stalled_job_recovered_after_interrupted_serverless_execution(self):
+        """Jobs left in 'searching' state (e.g. from lambda timeout/freeze) are safely recovered."""
+        prod_id = self.db.add_product(product_name="Coffee Beans", brand="Blue Tokai")
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Blue Tokai Coffee Beans")
+
+        # Simulate job claimed and worker terminated 10 minutes ago
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=600)).isoformat()
+        with self.db._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'searching', last_attempt_at = ?, attempt_count = 1
+                WHERE id = ?
+                """,
+                (old_time, job_id),
+            )
+
+        # process_due_image_jobs recovers stalled jobs at the start
+        with patch("image_job_worker.process_image_discovery_job") as mock_worker:
+            # Stalled job will be recovered to retry_scheduled, and then eligible for processing
+            processed = process_due_image_jobs(self.db, limit=5)
+            self.assertEqual(processed, 1)
+            mock_worker.assert_called_once()
+
+    def test_28_job_execution_deadline_triggers_retryable_timeout(self):
+        """When an individual job exceeds its deadline, it catches TimeoutError and schedules a clean retry."""
+        prod_id = self.db.add_product(product_name="Organic Honey", brand="Dabur")
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Dabur Organic Honey")
+
+        mock_resolver = MagicMock()
+        mock_resolver.resolve_product_image.side_effect = TimeoutError("Execution budget exceeded during catalog search")
+
+        success = process_image_discovery_job(job_id, self.db, resolver=mock_resolver, deadline=time.monotonic() - 1.0)
+        self.assertFalse(success)
+
+        # Job is scheduled for retry with attempt recorded, not permanently failed
+        job = self.db.get_image_job(job_id)
+        self.assertEqual(job.status, "retry_scheduled")
+        self.assertEqual(job.attempt_count, 1)
+        self.assertIn("TimeoutError", job.last_error)
+
+    def test_29_shared_http_client_timeout_is_intentional(self):
+        """Shared safe image client has intentional 5.0s timeout."""
+        from product_image_resolver import create_safe_image_client, DOWNLOAD_TIMEOUT_SECONDS
+        client = create_safe_image_client()
+        self.assertEqual(DOWNLOAD_TIMEOUT_SECONDS, 5.0)
+        self.assertEqual(client.timeout.connect, 5.0)
+        self.assertEqual(client.timeout.read, 5.0)
+
+    def test_30_stalled_job_timeout_threshold_preserved(self):
+        """STALLED_JOB_TIMEOUT_SECONDS remains 300 to preserve persistent server safety."""
+        from image_job_worker import STALLED_JOB_TIMEOUT_SECONDS
+        self.assertEqual(STALLED_JOB_TIMEOUT_SECONDS, 300)
+
 
 if __name__ == "__main__":
     unittest.main()

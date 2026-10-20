@@ -1,0 +1,55 @@
+name: "Background Product Image Discovery Cron"
+
+on:
+  schedule:
+    # Run every 5 minutes to process due retries and recover stalled jobs
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: image-discovery-cron
+  cancel-in-progress: false
+
+jobs:
+  process-jobs:
+    name: "Trigger Image Discovery Queue"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: "Invoke Scheduled Image Discovery Endpoint"
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL || secrets.BACKEND_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BACKEND_URL}" ]; then
+            echo "::error::BACKEND_URL is not configured. Please set the repository variable BACKEND_URL (e.g. https://your-domain.vercel.app)."
+            exit 1
+          fi
+
+          if [ -z "${CRON_SECRET}" ]; then
+            echo "::error::CRON_SECRET is not configured. Please set the repository secret CRON_SECRET."
+            exit 1
+          fi
+
+          # Strip any trailing slashes from the base URL
+          CLEAN_BASE_URL="${BACKEND_URL%/}"
+          ENDPOINT="${CLEAN_BASE_URL}/api/jobs/process-pending?limit=10&max_duration_seconds=8"
+
+          echo "Triggering background image discovery at ${CLEAN_BASE_URL}/api/jobs/process-pending..."
+
+          # Perform authenticated HTTP GET request with 15s bounded timeout
+          # --fail-with-body: Fails on HTTP status >= 400 and prints error response
+          # Authentication header is passed via environment variable to avoid logging secrets
+          RESPONSE=$(curl \
+            --silent \
+            --show-error \
+            --fail-with-body \
+            --max-time 15 \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            "${ENDPOINT}")
+
+          echo "Job queue processor completed successfully."
+          echo "Summary: ${RESPONSE}"
