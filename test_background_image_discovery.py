@@ -717,6 +717,54 @@ class TestBackgroundImageDiscovery(unittest.TestCase):
         from image_job_worker import STALLED_JOB_TIMEOUT_SECONDS
         self.assertEqual(STALLED_JOB_TIMEOUT_SECONDS, 300)
 
+    def test_31_process_due_image_jobs_full_lifecycle_deterministic(self):
+        """
+        Validate the complete worker lifecycle via process_due_image_jobs:
+        1. Enqueues a pending job for a product with missing image.
+        2. Retrieves and processes it through process_due_image_jobs with a mocked resolver.
+        3. Confirms job and product state transitions to 'resolved'.
+        4. Confirms subsequent worker run reports processed: 0 as no due jobs remain.
+        """
+        prod_id = self.db.add_product(product_name="Almond Milk", brand="Silk", food_category="Dairy & Eggs")
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Silk Almond Milk")
+
+        # Initial state verification
+        job_before = self.db.get_image_job(job_id)
+        self.assertEqual(job_before.status, "pending")
+        self.assertEqual(job_before.attempt_count, 0)
+        prod_before = self.db.get_product(prod_id)
+        self.assertEqual(prod_before.image_status, "pending")
+
+        # Deterministic mock resolver (no external network calls)
+        mock_resolver = MagicMock(spec=ProductImageResolver)
+        mock_resolver.resolve_product_image.return_value = ImageMetadata(
+            source="mock_catalog",
+            original_url="https://images.example.com/products/silk_almond.jpg",
+            cached_path="/mock/cache/silk_almond.jpg",
+            status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+            barcode=None,
+            product_identity="Silk Almond Milk",
+        )
+
+        # Run worker directly through process_due_image_jobs
+        processed = process_due_image_jobs(self.db, limit=5, resolver=mock_resolver)
+        self.assertEqual(processed, 1)
+        mock_resolver.resolve_product_image.assert_called_once()
+
+        # Verify job and product state after processing
+        job_after = self.db.get_image_job(job_id)
+        self.assertEqual(job_after.status, "resolved")
+        self.assertEqual(job_after.attempt_count, 1)
+
+        prod_after = self.db.get_product(prod_id)
+        self.assertEqual(prod_after.image_status, "resolved")
+        self.assertEqual(prod_after.image_path, "https://images.example.com/products/silk_almond.jpg")
+        self.assertEqual(prod_after.image_source_type, "catalog")
+
+        # Second run: queue is now clear; returns processed: 0
+        second_processed = process_due_image_jobs(self.db, limit=5, resolver=mock_resolver)
+        self.assertEqual(second_processed, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
