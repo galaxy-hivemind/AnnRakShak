@@ -110,7 +110,8 @@ export function Dashboard() {
       <PageHero
         title="A little care. A lot less waste."
         description="Keep your kitchen fresh and make every ingredient count."
-        onAdd={() => setDialog({ type: 'add' })}
+        addLink="/scan"
+        addLabel="Add Ingredients"
       />
 
       <StatCardsRow />

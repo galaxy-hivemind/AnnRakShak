@@ -60,7 +60,8 @@ export function Inventory() {
       <PageHero
         title="Everything in your kitchen."
         description="Know what you have, and what needs your attention."
-        onAdd={() => setDialog({ type: 'add' })}
+        addLink="/scan"
+        addLabel="Add Ingredients"
       />
 
       <StatCardsRow />
@@ -74,7 +75,7 @@ export function Inventory() {
             onClick={() => setDialog({ type: 'add' })}
             className="text-link bg-transparent border-0 p-0 cursor-pointer"
           >
-            Add ingredient <ArrowRight size={16} />
+            Add manually <ArrowRight size={16} />
           </button>
         </div>
 

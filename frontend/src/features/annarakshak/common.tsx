@@ -43,12 +43,15 @@ export const primaryNav = [
   { to: '/waste', name: 'Waste journal', icon: BookOpen },
 ] as const;
 
-export const moreNav = [
-  { to: '/scan', name: 'Scan Product', icon: ScanLine },
-  { to: '/history', name: 'Scan History', icon: History },
+export const scanNav = { to: '/scan', name: 'Scan Product', icon: ScanLine } as const;
+
+export const settingsNav = [
+  { to: '/history', name: 'Scanned History', icon: History },
   { to: '/review', name: 'Needs Review', icon: CircleHelp },
   { to: '/settings', name: 'Settings', icon: Settings },
 ] as const;
+
+export const moreNav = settingsNav;
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -62,7 +65,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { data: settings } = useQuery(settingsQuery);
   const { data: scans } = useQuery(scansQuery);
   const count = scans?.filter((s) => s.reviewStatus === 'Needs Review').length || 0;
-  const moreActive = moreNav.some((n) => n.to === pathname);
+  const settingsActive = settingsNav.some((n) => n.to === pathname);
 
   async function find(value: string) {
     const run = ++searchSequence.current;
@@ -98,16 +101,27 @@ export function AppShell({ children }: { children: ReactNode }) {
               </Link>
             ))}
 
-            {/* Subtle dropdown for advanced routes */}
+            {/* Direct Scan icon navigation */}
+            <Link
+              to="/scan"
+              className={`nav-item icon-only ${pathname === '/scan' ? 'active' : ''}`}
+              aria-label="Scan ingredients"
+              title="Scan ingredients"
+            >
+              <ScanLine size={17} />
+            </Link>
+
+            {/* Settings dropdown menu */}
             <DropdownMenu>
               <DropdownMenuTrigger
-                className={`nav-item opacity-80 hover:opacity-100 ${moreActive ? 'active opacity-100' : ''}`}
-                aria-label="More options"
+                className={`nav-item icon-only ${settingsActive ? 'active' : ''}`}
+                aria-label="Open settings menu"
+                title="Open settings menu"
               >
-                <ChevronDown size={14} />
+                <Settings size={17} />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-52">
-                {moreNav.map((n) => (
+                {settingsNav.map((n) => (
                   <DropdownMenuItem key={n.to} asChild>
                     <Link to={n.to} className="flex items-center gap-2">
                       <n.icon size={16} />
@@ -146,7 +160,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         {menu && (
           <nav aria-label="Mobile navigation" className="mobile-nav">
-            {[...primaryNav, ...moreNav].map((n) => (
+            {[...primaryNav, scanNav, ...settingsNav].map((n) => (
               <Link
                 key={n.to}
                 to={n.to}
@@ -209,18 +223,26 @@ export function PageHero({
   title,
   description,
   onAdd,
+  addLink,
+  addLabel = 'Add Ingredients',
+  addIcon,
   dateText,
 }: {
   kicker?: string;
   title: string;
   description: string;
   onAdd?: () => void;
+  addLink?: string;
+  addLabel?: string;
+  addIcon?: ReactNode;
   dateText?: string;
 }) {
   const today = new Date();
   const formattedDate =
     dateText ||
     `${today.toLocaleDateString('en-GB', { weekday: 'long' })}, ${today.getDate()} ${today.toLocaleDateString('en-GB', { month: 'long' })}`;
+
+  const icon = addIcon ?? <ScanLine size={17} />;
 
   return (
     <div className="greeting">
@@ -236,12 +258,19 @@ export function PageHero({
           <CalendarDays size={16} />
           {formattedDate}
         </span>
-        {onAdd && (
+        {addLink ? (
+          <Button asChild size="lg" className="add-btn">
+            <Link to={addLink}>
+              {icon}
+              <span>{addLabel}</span>
+            </Link>
+          </Button>
+        ) : onAdd ? (
           <Button size="lg" className="add-btn" onClick={onAdd}>
             <Plus size={17} />
-            Add ingredient
+            {addLabel === 'Add Ingredients' ? 'Add ingredient' : addLabel}
           </Button>
-        )}
+        ) : null}
       </div>
     </div>
   );

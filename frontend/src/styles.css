@@ -213,6 +213,13 @@
   font-weight: 600;
 }
 
+.topnav .nav-item.icon-only {
+  padding: 8px 10px;
+  min-width: 36px;
+  justify-content: center;
+  cursor: pointer;
+}
+
 .topnav .nav-item:focus-visible, .icon-btn:focus-visible {
   outline: 2px solid #ffffff;
   outline-offset: 2px;
@@ -369,6 +376,7 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  text-decoration: none;
   transition: background 0.15s ease, transform 0.15s ease;
 }
 
