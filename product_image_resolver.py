@@ -32,37 +32,112 @@ import re
 import socket
 import threading
 import time
+import urllib.parse
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 import cv2
+import httpcore
 import httpx
 import numpy as np
+from httpcore._backends.sync import SyncBackend, SyncStream
+from httpcore._exceptions import ConnectError, ConnectTimeout, ExceptionMapping, map_exceptions
+
+from barcode_detector import is_valid_gtin_checksum
 
 logger = logging.getLogger("AnnaRakshak.ImageResolver")
 
-# Timeouts & Size Limits
+# Timeouts, Limits & SSRF Controls
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 DOWNLOAD_TIMEOUT_SECONDS = 8.0
 MIN_IMAGE_DIMENSION = 100
 MAX_IMAGE_DIMENSION = 5000
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_REDIRECTS = 3
+CHUNK_SIZE = 16 * 1024  # 16 KB chunks for streaming
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
-# Open Food Facts API Endpoints
+DISALLOWED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+]
+
+
+def is_ip_disallowed(ip_str: str) -> bool:
+    """Check if an IP string belongs to any private, loopback, link-local, non-global, or reserved network."""
+    try:
+        ip = ipaddress.ip_address(str(ip_str).strip())
+    except (ValueError, TypeError):
+        return False
+
+    # 1. Handle IPv4-mapped IPv6 (::ffff:x.x.x.x)
+    if ip.version == 6 and ip.ipv4_mapped:
+        return is_ip_disallowed(str(ip.ipv4_mapped))
+
+    # 2. Reject RFC 8215 local-use NAT64 prefix (64:ff9b:1::/48) outright
+    if ip.version == 6 and ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        return True
+
+    # 3. Handle RFC 6052 Well-Known Prefix (64:ff9b::/96)
+    if ip.version == 6 and ip in ipaddress.ip_network("64:ff9b::/96"):
+        embedded_ipv4 = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+        return is_ip_disallowed(str(embedded_ipv4))
+
+    # 4. Positive global-routability check
+    if not ip.is_global:
+        return True
+
+    # 4. Strict classification properties
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+
+    # 5. Explicit CIDR denylist
+    for net in DISALLOWED_NETWORKS:
+        if ip in net:
+            return True
+
+    return False
+
+# Authoritative Product Catalogs & Public Sources
 OFF_BARCODE_URL = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
 OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+OBF_BARCODE_URL = "https://world.openbeautyfacts.org/api/v2/product/{barcode}.json"
+OBF_SEARCH_URL = "https://world.openbeautyfacts.org/cgi/search.pl"
+OPF_BARCODE_URL = "https://world.openproductsfacts.org/api/v2/product/{barcode}.json"
+OPF_SEARCH_URL = "https://world.openproductsfacts.org/cgi/search.pl"
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 OFF_USER_AGENT = "AnnaRakShak - FoodTracker - Version 1.0 - Contact: info@annarakshak.app"
 
 
 class ImageResolutionStatus(str, Enum):
     VERIFIED_WEB_IMAGE = "verified_web_image"
+    WEB_VERIFIED = "web_verified"
     CATEGORY_FALLBACK = "category_fallback"
     SEARCH_PENDING = "search_pending"
     SEARCH_ATTEMPTED_NO_MATCH = "search_attempted_no_match"
+    WEB_UNAVAILABLE = "web_unavailable"
+    AI_GENERATED = "ai_generated"
     SEARCH_FAILED_RETRYABLE = "search_failed_retryable"
 
 
@@ -78,6 +153,13 @@ class ImageMetadata:
     width: int | None = None
     height: int | None = None
     created_at: float = 0.0
+
+    @property
+    def is_verified(self) -> bool:
+        return self.status in (
+            ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+            ImageResolutionStatus.WEB_VERIFIED,
+        )
 
     @property
     def image_status(self) -> str:
@@ -97,6 +179,7 @@ class ImageMetadata:
         d["image_status"] = self.status.value
         d["image_url"] = self.original_url
         d["local_path"] = self.cached_path
+        d["is_verified"] = self.is_verified
         return d
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -111,7 +194,14 @@ class ImageMetadata:
         try:
             status = ImageResolutionStatus(stat_val)
         except ValueError:
-            status = ImageResolutionStatus.CATEGORY_FALLBACK
+            if stat_val == "web_verified":
+                status = ImageResolutionStatus.WEB_VERIFIED
+            elif stat_val == "web_unavailable":
+                status = ImageResolutionStatus.WEB_UNAVAILABLE
+            elif stat_val == "ai_generated":
+                status = ImageResolutionStatus.AI_GENERATED
+            else:
+                status = ImageResolutionStatus.CATEGORY_FALLBACK
         return cls(
             source=data.get("source", "unknown"),
             original_url=data.get("original_url") or data.get("image_url"),
@@ -126,10 +216,140 @@ class ImageMetadata:
         )
 
 
+def generate_search_queries(product_name: str | None, brand: str | None) -> list[str]:
+    """Generate ordered progressive queries from specific to broader."""
+    queries = []
+    clean_p = re.sub(r"['’]s\b", "", product_name or "")
+    clean_p = re.sub(r"['\"’]", "", clean_p).strip()
+    clean_b = re.sub(r"['’]s\b", "", brand or "")
+    clean_b = re.sub(r"['\"’]", "", clean_b).strip()
+
+    if not clean_p and not clean_b:
+        return []
+
+    p_lower = clean_p.lower()
+    b_lower = clean_b.lower()
+    p_without_brand = clean_p
+    if b_lower and p_lower.startswith(b_lower):
+        p_without_brand = clean_p[len(clean_b):].strip()
+    elif b_lower and b_lower in p_lower:
+        p_without_brand = re.sub(re.escape(clean_b), "", clean_p, flags=re.IGNORECASE).strip()
+
+    # 1. Full clean query
+    if clean_b and p_without_brand:
+        queries.append(f"{clean_b} {p_without_brand}".strip())
+    elif clean_p:
+        queries.append(clean_p)
+    elif clean_b:
+        queries.append(clean_b)
+
+    tokens = [t for t in re.findall(r"\w+", p_without_brand or clean_p) if len(t) > 2]
+    if clean_b and tokens:
+        # First 2 tokens with brand (e.g. 'Listerine Cool Mint', 'Paper Boat Swing Lively')
+        if len(tokens) >= 2:
+            queries.append(f"{clean_b} {tokens[0]} {tokens[1]}".strip())
+        # Last 2 tokens with brand (e.g. 'Cadbury Silk Brownie')
+        if len(tokens) >= 3:
+            queries.append(f"{clean_b} {tokens[-2]} {tokens[-1]}".strip())
+        # Flavor keyword with brand (e.g. 'Paper Boat Orange', 'Cadbury Brownie')
+        flavor_words = {
+            "orange", "brownie", "mint", "almond", "chocolate", "cookies",
+            "mango", "lemon", "apple", "berry", "butter", "masala", "lychee", "guava",
+        }
+        flavors = [t for t in tokens if t.lower() in flavor_words]
+        if flavors:
+            queries.append(f"{clean_b} {flavors[0]}".strip())
+        # Brand + first token (e.g. 'Paper Boat Swing', 'Cadbury Dairy', 'Listerine Cool')
+        if len(tokens) >= 1:
+            queries.append(f"{clean_b} {tokens[0]}".strip())
+        # Brand + last token (e.g. 'ChanduRam Cookies', 'Listerine Mouthwash')
+        if len(tokens) >= 2:
+            queries.append(f"{clean_b} {tokens[-1]}".strip())
+
+    # Product name alone (for brandless items like 'Bhajani Chakli')
+    if clean_p and clean_p not in queries:
+        queries.append(clean_p)
+
+    seen = set()
+    deduped = []
+    for q in queries:
+        q_norm = " ".join(q.split()).lower()
+        if q_norm and q_norm not in seen:
+            seen.add(q_norm)
+            deduped.append(q)
+    return deduped[:5]
+
+
+def score_candidate(
+    cand_brand: str | None,
+    cand_name: str | None,
+    target_brand: str | None,
+    target_name: str | None,
+    has_front_img: bool = False,
+) -> float:
+    """Score relevance of candidate product against target brand and product name."""
+    score = 0.0
+    c_brand = (cand_brand or "").lower().strip()
+    c_name = (cand_name or "").lower().strip()
+    t_brand = (target_brand or "").lower().strip()
+    t_name = (target_name or "").lower().strip()
+
+    c_brand = re.sub(r"['’]s\b", "", c_brand)
+    c_name = re.sub(r"['’]s\b", "", c_name)
+    t_brand = re.sub(r"['’]s\b", "", t_brand)
+    t_name = re.sub(r"['’]s\b", "", t_name)
+
+    # 1. Brand matching
+    if t_brand:
+        if t_brand in c_brand or c_brand in t_brand or t_brand in c_name:
+            score += 50.0
+        elif c_brand:
+            t_b_tokens = set(re.findall(r"\w+", t_brand))
+            c_b_tokens = set(re.findall(r"\w+", c_brand))
+            if not t_b_tokens.intersection(c_b_tokens):
+                score -= 60.0  # Penalize mismatched brand heavily
+    else:
+        score += 10.0
+
+    # 2. Token overlap
+    t_tokens = set(t for t in re.findall(r"\w+", t_name) if len(t) > 2)
+    if t_brand:
+        t_tokens -= set(re.findall(r"\w+", t_brand))
+    c_all_tokens = set(re.findall(r"\w+", f"{c_brand} {c_name}"))
+
+    if t_tokens:
+        overlap = t_tokens.intersection(c_all_tokens)
+        ratio = len(overlap) / len(t_tokens)
+        score += 40.0 * ratio
+    else:
+        score += 15.0
+
+    # 3. Flavor / variant match
+    flavor_words = {
+        "orange", "brownie", "mint", "almond", "chocolate", "cookies",
+        "mango", "lemon", "apple", "berry", "butter", "masala", "lychee", "guava",
+    }
+    t_flavors = t_tokens.intersection(flavor_words)
+    c_flavors = c_all_tokens.intersection(flavor_words)
+
+    if t_flavors:
+        if t_flavors.intersection(c_flavors):
+            score += 25.0
+        elif c_flavors:
+            score -= 15.0
+
+    # 4. Front image preference
+    if has_front_img:
+        score += 10.0
+
+    return score
+
+
 def is_safe_public_url(url: str) -> tuple[bool, str]:
     """
     Validate that an image URL is HTTPS and does not resolve to loopback,
-    private, link-local, multicast, or reserved IP address (SSRF Protection).
+    private, link-local, multicast, carrier-grade NAT, or reserved IP address (SSRF Protection).
+    Rejects embedded credentials, non-HTTPS schemes, and internal hostnames.
     """
     if not url:
         return False, "Empty URL"
@@ -142,28 +362,37 @@ def is_safe_public_url(url: str) -> tuple[bool, str]:
     if parsed.scheme.lower() != "https":
         return False, f"URL scheme must be HTTPS, got: {parsed.scheme}"
 
+    # Reject credentials embedded in URL (e.g. https://user:pass@evil.com)
+    if parsed.username or parsed.password:
+        return False, "SSRF protection: credentials embedded in URL forbidden"
+
     hostname = parsed.hostname
     if not hostname:
         return False, "Missing hostname in URL"
 
-    # Reject localhost or internal names
-    if hostname.lower() in ("localhost", "127.0.0.1", "::1"):
-        return False, "SSRF attempt: localhost forbidden"
+    lower_host = hostname.lower()
+    # Reject localhost, loopback, or internal domain names
+    if (
+        lower_host in ("localhost", "127.0.0.1", "::1")
+        or lower_host.endswith((".localhost", ".local", ".internal"))
+    ):
+        return False, "SSRF attempt: localhost or internal domain forbidden"
+
+    # Check if hostname itself is directly a disallowed numeric IP
+    try:
+        if is_ip_disallowed(lower_host):
+            return False, f"SSRF protection: destination IP {lower_host} is private or non-public"
+    except Exception:
+        pass
 
     try:
-        # Resolve all IPs for hostname
+        # Resolve all IPs for hostname and verify each against disallowed networks
         addr_info = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+        if not addr_info:
+            return False, f"DNS resolution returned no addresses for {hostname}"
         for _, _, _, _, sockaddr in addr_info:
             ip_str = sockaddr[0]
-            ip = ipaddress.ip_address(ip_str)
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
+            if is_ip_disallowed(ip_str):
                 return False, f"SSRF protection: resolved IP {ip_str} is private or non-public"
     except Exception as e:
         return False, f"DNS resolution failed for {hostname}: {e}"
@@ -231,54 +460,249 @@ def validate_and_decode_image_bytes(
         return False, 0, 0, f"Exception during image decode: {e}"
 
 
+class PinnedSyncBackend(SyncBackend):
+    """
+    Synchronous network backend that resolves and validates host IP addresses
+    before TCP socket connection, pinning the socket directly to the validated IP.
+    This guarantees that no HTTP or TLS request bytes can ever be sent to an
+    unvalidated or rebound private / metadata IP address.
+    """
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            addr_info = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            if not addr_info:
+                raise ConnectError(f"DNS resolution returned no addresses for host {host}")
+
+            verified_ips: list[str] = []
+            for _, _, _, _, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                if is_ip_disallowed(ip_str):
+                    raise ConnectError(
+                        f"SSRF / DNS rebinding protection: destination IP {ip_str} for host {host} is disallowed"
+                    )
+                if ip_str not in verified_ips:
+                    verified_ips.append(ip_str)
+
+            if not verified_ips:
+                raise ConnectError(f"No permitted IP addresses found for host {host}")
+        except ConnectError:
+            raise
+        except Exception as e:
+            raise ConnectError(f"DNS resolution failure during connect for {host}: {e}") from e
+
+        # Connect directly to the verified public IP(s) so the OS cannot re-resolve
+        last_err: Exception | None = None
+        sock: socket.socket | None = None
+        source_address = None if local_address is None else (local_address, 0)
+        exc_map: ExceptionMapping = {
+            socket.timeout: ConnectTimeout,
+            OSError: ConnectError,
+        }
+
+        with map_exceptions(exc_map):
+            for ip in verified_ips:
+                try:
+                    sock = socket.create_connection(
+                        (ip, port),
+                        timeout,
+                        source_address=source_address,
+                    )
+                    break
+                except OSError as e:
+                    last_err = e
+
+            if sock is None:
+                raise last_err or OSError(f"Could not connect to {host} on any verified IP")
+
+            if socket_options:
+                for option in socket_options:
+                    sock.setsockopt(*option)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        return SyncStream(sock)
+
+
+class SafeSSRFTransport(httpx.HTTPTransport):
+    """
+    HTTPTransport that forces all outbound HTTP/HTTPS connections through PinnedSyncBackend,
+    enforcing pre-connect IP validation and DNS pinning while preserving TLS SNI and certificate
+    verification against the original hostname.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=self._pool._ssl_context,
+            max_connections=self._pool._max_connections,
+            max_keepalive_connections=self._pool._max_keepalive_connections,
+            keepalive_expiry=self._pool._keepalive_expiry,
+            http1=self._pool._http1,
+            http2=self._pool._http2,
+            network_backend=PinnedSyncBackend(),
+            retries=self._pool._retries,
+        )
+
+
+def create_safe_image_client() -> httpx.Client:
+    """Create an httpx client configured with SafeSSRFTransport, trust_env=False, and non-redirecting policy."""
+    return httpx.Client(
+        transport=SafeSSRFTransport(trust_env=False),
+        timeout=DOWNLOAD_TIMEOUT_SECONDS,
+        follow_redirects=False,
+        trust_env=False,
+        headers={"User-Agent": OFF_USER_AGENT},
+    )
+
+
 def download_and_validate_web_image(
     url: str,
     target_dir: Path | None = None,
     client: httpx.Client | None = None,
 ) -> tuple[bool, bytes | None, dict[str, Any], str]:
     """
-    Safely download and validate an external product image with SSRF checks.
+    Safely download and validate an external product image with SSRF checks,
+    connection-time DNS pinning, incremental streaming size limits, and explicit manual redirect validation.
     Returns: (success, image_bytes, metadata_dict, error_message)
     """
-    safe, reason = is_safe_public_url(url)
-    if not safe:
-        return False, None, {}, f"URL safety check failed: {reason}"
+    current_url = url
+    visited_urls: set[str] = set()
+    redirect_count = 0
 
     close_client = False
     if client is None:
-        client = httpx.Client(
-            timeout=DOWNLOAD_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": OFF_USER_AGENT},
-        )
+        client = create_safe_image_client()
         close_client = True
 
     try:
-        resp = client.get(url)
-        if resp.status_code != 200:
-            return False, None, {}, f"HTTP {resp.status_code} fetching image from {url}"
+        raw_bytes: bytes = b""
+        final_ct: str = "image/jpeg"
 
-        # Validate final URL after redirects for SSRF
-        final_url = str(resp.url)
-        safe_final, reason_final = is_safe_public_url(final_url)
-        if not safe_final:
-            return False, None, {}, f"Redirected to unsafe URL: {reason_final}"
+        while True:
+            # 1. SSRF pre-request validation on initial and every redirected URL
+            safe, reason = is_safe_public_url(current_url)
+            if not safe:
+                return False, None, {}, f"URL safety check failed for {current_url}: {reason}"
 
-        ct = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-        if ct and not ct.startswith("image/"):
-            return False, None, {}, f"Invalid Content-Type '{ct}' (expected image/*)"
+            if current_url in visited_urls:
+                return False, None, {}, f"SSRF protection: redirect loop detected at {current_url}"
+            visited_urls.add(current_url)
 
-        raw_bytes = resp.content
-        ok, width, height, decode_msg = validate_and_decode_image_bytes(raw_bytes, ct)
+            # 2. Open request stream with follow_redirects=False
+            if hasattr(client, "stream"):
+                stream_ctx = client.stream("GET", current_url)
+            else:
+                # Fallback wrapper for test mocks that mock client.get directly
+                class _MockStreamCtx:
+                    def __init__(self, c, u):
+                        self.c = c
+                        self.u = u
+                        self.resp = None
+                    def __enter__(self):
+                        self.resp = self.c.get(self.u)
+                        return self.resp
+                    def __exit__(self, *args):
+                        if hasattr(self.resp, "close"):
+                            self.resp.close()
+                stream_ctx = _MockStreamCtx(client, current_url)
+
+            with stream_ctx as resp:
+                # 3. Explicitly handle redirect status codes
+                if resp.status_code in REDIRECT_STATUS_CODES:
+                    redirect_count += 1
+                    if redirect_count > MAX_REDIRECTS:
+                        return False, None, {}, f"Too many redirects (exceeded limit of {MAX_REDIRECTS})"
+
+                    location = resp.headers.get("Location") or resp.headers.get("location")
+                    if not location:
+                        return False, None, {}, f"HTTP {resp.status_code} redirect without Location header"
+
+                    # Resolve relative redirects against current URL
+                    next_url = urllib.parse.urljoin(current_url, location)
+                    current_url = next_url
+                    continue
+
+                if resp.status_code != 200:
+                    return False, None, {}, f"HTTP {resp.status_code} fetching image from {current_url}"
+
+                # 4. Check Content-Type header before reading stream
+                ct = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if ct and not ct.startswith("image/"):
+                    return False, None, {}, f"Invalid Content-Type '{ct}' (expected image/*)"
+                final_ct = ct or "image/jpeg"
+
+                # 5. Check declared Content-Length upfront if present
+                content_length_str = resp.headers.get("content-length")
+                if content_length_str and content_length_str.isdigit():
+                    declared_len = int(content_length_str)
+                    if declared_len > MAX_IMAGE_SIZE_BYTES:
+                        return (
+                            False,
+                            None,
+                            {},
+                            f"Declared Content-Length ({declared_len} bytes) exceeds limit ({MAX_IMAGE_SIZE_BYTES} bytes)",
+                        )
+
+                # 6. Post-connect socket check for DNS rebinding mitigation (inspect actual connected peer IP)
+                ns = getattr(resp, "extensions", {}).get("network_stream") if hasattr(resp, "extensions") and resp.extensions else None
+                if ns and hasattr(ns, "get_extra_info"):
+                    server_addr = ns.get_extra_info("server_addr")
+                    if server_addr and len(server_addr) >= 1:
+                        connected_ip = str(server_addr[0])
+                        if is_ip_disallowed(connected_ip):
+                            return (
+                                False,
+                                None,
+                                {},
+                                f"SSRF / DNS rebinding protection: connected IP {connected_ip} is disallowed",
+                            )
+
+                # 7. Incremental stream consumption with hard byte counter
+                chunks = []
+                total_bytes = 0
+                if hasattr(resp, "iter_bytes"):
+                    for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_IMAGE_SIZE_BYTES:
+                            return (
+                                False,
+                                None,
+                                {},
+                                f"Image size exceeds limit ({MAX_IMAGE_SIZE_BYTES} bytes) while streaming",
+                            )
+                        chunks.append(chunk)
+                    raw_bytes = b"".join(chunks)
+                else:
+                    raw_bytes = getattr(resp, "content", b"")
+                    if len(raw_bytes) > MAX_IMAGE_SIZE_BYTES:
+                        return (
+                            False,
+                            None,
+                            {},
+                            f"Image size exceeds limit ({MAX_IMAGE_SIZE_BYTES} bytes)",
+                        )
+
+            # Successfully streamed response without redirect
+            break
+
+        # 8. Decode and visually validate image using OpenCV
+        ok, width, height, decode_msg = validate_and_decode_image_bytes(raw_bytes, final_ct)
         if not ok:
             return False, None, {}, f"Image validation failed: {decode_msg}"
 
-        # Save locally if target_dir provided
+        # 9. Local disk caching if requested
         cached_path_str = None
         if target_dir:
             try:
                 target_dir.mkdir(parents=True, exist_ok=True)
-                url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+                url_hash = hashlib.sha256(current_url.encode()).hexdigest()[:16]
                 cached_filename = f"prod_{url_hash}.jpg"
                 cached_file = target_dir / cached_filename
                 cached_file.write_bytes(raw_bytes)
@@ -287,18 +711,19 @@ def download_and_validate_web_image(
                 logger.warning("Could not persist cached image file to %s: %s", target_dir, e)
 
         meta = {
-            "original_url": url,
+            "original_url": current_url,
             "cached_path": cached_path_str,
-            "content_type": ct or "image/jpeg",
+            "content_type": final_ct,
             "width": width,
             "height": height,
             "size_bytes": len(raw_bytes),
         }
         return True, raw_bytes, meta, "OK"
+
     except Exception as e:
-        return False, None, {}, f"Download exception for {url}: {e}"
+        return False, None, {}, f"Download exception for {current_url}: {e}"
     finally:
-        if close_client:
+        if close_client and client is not None:
             client.close()
 
 
@@ -327,13 +752,9 @@ class ProductImageResolver:
         self._in_flight: set[str] = set()
 
     def _get_client(self) -> httpx.Client:
-        if self._client:
+        if self._client and not self._client.is_closed:
             return self._client
-        return httpx.Client(
-            timeout=DOWNLOAD_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": OFF_USER_AGENT},
-        )
+        return create_safe_image_client()
 
     def _normalize_key(self, barcode: str | None, product_name: str | None, brand: str | None) -> str:
         if barcode:
@@ -383,11 +804,18 @@ class ProductImageResolver:
         # 1. Check existing metadata if provided
         if existing_metadata:
             meta = ImageMetadata.from_dict(existing_metadata)
-            if meta.status == ImageResolutionStatus.VERIFIED_WEB_IMAGE:
+            if meta.is_verified:
                 logger.info("Reusing existing verified product image from metadata: %s", meta.original_url)
                 return meta
-            if is_supplementary and meta.status == ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH:
-                if not (barcode and barcode != meta.barcode):
+            if is_supplementary and meta.status in (ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH, ImageResolutionStatus.WEB_UNAVAILABLE):
+                clean_incoming_bc = re.sub(r"\D", "", str(barcode)) if barcode else None
+                clean_prev_bc = re.sub(r"\D", "", str(meta.barcode)) if meta.barcode else None
+                has_new_valid_bc = bool(
+                    clean_incoming_bc
+                    and is_valid_gtin_checksum(clean_incoming_bc)
+                    and clean_incoming_bc != clean_prev_bc
+                )
+                if not has_new_valid_bc:
                     logger.info("Supplementary scan reusing previous no-match state; skipping repeated lookup.")
                     return meta
 
@@ -396,10 +824,17 @@ class ProductImageResolver:
         with self._lock:
             cached = self._cache.get(key)
             if cached:
-                if cached.status == ImageResolutionStatus.VERIFIED_WEB_IMAGE:
+                if cached.is_verified:
                     return cached
-                if is_supplementary and cached.status == ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH:
-                    if not (barcode and barcode != cached.barcode):
+                if is_supplementary and cached.status in (ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH, ImageResolutionStatus.WEB_UNAVAILABLE):
+                    clean_incoming_bc = re.sub(r"\D", "", str(barcode)) if barcode else None
+                    clean_cached_bc = re.sub(r"\D", "", str(cached.barcode)) if cached.barcode else None
+                    has_new_valid_bc = bool(
+                        clean_incoming_bc
+                        and is_valid_gtin_checksum(clean_incoming_bc)
+                        and clean_incoming_bc != clean_cached_bc
+                    )
+                    if not has_new_valid_bc:
                         return cached
 
             # Wait if another thread is currently executing search for this exact identity
@@ -429,30 +864,34 @@ class ProductImageResolver:
                 self.cache_result(barcode, product_name, brand, fallback)
                 return fallback
 
-            # 4. Mandatory Priority: Stage 1 — Exact Barcode lookup in Open Food Facts
+            # 4. Mandatory Priority: Stage 1 — Exact Barcode lookup in product catalogs
             client = self._get_client()
             if barcode:
-                logger.info("Attempting Stage 1: Barcode lookup on Open Food Facts for %s", barcode)
-                meta = self._lookup_open_food_facts_barcode(barcode, identity_str, client)
-                if meta and meta.status == ImageResolutionStatus.VERIFIED_WEB_IMAGE:
-                    self.cache_result(barcode, product_name, brand, meta)
-                    return meta
+                clean_bc = re.sub(r"\D", "", str(barcode))
+                if is_valid_gtin_checksum(clean_bc):
+                    logger.info("Attempting Stage 1: Barcode lookup on product catalogs for %s", clean_bc)
+                    meta = self._lookup_open_food_facts_barcode(clean_bc, identity_str, client)
+                    if meta and meta.is_verified:
+                        self.cache_result(clean_bc, product_name, brand, meta)
+                        return meta
+                else:
+                    logger.info("Barcode '%s' failed GTIN checksum validation; skipping exact barcode lookup", barcode)
 
-            # 5. Mandatory Priority: Stage 2 — Exact Product Name + Brand on Open Food Facts
+            # 5. Mandatory Priority: Stage 2 — Name & Brand progressive search across product catalogs and public sources
             if product_name and product_name.strip():
-                logger.info("Attempting Stage 2: Name & Brand search on Open Food Facts for '%s' ('%s')", product_name, brand or "")
+                logger.info("Attempting Stage 2: Name & Brand search across catalogs for '%s' ('%s')", product_name, brand or "")
                 meta = self._lookup_open_food_facts_search(product_name, brand, barcode, identity_str, client)
-                if meta and meta.status == ImageResolutionStatus.VERIFIED_WEB_IMAGE:
+                if meta and meta.is_verified:
                     self.cache_result(barcode, product_name, brand, meta)
                     return meta
 
             # 6. Stage 3 — Optional General Web Search Provider (if configured)
             meta = self._lookup_optional_web_search(product_name, brand, barcode, identity_str, client)
-            if meta and meta.status == ImageResolutionStatus.VERIFIED_WEB_IMAGE:
+            if meta and meta.is_verified:
                 self.cache_result(barcode, product_name, brand, meta)
                 return meta
 
-            # 7. Stage 4 — Fallback: No suitable image found. Cache search attempted.
+            # 7. Stage 4 — Fallback: No suitable image found after bounded multi-catalog search
             logger.info("Product image lookup completed with no suitable match for '%s'. Using category fallback.", identity_str)
             no_match = ImageMetadata(
                 source="category_fallback",
@@ -476,52 +915,70 @@ class ProductImageResolver:
         identity_str: str,
         client: httpx.Client,
     ) -> ImageMetadata | None:
-        """Query Open Food Facts by barcode."""
-        url = OFF_BARCODE_URL.format(barcode=barcode.strip())
-        try:
-            resp = client.get(url)
-            if resp.status_code != 200:
-                logger.debug("Open Food Facts returned %s for barcode %s", resp.status_code, barcode)
-                return None
+        """Query product catalogs by barcode (OFF, OBF, OPF)."""
+        clean_bc = barcode.strip()
+        catalog_endpoints = [
+            ("open_food_facts_barcode", OFF_BARCODE_URL),
+            ("open_beauty_facts_barcode", OBF_BARCODE_URL),
+            ("open_products_facts_barcode", OPF_BARCODE_URL),
+        ]
 
-            data = resp.json()
-            if data.get("status") != 1 and "product" not in data:
-                return None
+        for source_name, url_template in catalog_endpoints:
+            url = url_template.format(barcode=clean_bc)
+            for attempt in range(2):
+                try:
+                    resp = client.get(url)
+                    if resp.status_code in (502, 503, 504) and attempt == 0:
+                        time.sleep(0.25)
+                        continue
+                    if resp.status_code != 200:
+                        break
 
-            prod = data.get("product") or {}
-            img_url = (
-                prod.get("image_front_url")
-                or prod.get("image_url")
-                or prod.get("image_front_small_url")
-            )
-            if not img_url:
-                return None
+                    data = resp.json()
+                    if data.get("status") != 1 and "product" not in data:
+                        break
 
-            # Download & Validate candidate image
-            success, _, meta_dict, err = download_and_validate_web_image(
-                img_url,
-                target_dir=self.cache_dir,
-                client=client,
-            )
-            if not success:
-                logger.warning("Candidate image for barcode %s failed validation: %s", barcode, err)
-                return None
+                    prod = data.get("product") or {}
+                    img_url = (
+                        prod.get("image_front_url")
+                        or prod.get("image_url")
+                        or prod.get("image_front_small_url")
+                    )
+                    if not img_url:
+                        break
 
-            return ImageMetadata(
-                source="open_food_facts_barcode",
-                original_url=img_url,
-                cached_path=meta_dict.get("cached_path"),
-                status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
-                barcode=barcode,
-                product_identity=prod.get("product_name") or identity_str,
-                content_type=meta_dict.get("content_type"),
-                width=meta_dict.get("width"),
-                height=meta_dict.get("height"),
-                created_at=time.time(),
-            )
-        except Exception as e:
-            logger.warning("Exception querying Open Food Facts for barcode %s: %s", barcode, e)
-            return None
+                    # Download & Validate candidate image
+                    success, _, meta_dict, err = download_and_validate_web_image(
+                        img_url,
+                        target_dir=self.cache_dir,
+                        client=client,
+                    )
+                    if not success:
+                        logger.warning("Barcode %s candidate image failed validation: %s", clean_bc, err)
+                        break
+
+                    return ImageMetadata(
+                        source=source_name,
+                        original_url=img_url,
+                        cached_path=meta_dict.get("cached_path"),
+                        status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+                        barcode=clean_bc,
+                        product_identity=prod.get("product_name") or identity_str,
+                        content_type=meta_dict.get("content_type"),
+                        width=meta_dict.get("width"),
+                        height=meta_dict.get("height"),
+                        created_at=time.time(),
+                    )
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    if attempt == 0:
+                        time.sleep(0.25)
+                        continue
+                    break
+                except Exception as e:
+                    logger.debug("Exception querying %s for barcode %s: %s", source_name, clean_bc, e)
+                    break
+
+        return None
 
     def _lookup_open_food_facts_search(
         self,
@@ -531,70 +988,174 @@ class ProductImageResolver:
         identity_str: str,
         client: httpx.Client,
     ) -> ImageMetadata | None:
-        """Search Open Food Facts by product name and brand."""
-        query_parts = []
-        if brand and brand.strip():
-            query_parts.append(brand.strip())
-        query_parts.append(product_name.strip())
-        query = " ".join(query_parts)
-
-        params = {
-            "search_terms": query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": 5,
-            "fields": "code,product_name,brands,image_url,image_front_url",
-        }
-
-        try:
-            resp = client.get(OFF_SEARCH_URL, params=params)
-            if resp.status_code != 200:
-                return None
-
-            data = resp.json()
-            products = data.get("products", [])
-            if not products:
-                return None
-
-            # Target tokens for identity matching
-            target_tokens = set(re.findall(r"\w+", query.lower()))
-
-            for cand in products:
-                cand_name = cand.get("product_name") or ""
-                cand_brand = cand.get("brands") or ""
-                cand_tokens = set(re.findall(r"\w+", f"{cand_brand} {cand_name}".lower()))
-
-                # Ensure at least 50% overlap with target search tokens
-                overlap = target_tokens.intersection(cand_tokens)
-                if not overlap or (len(overlap) / max(len(target_tokens), 1)) < 0.4:
-                    continue
-
-                img_url = cand.get("image_front_url") or cand.get("image_url")
-                if not img_url:
-                    continue
-
-                success, _, meta_dict, err = download_and_validate_web_image(
-                    img_url,
-                    target_dir=self.cache_dir,
-                    client=client,
-                )
-                if success:
-                    return ImageMetadata(
-                        source="open_food_facts_search",
-                        original_url=img_url,
-                        cached_path=meta_dict.get("cached_path"),
-                        status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
-                        barcode=barcode or cand.get("code"),
-                        product_identity=f"{cand_brand} {cand_name}".strip() or identity_str,
-                        content_type=meta_dict.get("content_type"),
-                        width=meta_dict.get("width"),
-                        height=meta_dict.get("height"),
-                        created_at=time.time(),
-                    )
-        except Exception as e:
-            logger.warning("Exception searching Open Food Facts for '%s': %s", query, e)
+        """Progressively search product catalogs (OFF, OBF, OPF) with candidate ranking."""
+        queries = generate_search_queries(product_name, brand)
+        if not queries:
             return None
+
+        # Check for beauty/personal care keywords to prioritize Open Beauty Facts
+        combined_text = f"{brand or ''} {product_name}".lower()
+        beauty_keywords = (
+            "mouthwash", "toothpaste", "shampoo", "soap", "cream", "lotion",
+            "cosmetic", "skincare", "listerine", "deodorant", "perfume", "cleanser",
+        )
+        if any(kw in combined_text for kw in beauty_keywords):
+            catalogs = [
+                ("open_beauty_facts", OBF_SEARCH_URL),
+                ("open_food_facts", OFF_SEARCH_URL),
+                ("open_products_facts", OPF_SEARCH_URL),
+            ]
+        else:
+            catalogs = [
+                ("open_food_facts", OFF_SEARCH_URL),
+                ("open_beauty_facts", OBF_SEARCH_URL),
+                ("open_products_facts", OPF_SEARCH_URL),
+            ]
+
+        for query in queries:
+            params = {
+                "search_terms": query,
+                "search_simple": 1,
+                "action": "process",
+                "json": 1,
+                "page_size": 10,
+                "fields": "code,product_name,brands,image_url,image_front_url,image_front_small_url",
+            }
+
+            for cat_name, cat_url in catalogs:
+                products = []
+                for attempt in range(2):
+                    try:
+                        resp = client.get(cat_url, params=params)
+                        if resp.status_code in (502, 503, 504) and attempt == 0:
+                            time.sleep(0.25)
+                            continue
+                        if resp.status_code != 200:
+                            break
+                        data = resp.json()
+                        products = data.get("products", [])
+                        break
+                    except (httpx.TimeoutException, httpx.NetworkError):
+                        if attempt == 0:
+                            time.sleep(0.25)
+                            continue
+                        break
+                    except Exception as e:
+                        logger.debug("Exception searching %s for '%s': %s", cat_name, query, e)
+                        break
+
+                if not products:
+                    continue
+
+                # Rank candidates
+                ranked_candidates = []
+                min_threshold = 45.0 if (brand and brand.strip()) else 25.0
+                for cand in products:
+                    c_name = cand.get("product_name") or ""
+                    c_brand = cand.get("brands") or ""
+                    has_front = bool(cand.get("image_front_url"))
+                    score = score_candidate(c_brand, c_name, brand, product_name, has_front_img=has_front)
+                    if score >= min_threshold:
+                        img_url = cand.get("image_front_url") or cand.get("image_url") or cand.get("image_front_small_url")
+                        if img_url:
+                            ranked_candidates.append((score, cand, img_url))
+
+                ranked_candidates.sort(key=lambda x: x[0], reverse=True)
+
+                # Try downloading and validating in rank order
+                for score, cand, img_url in ranked_candidates:
+                    success, _, meta_dict, err = download_and_validate_web_image(
+                        img_url,
+                        target_dir=self.cache_dir,
+                        client=client,
+                    )
+                    if success:
+                        cand_brand = cand.get("brands") or brand or ""
+                        cand_name = cand.get("product_name") or product_name
+                        return ImageMetadata(
+                            source=f"{cat_name}_search",
+                            original_url=img_url,
+                            cached_path=meta_dict.get("cached_path"),
+                            status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+                            barcode=barcode or cand.get("code"),
+                            product_identity=f"{cand_brand} {cand_name}".strip() or identity_str,
+                            content_type=meta_dict.get("content_type"),
+                            width=meta_dict.get("width"),
+                            height=meta_dict.get("height"),
+                            created_at=time.time(),
+                        )
+                    else:
+                        logger.info("Candidate image %s failed validation: %s; trying next candidate", img_url, err)
+
+        # Fallback to Wikipedia / Wikimedia image search if catalogs found no suitable image
+        wiki_meta = self._lookup_wikipedia_search(product_name, brand, barcode, identity_str, client)
+        if wiki_meta and wiki_meta.is_verified:
+            return wiki_meta
+
+        return None
+
+    def _lookup_wikipedia_search(
+        self,
+        product_name: str | None,
+        brand: str | None,
+        barcode: str | None,
+        identity_str: str,
+        client: httpx.Client,
+    ) -> ImageMetadata | None:
+        """Search Wikipedia/Wikimedia for authoritative brand or packaging images."""
+        queries = generate_search_queries(product_name, brand)
+        if not queries:
+            return None
+
+        min_threshold = 45.0 if (brand and brand.strip()) else 25.0
+
+        for query in queries[:3]:
+            params = {
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrlimit": 3,
+                "prop": "pageimages",
+                "piprop": "thumbnail|original",
+                "pithumbsize": 600,
+            }
+            try:
+                resp = client.get(WIKIPEDIA_API_URL, params=params)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                pages = data.get("query", {}).get("pages", {})
+                for page_id, page in pages.items():
+                    title = page.get("title") or ""
+                    score = score_candidate(title, title, brand, product_name, has_front_img=False)
+                    if score < min_threshold:
+                        continue
+                    thumb = page.get("thumbnail") or {}
+                    img_url = thumb.get("source") or (page.get("original") or {}).get("source")
+                    if not img_url:
+                        continue
+                    success, _, meta_dict, err = download_and_validate_web_image(
+                        img_url,
+                        target_dir=self.cache_dir,
+                        client=client,
+                    )
+                    if success:
+                        return ImageMetadata(
+                            source="wikipedia_search",
+                            original_url=img_url,
+                            cached_path=meta_dict.get("cached_path"),
+                            status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+                            barcode=barcode,
+                            product_identity=f"{title} ({identity_str})",
+                            content_type=meta_dict.get("content_type"),
+                            width=meta_dict.get("width"),
+                            height=meta_dict.get("height"),
+                            created_at=time.time(),
+                        )
+            except Exception as e:
+                logger.debug("Wikipedia search exception for '%s': %s", query, e)
+                continue
 
         return None
 

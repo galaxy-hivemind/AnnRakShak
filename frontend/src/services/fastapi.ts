@@ -37,6 +37,8 @@ interface BackendProduct {
   scan_id?: number | null;
   barcode?: string | null;
   image_metadata?: Record<string, any> | null;
+  image_status?: string | null;
+  image_source_type?: string | null;
 }
 
 interface BackendDateCandidate {
@@ -781,6 +783,9 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
         return resolveFoodImage({ name: bp.product_name, category: cat, image: prodImg });
       })(),
       scanId: bp.scan_id ? `SC-${bp.scan_id}` : (bp.date_candidates?.[0]?.scan_id ? `SC-${bp.date_candidates[0].scan_id}` : undefined),
+      imageStatus: bp.image_status || undefined,
+      imageSourceType: bp.image_source_type || undefined,
+      imageMetadata: bp.image_metadata || undefined,
     };
   }
 

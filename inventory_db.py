@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import json
 import logging
 import os
 import sqlite3
@@ -182,6 +183,26 @@ class DateCandidateRecord:
 
 
 @dataclass
+class ImageDiscoveryJobRecord:
+    id: int
+    product_id: int
+    normalized_identity: str
+    status: str
+    attempt_count: int
+    max_attempts: int
+    next_eligible_at: str
+    created_at: str
+    updated_at: str
+    last_error: str | None = None
+    last_attempt_at: str | None = None
+    completed_at: str | None = None
+    metadata: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ProductRecord:
     id: int
     product_name: str
@@ -198,6 +219,9 @@ class ProductRecord:
     created_at: str
     updated_at: str
     scan_id: int | None = None
+    image_status: str | None = None
+    image_source_type: str | None = None
+    image_metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -277,6 +301,9 @@ SQLITE_BASE_SCHEMA = """
         notes TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        image_status TEXT DEFAULT 'pending',
+        image_source_type TEXT DEFAULT 'fallback',
+        image_metadata TEXT,
         FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
     );
 
@@ -310,6 +337,23 @@ SQLITE_BASE_SCHEMA = """
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
         FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL
     );
+
+    CREATE TABLE IF NOT EXISTS image_discovery_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        normalized_identity TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 4,
+        next_eligible_at TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_attempt_at TEXT,
+        completed_at TEXT,
+        metadata TEXT,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+    );
 """
 
 SQLITE_INDEXES = """
@@ -321,6 +365,8 @@ SQLITE_INDEXES = """
     CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_status_next ON image_discovery_jobs(status, next_eligible_at);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_product ON image_discovery_jobs(product_id);
 """
 
 SQLITE_SCHEMA = f"""{SQLITE_BASE_SCHEMA}
@@ -342,7 +388,10 @@ POSTGRES_BASE_SCHEMA = """
         image_path TEXT,
         notes TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        image_status TEXT DEFAULT 'pending',
+        image_source_type TEXT DEFAULT 'fallback',
+        image_metadata TEXT
     );
 
     CREATE TABLE IF NOT EXISTS scan_history (
@@ -372,10 +421,29 @@ POSTGRES_BASE_SCHEMA = """
         evidence TEXT,
         created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS image_discovery_jobs (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER NOT NULL,
+        normalized_identity TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 4,
+        next_eligible_at TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_attempt_at TEXT,
+        completed_at TEXT,
+        metadata TEXT
+    );
 """
 
 POSTGRES_MIGRATIONS = """
     ALTER TABLE products ADD COLUMN IF NOT EXISTS scan_id INTEGER;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS image_status TEXT DEFAULT 'pending';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS image_source_type TEXT DEFAULT 'fallback';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS image_metadata TEXT;
     ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS product_id INTEGER;
     ALTER TABLE date_candidates ADD COLUMN IF NOT EXISTS scan_id INTEGER;
     ALTER TABLE date_candidates ADD COLUMN IF NOT EXISTS product_id INTEGER;
@@ -403,6 +471,11 @@ POSTGRES_CONSTRAINTS = """
             ALTER TABLE date_candidates ADD CONSTRAINT fk_date_candidates_scan
                 FOREIGN KEY (scan_id) REFERENCES scan_history(id) ON DELETE SET NULL NOT VALID;
         END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_image_jobs_product') THEN
+            ALTER TABLE image_discovery_jobs ADD CONSTRAINT fk_image_jobs_product
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE NOT VALID;
+        END IF;
     END $$;
 """
 
@@ -415,6 +488,8 @@ POSTGRES_INDEXES = """
     CREATE INDEX IF NOT EXISTS idx_date_candidates_product ON date_candidates(product_id);
     CREATE INDEX IF NOT EXISTS idx_date_candidates_scan ON date_candidates(scan_id);
     CREATE INDEX IF NOT EXISTS idx_scan_history_timestamp ON scan_history(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_status_next ON image_discovery_jobs(status, next_eligible_at);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_product ON image_discovery_jobs(product_id);
 """
 
 POSTGRES_SCHEMA = f"""{POSTGRES_BASE_SCHEMA}
@@ -580,6 +655,12 @@ class InventoryDatabase:
 
         if not column_exists("products", "scan_id"):
             conn.execute("ALTER TABLE products ADD COLUMN scan_id INTEGER REFERENCES scan_history(id) ON DELETE SET NULL")
+        if not column_exists("products", "image_status"):
+            conn.execute("ALTER TABLE products ADD COLUMN image_status TEXT DEFAULT 'pending'")
+        if not column_exists("products", "image_source_type"):
+            conn.execute("ALTER TABLE products ADD COLUMN image_source_type TEXT DEFAULT 'fallback'")
+        if not column_exists("products", "image_metadata"):
+            conn.execute("ALTER TABLE products ADD COLUMN image_metadata TEXT")
         if not column_exists("scan_history", "product_id"):
             conn.execute("ALTER TABLE scan_history ADD COLUMN product_id INTEGER REFERENCES products(id) ON DELETE SET NULL")
         if not column_exists("date_candidates", "scan_id"):
@@ -949,6 +1030,9 @@ class InventoryDatabase:
         candidate_dates: list[Any] | None = None,
         force: bool = False,
         scan_id: int | None = None,
+        image_status: str | None = None,
+        image_source_type: str | None = None,
+        image_metadata: dict[str, Any] | str | None = None,
     ) -> int:
         """
         Add a verified or user-confirmed product into the inventory.
@@ -973,6 +1057,21 @@ class InventoryDatabase:
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+        # Normalize image metadata to JSON string if needed
+        clean_meta_str: str | None = None
+        if image_metadata is not None:
+            clean_meta_str = json.dumps(image_metadata) if isinstance(image_metadata, dict) else str(image_metadata)
+
+        clean_img_status = image_status
+        clean_img_source = image_source_type
+        if clean_img_status is None:
+            if image_path:
+                clean_img_status = "resolved"
+                clean_img_source = clean_img_source or "catalog"
+            else:
+                clean_img_status = "pending"
+                clean_img_source = clean_img_source or "fallback"
+
         with self._get_connection() as conn:
             # Idempotent check for scan confirmation: if a product already exists for this scan_id, update it
             if scan_id is not None:
@@ -986,7 +1085,10 @@ class InventoryDatabase:
                         SET product_name = ?, brand = ?, food_category = ?, date_type = ?,
                             date_text = ?, normalized_date = ?, date_status = ?, date_source = ?,
                             analysis_status = ?, image_path = COALESCE(?, image_path),
-                            notes = ?, updated_at = ?
+                            notes = ?, updated_at = ?,
+                            image_status = COALESCE(?, image_status),
+                            image_source_type = COALESCE(?, image_source_type),
+                            image_metadata = COALESCE(?, image_metadata)
                         WHERE id = ?
                         """,
                         (
@@ -1002,6 +1104,9 @@ class InventoryDatabase:
                             str(image_path) if image_path else None,
                             notes.strip() if notes else None,
                             now,
+                            clean_img_status,
+                            clean_img_source,
+                            clean_meta_str,
                             prod_id,
                         ),
                     )
@@ -1087,8 +1192,9 @@ class InventoryDatabase:
                     INSERT INTO products (
                         scan_id, product_name, brand, food_category, date_type, date_text,
                         normalized_date, date_status, date_source, analysis_status,
-                        image_path, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        image_path, notes, created_at, updated_at,
+                        image_status, image_source_type, image_metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id
                     """,
                     (
@@ -1106,6 +1212,9 @@ class InventoryDatabase:
                         notes.strip() if notes else None,
                         now,
                         now,
+                        clean_img_status,
+                        clean_img_source,
+                        clean_meta_str,
                     ),
                 )
                 row = cursor.fetchone()
@@ -1116,8 +1225,9 @@ class InventoryDatabase:
                     INSERT INTO products (
                         scan_id, product_name, brand, food_category, date_type, date_text,
                         normalized_date, date_status, date_source, analysis_status,
-                        image_path, notes, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        image_path, notes, created_at, updated_at,
+                        image_status, image_source_type, image_metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         scan_id,
@@ -1134,6 +1244,9 @@ class InventoryDatabase:
                         notes.strip() if notes else None,
                         now,
                         now,
+                        clean_img_status,
+                        clean_img_source,
+                        clean_meta_str,
                     ),
                 )
                 product_id = cursor.lastrowid
@@ -1328,10 +1441,17 @@ class InventoryDatabase:
             "date_type",
             "normalized_date",
             "date_status",
+            "image_status",
+            "image_source_type",
+            "image_metadata",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return False
+
+        if "image_metadata" in updates and updates["image_metadata"] is not None:
+            if isinstance(updates["image_metadata"], dict):
+                updates["image_metadata"] = json.dumps(updates["image_metadata"])
 
         if "product_name" in updates and not updates["product_name"]:
             raise ValueError("Product name cannot be empty.")
@@ -1512,10 +1632,36 @@ class InventoryDatabase:
     @staticmethod
     def _row_to_product(row: Any) -> ProductRecord:
         scan_id = None
+        image_status = None
+        image_source_type = None
+        image_metadata = None
+
         if hasattr(row, "keys"):
-            scan_id = row["scan_id"] if "scan_id" in row.keys() else None
+            keys = set(row.keys())
+            scan_id = row["scan_id"] if "scan_id" in keys else None
+            image_status = row["image_status"] if "image_status" in keys else None
+            image_source_type = row["image_source_type"] if "image_source_type" in keys else None
+            raw_meta = row["image_metadata"] if "image_metadata" in keys else None
         elif isinstance(row, dict):
             scan_id = row.get("scan_id")
+            image_status = row.get("image_status")
+            image_source_type = row.get("image_source_type")
+            raw_meta = row.get("image_metadata")
+        else:
+            scan_id = getattr(row, "scan_id", None)
+            image_status = getattr(row, "image_status", None)
+            image_source_type = getattr(row, "image_source_type", None)
+            raw_meta = getattr(row, "image_metadata", None)
+
+        if raw_meta:
+            if isinstance(raw_meta, dict):
+                image_metadata = raw_meta
+            elif isinstance(raw_meta, str) and raw_meta.strip():
+                try:
+                    image_metadata = json.loads(raw_meta)
+                except Exception:
+                    image_metadata = None
+
         return ProductRecord(
             id=row["id"],
             product_name=row["product_name"],
@@ -1532,4 +1678,413 @@ class InventoryDatabase:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             scan_id=scan_id,
+            image_status=image_status,
+            image_source_type=image_source_type,
+            image_metadata=image_metadata,
+        )
+
+    # -----------------------------------------------------------------------
+    # Image Discovery Job Queue Operations
+    # -----------------------------------------------------------------------
+
+    def create_image_job(
+        self,
+        product_id: int,
+        normalized_identity: str,
+        max_attempts: int = 4,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Enqueue a background image discovery job for a product.
+        Idempotent: Reuses existing active job if identity matches.
+        Cancels stale jobs if identity changed.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        clean_identity = normalized_identity.strip()
+        meta_json = json.dumps(metadata) if metadata is not None else None
+
+        with self._get_connection() as conn:
+            # Check if an active job already exists
+            cur = conn.execute(
+                """
+                SELECT id, normalized_identity, status
+                FROM image_discovery_jobs
+                WHERE product_id = ? AND status IN ('pending', 'searching', 'retry_scheduled')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (product_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                job_id = existing["id"] if hasattr(existing, "keys") else existing[0]
+                existing_identity = existing["normalized_identity"] if hasattr(existing, "keys") else existing[1]
+                if existing_identity == clean_identity:
+                    return job_id
+                # Stale job for older identity - obsolete it
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'cancelled', last_error = 'Product identity changed', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, job_id),
+                )
+
+            # Insert new job with attempt 1 eligible immediately (delay 0s)
+            if self.is_postgres:
+                res = conn.execute(
+                    """
+                    INSERT INTO image_discovery_jobs (
+                        product_id, normalized_identity, status, attempt_count,
+                        max_attempts, next_eligible_at, created_at, updated_at, metadata
+                    ) VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (product_id, clean_identity, max_attempts, now, now, now, meta_json),
+                )
+                new_id = res.fetchone()[0]
+            else:
+                res = conn.execute(
+                    """
+                    INSERT INTO image_discovery_jobs (
+                        product_id, normalized_identity, status, attempt_count,
+                        max_attempts, next_eligible_at, created_at, updated_at, metadata
+                    ) VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+                    """,
+                    (product_id, clean_identity, max_attempts, now, now, now, meta_json),
+                )
+                new_id = res.lastrowid
+
+            # Sync product image_status to 'pending' unless manually set
+            conn.execute(
+                """
+                UPDATE products
+                SET image_status = 'pending'
+                WHERE id = ? AND (image_source_type IS NULL OR image_source_type != 'manual')
+                """,
+                (product_id,),
+            )
+            return new_id
+
+    def get_image_job(self, job_id: int) -> ImageDiscoveryJobRecord | None:
+        """Retrieve image discovery job by ID."""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT * FROM image_discovery_jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            return self._row_to_image_job(row)
+
+    def get_active_job_for_product(self, product_id: int) -> ImageDiscoveryJobRecord | None:
+        """Retrieve the most recent active job for a product."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM image_discovery_jobs
+                WHERE product_id = ? AND status IN ('pending', 'searching', 'retry_scheduled')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (product_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return self._row_to_image_job(row)
+
+    def get_due_image_jobs(self, limit: int = 10, current_time: str | None = None) -> list[ImageDiscoveryJobRecord]:
+        """Fetch jobs ready for processing based on next_eligible_at."""
+        now = current_time or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM image_discovery_jobs
+                WHERE status IN ('pending', 'retry_scheduled') AND next_eligible_at <= ?
+                ORDER BY next_eligible_at ASC, id ASC
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+            return [self._row_to_image_job(r) for r in rows]
+
+    def claim_image_job(self, job_id: int) -> bool:
+        """
+        Atomically transition job status to 'searching' and increment attempt_count.
+        Returns True if claimed successfully, False if already claimed or finished.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'searching',
+                    attempt_count = attempt_count + 1,
+                    last_attempt_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'retry_scheduled')
+                """,
+                (now, now, job_id),
+            )
+            if cur.rowcount == 0:
+                return False
+
+            # Update product status
+            conn.execute(
+                """
+                UPDATE products
+                SET image_status = 'searching'
+                WHERE id = (SELECT product_id FROM image_discovery_jobs WHERE id = ?)
+                  AND (image_source_type IS NULL OR image_source_type != 'manual')
+                """,
+                (job_id,),
+            )
+            return True
+
+    def schedule_job_retry(
+        self,
+        job_id: int,
+        error_message: str,
+        delay_seconds: float,
+        is_retryable: bool = True,
+    ) -> bool:
+        """
+        Handle a job failure by scheduling retry or marking permanently failed.
+        """
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        now = now_dt.isoformat()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT product_id, attempt_count, max_attempts FROM image_discovery_jobs WHERE id = ?",
+                (job_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            prod_id = row["product_id"] if hasattr(row, "keys") else row[0]
+            attempts = row["attempt_count"] if hasattr(row, "keys") else row[1]
+            max_att = row["max_attempts"] if hasattr(row, "keys") else row[2]
+
+            if attempts >= max_att or not is_retryable:
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'failed', last_error = ?, completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (error_message, now, now, job_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET image_status = 'failed'
+                    WHERE id = ? AND (image_source_type IS NULL OR image_source_type != 'manual')
+                    """,
+                    (prod_id,),
+                )
+                return True
+            else:
+                next_dt = now_dt + datetime.timedelta(seconds=delay_seconds)
+                next_time = next_dt.isoformat()
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'retry_scheduled', last_error = ?, next_eligible_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (error_message, next_time, now, job_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE products
+                    SET image_status = 'retry_scheduled'
+                    WHERE id = ? AND (image_source_type IS NULL OR image_source_type != 'manual')
+                    """,
+                    (prod_id,),
+                )
+                return True
+
+    def apply_resolved_product_image(
+        self,
+        product_id: int,
+        job_id: int,
+        image_path: str,
+        image_metadata: dict[str, Any] | None = None,
+        image_source_type: str = "catalog",
+    ) -> bool:
+        """
+        Safely update product with a verified image candidate.
+        Enforces stale-job and manual protection rules:
+        - Product must still exist.
+        - Product must not have manual image.
+        - Product identity must not have changed.
+        Only updates image fields; preserves all dates, notes, and other attributes.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        meta_json = json.dumps(image_metadata) if image_metadata is not None else None
+
+        with self._get_connection() as conn:
+            # 1. Verify target product still exists
+            p_cur = conn.execute(
+                "SELECT id, product_name, brand, image_source_type FROM products WHERE id = ?",
+                (product_id,),
+            )
+            p_row = p_cur.fetchone()
+            if not p_row:
+                # Deleted product - cancel job and do not recreate product!
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'cancelled', last_error = 'Product was deleted', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, job_id),
+                )
+                return False
+
+            p_src = p_row["image_source_type"] if hasattr(p_row, "keys") else p_row[3]
+            if p_src == "manual":
+                # Manual image selection takes precedence over background discovery
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'cancelled', last_error = 'Manual image selection preserved', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, job_id),
+                )
+                return False
+
+            # Check job identity agreement
+            j_cur = conn.execute(
+                "SELECT normalized_identity FROM image_discovery_jobs WHERE id = ?",
+                (job_id,),
+            )
+            j_row = j_cur.fetchone()
+            if j_row:
+                job_ident = j_row["normalized_identity"] if hasattr(j_row, "keys") else j_row[0]
+                p_name = p_row["product_name"] if hasattr(p_row, "keys") else p_row[1]
+                p_brand = p_row["brand"] if hasattr(p_row, "keys") else p_row[2]
+                curr_ident = f"{(p_brand or '').strip()} {p_name.strip()}".strip()
+                if job_ident != curr_ident and job_ident != p_name.strip():
+                    conn.execute(
+                        """
+                        UPDATE image_discovery_jobs
+                        SET status = 'cancelled', last_error = 'Product identity modified after job creation', completed_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, job_id),
+                    )
+                    return False
+
+            # Apply verified image
+            conn.execute(
+                """
+                UPDATE products
+                SET image_path = ?,
+                    image_status = 'resolved',
+                    image_source_type = ?,
+                    image_metadata = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (image_path, image_source_type, meta_json, now, product_id),
+            )
+            conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'resolved', completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, job_id),
+            )
+            return True
+
+    def apply_no_match_product_image(self, product_id: int, job_id: int) -> bool:
+        """
+        Record discovery completed with no credible match found.
+        Keeps existing image or fallback intact without erasing it.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            p_cur = conn.execute("SELECT id, image_source_type FROM products WHERE id = ?", (product_id,))
+            p_row = p_cur.fetchone()
+            if not p_row:
+                conn.execute(
+                    "UPDATE image_discovery_jobs SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, job_id),
+                )
+                return False
+
+            p_src = p_row["image_source_type"] if hasattr(p_row, "keys") else p_row[1]
+            if p_src != "manual":
+                conn.execute(
+                    "UPDATE products SET image_status = 'no_match', updated_at = ? WHERE id = ?",
+                    (now, product_id),
+                )
+            conn.execute(
+                "UPDATE image_discovery_jobs SET status = 'no_match', completed_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, job_id),
+            )
+            return True
+
+    def cancel_image_jobs_for_product(self, product_id: int, reason: str = "Cancelled") -> int:
+        """Cancel all pending or in-progress image discovery jobs for a product."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'cancelled', last_error = ?, completed_at = ?, updated_at = ?
+                WHERE product_id = ? AND status IN ('pending', 'searching', 'retry_scheduled')
+                """,
+                (reason, now, now, product_id),
+            )
+            return cur.rowcount
+
+    def recover_stalled_jobs(self, stalled_seconds: int = 300) -> int:
+        """
+        Recover jobs stuck in 'searching' state due to serverless termination or unhandled worker crash.
+        """
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=stalled_seconds)).isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            # Jobs with remaining attempts get scheduled for retry
+            cur1 = conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'retry_scheduled',
+                    last_error = 'Worker interrupted / stalled execution recovered',
+                    next_eligible_at = ?,
+                    updated_at = ?
+                WHERE status = 'searching' AND last_attempt_at < ? AND attempt_count < max_attempts
+                """,
+                (now, now, cutoff),
+            )
+            # Jobs with exhausted attempts get marked failed
+            cur2 = conn.execute(
+                """
+                UPDATE image_discovery_jobs
+                SET status = 'failed',
+                    last_error = 'Max attempts exhausted after stalled execution',
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE status = 'searching' AND last_attempt_at < ? AND attempt_count >= max_attempts
+                """,
+                (now, now, cutoff),
+            )
+            return cur1.rowcount + cur2.rowcount
+
+    @staticmethod
+    def _row_to_image_job(row: Any) -> ImageDiscoveryJobRecord:
+        return ImageDiscoveryJobRecord(
+            id=row["id"],
+            product_id=row["product_id"],
+            normalized_identity=row["normalized_identity"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            max_attempts=row["max_attempts"],
+            next_eligible_at=str(row["next_eligible_at"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            last_error=row["last_error"],
+            last_attempt_at=str(row["last_attempt_at"]) if row["last_attempt_at"] else None,
+            completed_at=str(row["completed_at"]) if row["completed_at"] else None,
+            metadata=row["metadata"],
         )

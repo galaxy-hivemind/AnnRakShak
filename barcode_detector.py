@@ -64,9 +64,6 @@ def detect_barcode_from_cv_image(image: np.ndarray) -> str | None:
                     if is_valid_gtin_checksum(cleaned):
                         logger.info("OpenCV BarcodeDetector found valid GTIN: %s", cleaned)
                         return cleaned
-                    elif len(cleaned) in (8, 12, 13, 14):
-                        # Some non-checksum formats or partials
-                        return cleaned
     except Exception as e:
         logger.debug("OpenCV BarcodeDetector exception: %s", e)
 
@@ -123,30 +120,35 @@ def resolve_scanned_barcode(
     ai_barcode: str | None = None,
 ) -> str | None:
     """
-    Multi-stage barcode resolver prioritizing hardware/CV detection,
-    then OCR checksum validation, then AI identification.
-    Never invents or guesses a barcode.
+    Multi-stage barcode resolver prioritizing:
+      1. Hardware / Optical OpenCV detection from camera frame.
+      2. Checksum-validated OCR extraction.
+      3. Checksum-validated AI identification.
+    Never invents or guesses a barcode. Rejects invalid checksums.
     """
-    # 1. AI result if already validated
+    # 1. Optical CV detection from image array or path
+    try:
+        if image is not None:
+            cv_code = detect_barcode_from_cv_image(image)
+            if cv_code and is_valid_gtin_checksum(cv_code):
+                return cv_code
+        elif image_path:
+            cv_code = detect_barcode_from_file(image_path)
+            if cv_code and is_valid_gtin_checksum(cv_code):
+                return cv_code
+    except Exception as e:
+        logger.warning(f"Optical barcode detection failed gracefully: {e}")
+
+    # 2. Checksum-validated OCR extraction
+    if ocr_text:
+        ocr_code = extract_barcode_from_ocr(ocr_text)
+        if ocr_code and is_valid_gtin_checksum(ocr_code):
+            return ocr_code
+
+    # 3. Checksum-validated AI identification
     if ai_barcode:
         cleaned_ai = re.sub(r"\D", "", ai_barcode)
         if is_valid_gtin_checksum(cleaned_ai):
             return cleaned_ai
-
-    # 2. Direct CV detection from image array or path
-    if image is not None:
-        cv_code = detect_barcode_from_cv_image(image)
-        if cv_code:
-            return cv_code
-    elif image_path:
-        cv_code = detect_barcode_from_file(image_path)
-        if cv_code:
-            return cv_code
-
-    # 3. Checksum-validated OCR extraction
-    if ocr_text:
-        ocr_code = extract_barcode_from_ocr(ocr_text)
-        if ocr_code:
-            return ocr_code
 
     return None

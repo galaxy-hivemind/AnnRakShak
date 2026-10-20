@@ -386,6 +386,12 @@ export function InventoryPhotoCard({
           }}
         />
         <span className="cat-chip">{shortCategory(product)}</span>
+        {product.imageStatus === 'searching' && (
+          <span className="cat-chip ml-1 text-[10px] bg-sky-950/80 text-sky-200">Finding image…</span>
+        )}
+        {product.imageStatus === 'retry_scheduled' && (
+          <span className="cat-chip ml-1 text-[10px] bg-amber-950/80 text-amber-200">Retry queued</span>
+        )}
       </div>
       <div className="inv-body">
         <div className="inv-title-row">

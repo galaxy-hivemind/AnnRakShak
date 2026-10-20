@@ -7,3 +7,5 @@ fastapi==0.143.0
 uvicorn==0.54.0
 python-multipart>=0.0.20
 psycopg2-binary==2.9.13
+httpx==0.28.1
+httpcore==1.0.9

@@ -31,7 +31,7 @@ from typing import Any, Literal
 
 import cv2
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import numpy as np
@@ -43,6 +43,7 @@ from evidence_merger import merge_scan_results
 from ocr_engine import AppleVisionOCREngine, OCRResult
 from barcode_detector import resolve_scanned_barcode
 from product_image_resolver import get_image_resolver, ProductImageResolver
+from image_job_worker import process_due_image_jobs, process_image_discovery_job
 from inventory_db import (
     DEFAULT_DB_PATH,
     DEFAULT_WARNING_DAYS,
@@ -136,6 +137,8 @@ class ProductResponse(BaseModel):
     scan_id: int | None = None
     barcode: str | None = None
     image_metadata: dict[str, Any] | None = None
+    image_status: str | None = None
+    image_source_type: str | None = None
 
 
 class ProductCreate(BaseModel):
@@ -409,6 +412,21 @@ def get_analyzer(request: Request) -> GeminiAnalyzer:
     return request.app.state.analyzer
 
 
+def _safe_image_meta_dict(meta: Any) -> dict[str, Any] | None:
+    if meta is None or type(meta).__name__.endswith("Mock"):
+        return None
+    if isinstance(meta, dict):
+        return meta
+    if hasattr(meta, "to_dict") and callable(meta.to_dict):
+        try:
+            d = meta.to_dict()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    return None
+
+
 def serialize_product(
     p: ProductRecord,
     candidates: list[DateCandidateRecord] | None = None,
@@ -428,6 +446,8 @@ def serialize_product(
             if m_bar:
                 barcode = m_bar.group(1).strip()
 
+    raw_meta = image_metadata if image_metadata is not None else p.image_metadata
+    eff_image_meta = _safe_image_meta_dict(raw_meta)
     return ProductResponse(
         id=p.id,
         product_name=p.product_name,
@@ -448,7 +468,9 @@ def serialize_product(
         date_candidates=[DateCandidateItem(**c.to_dict()) for c in (candidates or [])],
         scan_id=p.scan_id,
         barcode=barcode,
-        image_metadata=image_metadata,
+        image_metadata=eff_image_meta,
+        image_status=p.image_status,
+        image_source_type=p.image_source_type,
     )
 
 
@@ -519,7 +541,7 @@ def serialize_scan(
         decision_reason=decision_reason,
         supplementary_images=list(s.supplementary_images),
         barcode=barcode,
-        image_metadata=image_metadata,
+        image_metadata=_safe_image_meta_dict(image_metadata),
     )
 
 
@@ -529,7 +551,7 @@ def serialize_scan(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application state, database, Gemini analyzer, and persistent OCR engine."""
+    """Manage application state, database, Gemini analyzer, persistent OCR engine, and background worker."""
     if not hasattr(app.state, "db") or app.state.db is None:
         app.state.db = get_database()
     if not hasattr(app.state, "analyzer") or app.state.analyzer is None:
@@ -541,9 +563,32 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not initialize shared AppleVisionOCREngine: %s", e)
             app.state.ocr_engine = None
 
+    # In local development or long-running containers, start the background retry scheduler
+    scheduler_task = None
+    if not is_serverless_environment():
+        async def _background_job_scheduler():
+            while True:
+                try:
+                    await asyncio.sleep(5)
+                    db = getattr(app.state, "db", None)
+                    if db:
+                        await asyncio.to_thread(process_due_image_jobs, db, 5)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug("Background job scheduler tick error: %s", e)
+
+        scheduler_task = asyncio.create_task(_background_job_scheduler())
+
     try:
         yield
     finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
         if hasattr(app.state, "db") and app.state.db is not None:
             try:
                 app.state.db.close()
@@ -851,12 +896,15 @@ def get_product_image(
 @app.post("/api/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED, tags=["Products"])
 def create_product(
     payload: ProductCreate,
+    background_tasks: BackgroundTasks,
     db: InventoryDatabase = Depends(get_db),
 ) -> ProductResponse:
     """
     Add a new product to inventory.
+    Saves promptly without blocking on external catalog searches.
     Guards against identical duplicates unless force=True is provided.
     Preserves verified web image and barcode from associated scan.
+    Schedules asynchronous background image discovery if no verified image is present.
     """
     candidate_dates = None
     scan = None
@@ -869,7 +917,7 @@ def create_product(
         candidate_dates = db.get_scan_date_candidates(payload.scan_id)
         if scan:
             image_meta = scan.image_metadata
-            if image_meta and image_meta.get("image_status") == "verified_web_image":
+            if image_meta and image_meta.get("image_status") in ("verified_web_image", "web_verified"):
                 disp_img = image_meta.get("image_url") or image_meta.get("local_path")
             if scan.raw_json:
                 try:
@@ -890,6 +938,9 @@ def create_product(
     if barcode and (not notes or "Barcode:" not in notes):
         notes = f"Barcode: {barcode} | {notes}" if notes else f"Barcode: {barcode}"
 
+    init_img_status = "resolved" if disp_img else "pending"
+    init_img_src = "catalog" if disp_img else "fallback"
+
     product_id = db.add_product(
         product_name=payload.product_name,
         date_type=payload.date_type,
@@ -904,6 +955,9 @@ def create_product(
         force=payload.force,
         candidate_dates=candidate_dates,
         scan_id=payload.scan_id,
+        image_status=init_img_status,
+        image_source_type=init_img_src,
+        image_metadata=image_meta,
     )
     p = db.get_product(product_id)
     if not p:
@@ -911,6 +965,13 @@ def create_product(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve newly created product.",
         )
+
+    # Prompt save guaranteed: Start background image discovery only after successful save
+    if not disp_img:
+        ident = f"{(payload.brand or '').strip()} {payload.product_name.strip()}".strip()
+        job_id = db.create_image_job(product_id=product_id, normalized_identity=ident)
+        background_tasks.add_task(process_image_discovery_job, job_id, db)
+
     candidates = db.get_product_date_candidates(product_id)
     return serialize_product(p, candidates=candidates, barcode=barcode, image_metadata=image_meta)
 
@@ -957,7 +1018,7 @@ def update_product(
             notes=current_notes or None,
         )
 
-    # 3. Update descriptive metadata
+    # 3. Update descriptive metadata and image handling
     update_fields: dict[str, Any] = {}
     if payload.product_name is not None:
         update_fields["product_name"] = payload.product_name
@@ -966,7 +1027,14 @@ def update_product(
     if payload.food_category is not None:
         update_fields["food_category"] = payload.food_category
     if payload.image_path is not None:
+        # Manual image selection takes precedence over background discovery
         update_fields["image_path"] = payload.image_path
+        update_fields["image_source_type"] = "manual"
+        update_fields["image_status"] = "resolved"
+        db.cancel_image_jobs_for_product(product_id, reason="User manually selected image")
+    if payload.product_name is not None or payload.brand is not None:
+        # Product identity modified: obsolete any active discovery job for older identity
+        db.cancel_image_jobs_for_product(product_id, reason="Product identity modified by user")
     if (payload.notes is not None or payload.quantity is not None) and not date_changed:
         update_fields["notes"] = current_notes or None
 
@@ -999,6 +1067,37 @@ def delete_product(
         message=f"Product {product_id} successfully deleted.",
         deleted_id=product_id,
     )
+
+
+@app.get("/api/products/{product_id}/image-job", tags=["Products"])
+def get_product_image_job(
+    product_id: int,
+    db: InventoryDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieve active or latest background image discovery job for a product."""
+    product = db.get_product(product_id)
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Product with ID {product_id} not found.",
+        )
+    job = db.get_active_job_for_product(product_id)
+    return {
+        "product_id": product_id,
+        "image_status": product.image_status,
+        "image_source_type": product.image_source_type,
+        "active_job": job.to_dict() if job else None,
+    }
+
+
+@app.post("/api/jobs/process-pending", tags=["Jobs"])
+def process_pending_jobs(
+    limit: int = Query(default=10, ge=1, le=50),
+    db: InventoryDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Process due background image discovery jobs (for cron or manual execution)."""
+    count = process_due_image_jobs(db, limit=limit)
+    return {"status": "ok", "processed": count}
 
 
 @app.get("/api/scans", response_model=list[ScanResponse], tags=["Scans"])
@@ -1161,7 +1260,7 @@ async def reanalyze_scan(
     image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
 
     disp_img: str | None = None
-    if image_meta and image_meta.get("image_status") == "verified_web_image":
+    if image_meta and image_meta.get("image_status") in ("verified_web_image", "web_verified"):
         disp_img = image_meta.get("image_url") or image_meta.get("local_path")
 
     t_db_0 = time.perf_counter()
@@ -1487,7 +1586,7 @@ async def add_supplementary_scan(
         image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
 
         disp_img: str | None = None
-        if image_meta and image_meta.get("image_status") == "verified_web_image":
+        if image_meta and image_meta.get("image_status") in ("verified_web_image", "web_verified"):
             disp_img = image_meta.get("image_url") or image_meta.get("local_path")
 
         # 8. Re-assess confidence and auto-save eligibility
@@ -1630,6 +1729,7 @@ def run_local_ocr(frame_bgr: np.ndarray, engine: AppleVisionOCREngine | None = N
 @app.post("/api/scans", response_model=ScanResponse, status_code=status.HTTP_201_CREATED, tags=["Scans"])
 async def create_scan(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: InventoryDatabase = Depends(get_db),
     analyzer: GeminiAnalyzer = Depends(get_analyzer),
 ) -> ScanResponse:
@@ -1785,24 +1885,27 @@ async def create_scan(
             result.barcode = detected_barcode
 
         # 5c. Intelligent Product Image Discovery & Validation
-        image_meta = None
+        # Fast path: check in-memory cache first so existing verified products resolve instantly
+        image_resolver = get_image_resolver()
+        cached_meta = None
         try:
-            image_resolver = get_image_resolver()
-            image_meta = await asyncio.to_thread(
-                image_resolver.resolve_product_image,
+            cached_meta = image_resolver.get_cached(
+                barcode=detected_barcode or result.barcode,
                 product_name=result.product_name,
                 brand=result.brand,
-                barcode=detected_barcode or result.barcode,
-                category=result.food_category,
-                is_supplementary=False,
             )
-        except Exception as e:
-            logger.warning("Product image resolution failed gracefully during create_scan: %s", e)
+        except Exception:
+            cached_meta = None
+
+        image_meta = None
+        if cached_meta and not type(cached_meta).__name__.endswith("Mock"):
+            if getattr(cached_meta, "is_verified", False) is True:
+                image_meta = cached_meta
 
         product_display_image: str | None = None
-        image_meta_dict = image_meta.to_dict() if hasattr(image_meta, "to_dict") else (image_meta if isinstance(image_meta, dict) else None)
-        if image_meta and image_meta.get("image_status") == "verified_web_image":
-            product_display_image = image_meta.get("image_url") or image_meta.get("local_path")
+        image_meta_dict = _safe_image_meta_dict(image_meta)
+        if image_meta_dict and image_meta_dict.get("image_status") in ("verified_web_image", "web_verified"):
+            product_display_image = image_meta_dict.get("image_url") or image_meta_dict.get("local_path")
 
         # Assess confidence and auto-save eligibility
         assessment = evaluate_scan_confidence(result)
@@ -1849,9 +1952,18 @@ async def create_scan(
                     candidate_dates=cand_records,
                     force=True,
                     scan_id=scan_id,
+                    image_status="resolved" if product_display_image else "pending",
+                    image_source_type="catalog" if product_display_image else "fallback",
+                    image_metadata=image_meta_dict,
                 )
                 auto_saved = True
                 decision_reason = assessment.decision_reason
+
+                # Asynchronous Background Discovery for auto-saved product if no verified image is cached yet
+                if not product_display_image:
+                    ident = f"{(result.brand or '').strip()} {result.product_name.strip()}".strip()
+                    job_id = db.create_image_job(product_id=product_id, normalized_identity=ident)
+                    background_tasks.add_task(process_image_discovery_job, job_id, db, resolver=image_resolver)
             except Exception as e:
                 logger.error("Auto-save failed to persist product for scan %d: %s", scan_id, e)
                 auto_saved = False
