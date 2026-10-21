@@ -1481,6 +1481,10 @@
     padding: 10px 12px;
     font-size: 12px;
   }
+  .scan-grid {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
