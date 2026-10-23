@@ -1,4 +1,4 @@
-import { useState, useRef, type ReactNode } from 'react';
+import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { Link, useRouterState } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -7,6 +7,7 @@ import {
   LayoutGrid,
   Box,
   CalendarDays,
+  Calendar,
   BookOpen,
   ScanLine,
   History,
@@ -15,6 +16,7 @@ import {
   Bell,
   Search,
   ChevronDown,
+  ChevronRight,
   Menu,
   X,
   ArrowRight,
@@ -27,6 +29,8 @@ import {
   Sprout,
   TrendingDown,
   Plus,
+  Home,
+  MoreVertical,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -35,6 +39,21 @@ import { settingsQuery, scansQuery, service, dashboardQuery } from '@/services/a
 import { displayDate, productStatus, daysFromToday } from '@/services/dates';
 import type { Product, ProductStatus } from '@/services/types';
 import { resolveFoodImage, categoryImages, tomatoesImg } from '@/services/food-images';
+import { formatProductDisplayName } from './product-identity';
+
+export function getTimeGreeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
+export function getTimeEmoji(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return '☀️';
+  if (hour < 17) return '🌤️';
+  return '🌙';
+}
 
 export const primaryNav = [
   { to: '/', name: 'Overview', icon: LayoutGrid },
@@ -73,57 +92,115 @@ export function AppShell({ children }: { children: ReactNode }) {
     setSearching(true);
     const all = await service.getProducts();
     if (run !== searchSequence.current) return;
-    setResults(all.filter((p) => `${p.name} ${p.brand}`.toLowerCase().includes(value.toLowerCase())));
+    const lower = value.toLowerCase().trim();
+    setResults(
+      all.filter((p) => {
+        const display = formatProductDisplayName(p).toLowerCase();
+        const rawName = (p.name || '').toLowerCase();
+        const brand = (p.brand || '').toLowerCase();
+        const cat = (p.category || '').toLowerCase();
+        return display.includes(lower) || rawName.includes(lower) || brand.includes(lower) || cat.includes(lower);
+      })
+    );
     setSearching(false);
   }
 
+  // Keyboard shortcut: Cmd+K / Ctrl+K opens quick inventory search
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setSearch((prev) => !prev);
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const today = new Date();
+  const dateFormatted = today.toLocaleDateString('en-GB', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+
   return (
     <div className={`app-shell ${settings?.compact ? 'compact' : ''}`}>
-      <header className="topnav">
-        <div className="topnav-inner">
-          <Link to="/" className="brand" onClick={() => setMenu(false)}>
-            <span className="brand-icon">
-              <Shield size={32} strokeWidth={1.8} />
-              <Leaf className="leaf" strokeWidth={2.2} />
-            </span>
-            <span className="brand-name">AnnRakshak</span>
+      {/* 1. Left Vertical Navigation Sidebar */}
+      <aside className={`app-sidebar ${menu ? 'mobile-open' : ''}`}>
+        <div className="sidebar-brand">
+          <Link to="/" className="sidebar-brand-link" onClick={() => setMenu(false)}>
+            <img
+              src="/annarakshak-logo.png"
+              alt="AnnRakshak — Technology Jo Ann Ko Samjhe"
+              className="sidebar-logo"
+            />
+          </Link>
+        </div>
+
+        <nav aria-label="Main navigation" className="sidebar-nav">
+          <Link
+            to="/"
+            onClick={() => setMenu(false)}
+            className={`sidebar-nav-item ${pathname === '/' ? 'active' : ''}`}
+          >
+            <Home size={18} />
+            <span>Home</span>
           </Link>
 
-          <nav aria-label="Main navigation" className="topnav-links">
-            {primaryNav.map((n) => (
-              <Link
-                key={n.to}
-                to={n.to}
-                className={`nav-item ${pathname === n.to ? 'active' : ''}`}
-              >
-                <n.icon />
-                <span>{n.name}</span>
-              </Link>
-            ))}
+          <Link
+            to="/inventory"
+            onClick={() => setMenu(false)}
+            className={`sidebar-nav-item ${pathname === '/inventory' ? 'active' : ''}`}
+          >
+            <Box size={18} />
+            <span>Inventory</span>
+          </Link>
 
-            {/* Direct Scan icon navigation */}
+          <Link
+            to="/scan"
+            onClick={() => setMenu(false)}
+            className={`sidebar-nav-item ${pathname === '/scan' ? 'active' : ''}`}
+            aria-label="Scan ingredients"
+            title="Scan ingredients"
+          >
+            <ScanLine size={18} />
+            <span>Scan</span>
+          </Link>
+
+          <Link
+            to="/timeline"
+            onClick={() => setMenu(false)}
+            className={`sidebar-nav-item ${pathname === '/timeline' ? 'active' : ''}`}
+          >
+            <CalendarDays size={18} />
+            <span>Expiry</span>
+          </Link>
+
+          {/* Settings Nav Item with Dropdown Support */}
+          <div className="sidebar-settings-group">
             <Link
-              to="/scan"
-              className={`nav-item icon-only ${pathname === '/scan' ? 'active' : ''}`}
-              aria-label="Scan ingredients"
-              title="Scan ingredients"
+              to="/settings"
+              onClick={() => setMenu(false)}
+              className={`sidebar-nav-item flex-1 ${settingsActive ? 'active' : ''}`}
             >
-              <ScanLine size={17} />
+              <Settings size={18} />
+              <span>Settings</span>
             </Link>
 
-            {/* Settings dropdown menu */}
             <DropdownMenu>
               <DropdownMenuTrigger
-                className={`nav-item icon-only ${settingsActive ? 'active' : ''}`}
+                className={`sidebar-settings-trigger ${settingsActive ? 'active' : ''}`}
                 aria-label="Open settings menu"
                 title="Open settings menu"
               >
                 <Settings size={17} />
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-52">
+              <DropdownMenuContent align="start" className="w-52">
                 {settingsNav.map((n) => (
                   <DropdownMenuItem key={n.to} asChild>
-                    <Link to={n.to} className="flex items-center gap-2">
+                    <Link to={n.to} className="flex items-center gap-2" onClick={() => setMenu(false)}>
                       <n.icon size={16} />
                       {n.name}
                       {n.to === '/review' && count > 0 && <span className="nav-count">{count}</span>}
@@ -132,52 +209,77 @@ export function AppShell({ children }: { children: ReactNode }) {
                 ))}
               </DropdownMenuContent>
             </DropdownMenu>
-          </nav>
+          </div>
+        </nav>
+      </aside>
 
-          <div className="topnav-tools">
-            <Link
-              to="/review"
-              className={`icon-btn ${count ? 'notification' : ''}`}
-              aria-label={`${count} records need attention`}
-              title={`${count} records need attention`}
-            >
-              <Bell size={19} />
-            </Link>
-            <span className="topnav-divider" />
-            <span className="avatar" title="My kitchen">
-              MK
-            </span>
+      {/* Backdrop for mobile drawer */}
+      {menu && <div className="sidebar-backdrop" onClick={() => setMenu(false)} />}
+
+      {/* 2. Main Content Area */}
+      <div className="app-content-area">
+        {/* Top Header Bar */}
+        <header className="app-topbar">
+          <div className="topbar-left">
             <button
-              className="icon-btn mobile-menu"
+              className="mobile-menu-toggle"
               aria-label={menu ? 'Close navigation' : 'Open navigation'}
               aria-expanded={menu}
               onClick={() => setMenu(!menu)}
             >
               {menu ? <X size={20} /> : <Menu size={20} />}
             </button>
+
+            {/* Header Search Field */}
+            <div
+              className="topbar-search-pill"
+              onClick={() => setSearch(true)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setSearch(true);
+                }
+              }}
+              aria-label="Search your inventory"
+            >
+              <Search size={15} className="search-icon" />
+              <span className="search-placeholder">Search your inventory...</span>
+              <kbd className="search-shortcut">⌘ K</kbd>
+            </div>
           </div>
-        </div>
 
-        {menu && (
-          <nav aria-label="Mobile navigation" className="mobile-nav">
-            {[...primaryNav, scanNav, ...settingsNav].map((n) => (
-              <Link
-                key={n.to}
-                to={n.to}
-                onClick={() => setMenu(false)}
-                className={`nav-item ${pathname === n.to ? 'active' : ''}`}
-              >
-                <n.icon />
-                <span>{n.name}</span>
-                {n.to === '/review' && count > 0 && <span className="nav-count">{count}</span>}
-              </Link>
-            ))}
-          </nav>
-        )}
-      </header>
+          <div className="topbar-right">
+            {/* Date Display */}
+            <div className="topbar-date">
+              <Calendar size={15} />
+              <span>{dateFormatted}</span>
+            </div>
 
-      <main className="app-main">{children}</main>
+            {/* Notifications Bell */}
+            <Link
+              to="/review"
+              className={`topbar-icon-btn ${count ? 'has-badge' : ''}`}
+              aria-label={`${count} records need attention`}
+              title={`${count} records need attention`}
+            >
+              <Bell size={18} />
+              {count > 0 && <span className="notification-dot">{count}</span>}
+            </Link>
 
+            {/* Profile Avatar */}
+            <div className="topbar-avatar" title="Ayush's Kitchen">
+              A
+            </div>
+          </div>
+        </header>
+
+        {/* Routed Main Page */}
+        <main className="app-main">{children}</main>
+      </div>
+
+      {/* Quick Search Dialog */}
       <Dialog open={search} onOpenChange={setSearch}>
         <DialogContent>
           <DialogTitle>Search inventory</DialogTitle>
@@ -299,6 +401,49 @@ export function PageIntro({
   );
 }
 
+export function WelcomeGreetingHero({
+  freshnessPercent = 100,
+  urgentCount = 0,
+}: {
+  freshnessPercent?: number;
+  urgentCount?: number;
+}) {
+  const greeting = getTimeGreeting();
+  const emoji = getTimeEmoji();
+  const today = new Date();
+  const formattedDate = `${today.toLocaleDateString('en-GB', { weekday: 'long' })}, ${today.getDate()} ${today.toLocaleDateString('en-GB', { month: 'long' })}`;
+  const isWarning = urgentCount > 0;
+
+  return (
+    <div className="welcome-hero">
+      <div>
+        <div className="welcome-title-row">
+          <h1>{greeting}! {emoji}</h1>
+          <div className={`freshness-pulse-badge ${isWarning ? 'warning' : ''}`}>
+            <span className={`pulse-dot ${isWarning ? 'warning' : ''}`} />
+            <span>{freshnessPercent}% Fresh</span>
+            <span className="opacity-75">· {urgentCount > 0 ? `${urgentCount} need attention` : 'All items good'}</span>
+          </div>
+        </div>
+        <p>Your kitchen inventory is up to date and organized.</p>
+      </div>
+
+      <div className="greeting-actions">
+        <span className="page-date">
+          <CalendarDays size={16} />
+          {formattedDate}
+        </span>
+        <Button asChild size="lg" className="add-btn">
+          <Link to="/scan">
+            <ScanLine size={17} />
+            <span>Add Ingredients</span>
+          </Link>
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function StatCardsRow() {
   const { data } = useQuery(dashboardQuery);
   if (!data) return null;
@@ -307,28 +452,30 @@ export function StatCardsRow() {
     {
       label: 'In your inventory',
       value: String(data.total),
-      unit: 'items',
+      unit: '',
       icon: Box,
-      caption: 'A well-stocked, thoughtful kitchen',
+      iconClass: 'bg-[#E8F1E5] text-[#1E684A] border border-[#D5E3D3]',
+      caption: 'Active items in stock',
       to: '/inventory' as const,
       warm: false,
     },
     {
       label: 'Use first',
       value: String(data.expiring.length),
-      unit: 'items',
+      unit: '',
       icon: Clock,
-      caption: 'A little attention goes a long way',
+      iconClass: 'bg-[#FEF3C7] text-[#D97706] border border-[#FDE68A]',
+      caption: data.expiring.length > 0 ? 'Within 7 days' : 'No urgent items',
       to: '/timeline' as const,
-      warm: true,
-      clock: true,
+      warm: data.expiring.length > 0,
     },
     {
       label: 'Inventory value',
       value: `₹${data.inventoryValue}`,
       unit: '',
       icon: Sprout,
-      caption: 'Good food, worth taking care of',
+      iconClass: 'bg-[#E8F1E5] text-[#1E684A] border border-[#D5E3D3]',
+      caption: 'Tracked pantry value',
       to: '/inventory' as const,
       warm: false,
     },
@@ -337,26 +484,28 @@ export function StatCardsRow() {
       value: `₹${data.wasteThisMonth}`,
       unit: '',
       icon: TrendingDown,
-      caption: `${data.wasteEntries} ${data.wasteEntries === 1 ? 'entry' : 'entries'} in your waste journal`,
+      iconClass: 'bg-[#F3F4F6] text-[#4B5563] border border-[#E5E7EB]',
+      caption: `${data.wasteEntries} ${data.wasteEntries === 1 ? 'item' : 'items'} wasted`,
       to: '/waste' as const,
       warm: false,
     },
   ];
 
   return (
-    <div className="metrics">
+    <div className="metrics-grid">
       {metrics.map((m) => (
-        <Link to={m.to} className="metric" key={m.label}>
-          <div className="metric-top">
-            <span>{m.label}</span>
-            <m.icon />
+        <Link to={m.to} className="metric-card" key={m.label}>
+          <div className="metric-card-top">
+            <span className="metric-label">{m.label}</span>
+            <div className={`metric-icon-wrap ${m.iconClass}`}>
+              <m.icon size={18} />
+            </div>
           </div>
-          <div className="metric-value">
-            <b className={m.warm ? 'warm' : ''}>{m.value}</b>
-            {m.unit && <span>{m.unit}</span>}
+          <div className="metric-value-wrap">
+            <span className={`metric-number ${m.warm ? 'warm' : ''}`}>{m.value}</span>
           </div>
-          <div className="metric-sub">
-            {m.clock ? '🕒' : '↳'} {m.caption}
+          <div className="metric-caption">
+            <span>{m.caption}</span>
           </div>
         </Link>
       ))}
@@ -393,12 +542,13 @@ export function InventoryPhotoCard({
     day: 'numeric',
     month: 'short',
   });
+  const displayName = formatProductDisplayName(product);
 
   return (
     <button
       className="inv-card"
       onClick={onClick}
-      aria-label={`Open ${product.name}`}
+      aria-label={`Open ${displayName}`}
     >
       <div className="inv-img">
         <img
@@ -414,22 +564,39 @@ export function InventoryPhotoCard({
             }
           }}
         />
-        <span className="cat-chip">{shortCategory(product)}</span>
+        {/* Floating pill badge on image top-left matching reference image */}
+        <div className="inv-floating-badge">
+          {urgent ? (
+            <span className="badge-pill warning">
+              <span className="dot" />
+              Expiring Soon
+            </span>
+          ) : (
+            <span className="badge-pill fresh">
+              <span className="dot" />
+              Fresh
+            </span>
+          )}
+        </div>
+
         {product.imageStatus === 'searching' && (
           <span className="cat-chip ml-1 text-[10px] bg-sky-950/80 text-sky-200">Finding image…</span>
         )}
         {product.imageStatus === 'retry_scheduled' && (
           <span className="cat-chip ml-1 text-[10px] bg-amber-950/80 text-amber-200">Retry queued</span>
         )}
+        {product.imageSourceType === 'generated' && (
+          <span className="cat-chip ml-1 text-[10px] bg-emerald-950/80 text-emerald-200" title="Studio AI photograph">AI Studio</span>
+        )}
       </div>
       <div className="inv-body">
         <div className="inv-title-row">
-          <strong>{product.name}</strong>
-          <ArrowUpRight size={16} />
+          <strong>{displayName}</strong>
+          <MoreVertical size={16} className="text-muted-foreground hover:text-foreground" />
         </div>
         <div className="food-meta">
           {product.quantity && <span>{product.quantity}</span>}
-          {product.quantity && <span>·</span>}
+          {product.quantity && <span>•</span>}
           <span className="inline-flex items-center gap-1">
             <Refrigerator size={12} />
             {product.storage || 'Fridge'}
@@ -439,19 +606,19 @@ export function InventoryPhotoCard({
           <span className={`use-badge ${isSafe ? 'safe' : ''}`}>
             • {dayLabel(d)}
           </span>
-          <CircleCheck size={16} className="text-emerald-700" />
         </div>
         <div className="inv-confirmed-foot">
-          Confirmed expiry · {formattedExpiry}
+          {product.verified ? `Confirmed expiry • ${formattedExpiry}` : 'Expiry not recorded'}
         </div>
       </div>
     </button>
   );
 }
 
-export function ProductCell({ product }: { product: Pick<Product, 'image' | 'name' | 'brand' | 'category'> }) {
+export function ProductCell({ product }: { product: Pick<Product, 'image' | 'name' | 'brand' | 'category'> & { displayName?: string } }) {
   const imgSrc = resolveFoodImage(product);
   const fallbackSrc = categoryImages[product.category || 'Pantry Staples'] || tomatoesImg;
+  const displayName = formatProductDisplayName(product);
   return (
     <div className="product-cell">
       <img
@@ -469,7 +636,7 @@ export function ProductCell({ product }: { product: Pick<Product, 'image' | 'nam
         }}
       />
       <div>
-        <div className="product-name">{product.name}</div>
+        <div className="product-name">{displayName}</div>
         <div className="product-brand">{product.brand || 'No brand specified'}</div>
       </div>
     </div>
@@ -581,9 +748,9 @@ export function Footer() {
     <footer className="footer-minimal">
       <span>
         <Leaf size={14} />
-        Less waste. More possibility.
+        AnnRakShak · Smart Kitchen Inventory
       </span>
-      <span>Sample kitchen · October 2026 / Made with care, AnnRakShak</span>
+      <span>Keep your kitchen fresh and organized</span>
     </footer>
   );
 }

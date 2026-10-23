@@ -4,7 +4,7 @@ export const categories = ['Dairy & Eggs', 'Grains & Cereals', 'Snacks', 'Bevera
 export type Category = typeof categories[number];
 export type ProductStatus = 'Expired' | 'Expires Today' | 'Expiring Soon' | 'Upcoming' | 'Best Before Passed' | 'Best Before Today' | 'Best Before Soon' | 'Best Before Future' | 'Needs Review' | 'Unknown' | 'Manufactured' | 'Packed';
 export interface ProductInput { name: string; brand: string; category: Category; quantity: string; date: string; dateType: DateType; notes: string; verified: boolean; }
-export interface Product extends ProductInput { id: string; image: string; scanId?: string; storage?: 'Fridge' | 'Freezer' | 'Pantry' | 'Counter'; price?: number; produce?: 'Vegetable' | 'Fruit'; imageStatus?: string; imageSourceType?: string; imageMetadata?: Record<string, any> | null; }
+export interface Product extends ProductInput { id: string; image: string; scanId?: string; storage?: 'Fridge' | 'Freezer' | 'Pantry' | 'Counter'; price?: number; produce?: 'Vegetable' | 'Fruit'; imageStatus?: string; imageSourceType?: string; imageMetadata?: Record<string, any> | null; displayName?: string; }
 export interface WasteEntry { id: string; name: string; quantity: string; value: number; reason: string; date: string; }
 export interface WasteInput { name: string; quantity: string; value: number; reason: string; date: string; }
 export interface DateCandidate { id: string; printedText: string; date: string; dateType: DateType; precision: 'day' | 'month' | 'unknown'; reason?: string; confidence?: number; isCalculated?: boolean; source?: 'printed' | 'calculated' | 'manual'; calculatedFrom?: string; }

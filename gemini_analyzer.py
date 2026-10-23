@@ -173,25 +173,32 @@ STRICT DATE EXTRACTION & INTERPRETATION RULES:
    - 'unknown': A date with no legible preceding label or clear indicator.
 
 3. RELATIVE EXPIRY & SHELF-LIFE:
-   - If packaging says "Best before X months from MFG" or "Shelf life: X months from manufacture":
-     * If a verified manufacturing date is printed, calculate the expiry date using calendar-month addition (e.g. MFD 2026-10-10 + 4 months = 2027-02-10).
-     * If manufacturing date is missing or unverified, do NOT invent a calendar date; record raw text, set normalized_date = null, and flag needs_review = true.
+   - If packaging says "Best before X months from MFG" or "Shelf life: X months from manufacture" or "Best before X months":
+     * If a manufacturing date is printed, automatically calculate the expiry date using calendar-month addition (e.g. MFD 2026-10-10 + 4 months = 2027-02-10).
+     * Set selected_expiry_date to the calculated date.
+     * Add this calculated date to date_candidates with date_type = 'best_before' and confidence = 0.95.
    - If packaging says "Use within 30 days of opening", record date_type = 'after_opening', normalized_date = null, and flag needs_review = true unless opening date is explicitly provided.
 
-4. DATE FORMATS & AMBIGUITY:
-   - Recognize common date formats: DD/MM/YY, DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, MM/YYYY, MM-YYYY, DD MMM YYYY, MMM YYYY.
-   - If Day, Month, and Year are clearly legible, set normalized_date to 'YYYY-MM-DD'.
-   - If only Month and Year are printed (e.g. '03/2028' or 'OCT 2026'): do NOT guess or invent an arbitrary day (like 01 or 31).
-     Set normalized_date = null and preserve the exact 'MM/YYYY' string in raw_text.
+4. DATE FORMATS & MONTH-ONLY DATES:
+   - Recognize common date formats: DD/MM/YY, DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, MM/YYYY, MM-YYYY, DD MMM YYYY, MMM YYYY, YYYY-MM.
+   - If Day, Month, and Year are clearly legible, normalize to 'YYYY-MM-DD'.
+   - If only Month and Year are printed (e.g. '03/2028', 'OCT 2026', '10/2026'):
+     * For manufacturing or packed dates: if the month is the current month when scanned, set the day to the current day of the scan (e.g. 2026-10-23). If it is a prior month, set the day to the 1st of that month ('YYYY-MM-01').
+     * For expiry or best-before dates: set the day to the 1st of that month ('YYYY-MM-01').
+     * High confidence (>= 0.90) must be assigned so dates are automatically confirmed.
    - Treat ambiguous numeric dates conservatively: if day vs month is ambiguous, set normalized_date = null and list in date_candidates.
    - Alphanumeric lot numbers, batch codes (e.g. 'BD0114', 'L2410'), MRP, and barcodes are NOT dates.
 
 5. SELECTION OF EXPIRY DATE:
-   - Set 'selected_expiry_date' (YYYY-MM-DD) ONLY when supported by clear, unambiguous evidence of an explicit expiry, use-by, or calculated relative best-before date with full year, month, and day.
-   - If only manufacturing dates or only month/year dates exist: set selected_expiry_date = null.
+   - Set 'selected_expiry_date' (YYYY-MM-DD) whenever supported by an explicit expiry date, best-before date, or calculated relative best-before date from MFG.
+   - If packaging has a manufacturing date and a statement like "Best before X months", calculate the expiry date and set 'selected_expiry_date' to that calculated date.
+   - Only set selected_expiry_date = null when NO expiry date or relative shelf life is present on the packaging.
 
-6. PRODUCT DETAILS & QUANTITY:
-   - Identify product name, brand, food category, and net quantity / weight / volume (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs') if printed anywhere on the packaging.
+6. HUMAN-IDENTIFIABLE PRODUCT IDENTITY:
+   - 'product_name': MUST be an instantly human-recognizable, specific consumer item name (e.g. 'Soan Papdi', 'Dry Fruit Cookies', 'Honitus Herbal Cough Lozenges', 'Toned Milk', 'Masala Chaas', 'Crunchy Bhajani Chakli', 'Whole Wheat Atta', 'Parle-G Biscuits').
+   - NEVER return generic category names as product_name such as 'Medicine', 'Ayurvedic Medicine', 'Snacks', 'Food Product', 'Item', or 'Unidentified Item'! If it is a pharmaceutical or herbal medicine, extract its specific brand/medicine name (e.g. 'Honitus Cough Drops' or 'Dabur Pudin Hara'). If it is a sweet, snack, or bakery item, identify the exact item (e.g. 'Soan Papdi', 'Bhajani Chakli', 'Dry Fruit Cookies').
+   - 'brand': The brand name or manufacturer (e.g. "Haldiram's", "ChanduRam's", 'Dabur', 'Amul', "Cavin's").
+   - Net quantity / weight / volume (e.g. '500 ml', '1 kg', '250 g', '10 tablets', '2 packs') if printed anywhere on the packaging.
    - If quantity is not clearly legible or printed, set quantity = null. Never guess or hallucinate quantity.
 """
 
@@ -217,9 +224,67 @@ class DateCandidate(BaseModel):
     evidence: str = Field(description="Brief explanation grounded strictly in visible label text.")
 
 
+MONTH_NAME_MAP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "september": 9, "sept": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def parse_month_year_from_text(text: str) -> tuple[int, int] | None:
+    """
+    Extract (year, month) from month-only date text if full calendar day is not present.
+    Returns None if a full calendar day is already present (e.g. 10/10/2026, 23 Oct 2026).
+    """
+    import re
+    if not text:
+        return None
+    clean = text.strip()
+    # If full calendar day is present, do not treat as month-only
+    if re.search(r"\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b", clean):
+        return None
+    if re.search(r"\b\d{1,2}\s+[A-Za-z]+\s+\d{2,4}\b", clean):
+        return None
+    if re.search(r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{2,4}\b", clean):
+        return None
+
+    # 1. Month word + Year (e.g. OCT 2026, October 2026, OCT-2026, OCT/2026)
+    m1 = re.search(r"\b([A-Za-z]+)[\s\/\-\.]+(20\d{2}|\d{2})\b", clean)
+    if m1 and m1.group(1).lower() in MONTH_NAME_MAP:
+        m_str, y_str = m1.group(1).lower(), m1.group(2)
+        y = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+        return y, MONTH_NAME_MAP[m_str]
+
+    # 2. Year + Month word (e.g. 2026 OCT, 2026-OCT)
+    m2 = re.search(r"\b(20\d{2})[\s\/\-\.]+([A-Za-z]+)\b", clean)
+    if m2 and m2.group(2).lower() in MONTH_NAME_MAP:
+        y_str, m_str = m2.group(1), m2.group(2).lower()
+        return int(y_str), MONTH_NAME_MAP[m_str]
+
+    # 3. Numeric MM/YYYY, MM-YYYY, MM.YYYY or YYYY-MM
+    m3 = re.search(r"\b(0?[1-9]|1[0-2])[\/\-\.](20\d{2})\b", clean)
+    if m3:
+        return int(m3.group(2)), int(m3.group(1))
+
+    m4 = re.search(r"\b(20\d{2})[\/\-\.](0?[1-9]|1[0-2])\b", clean)
+    if m4:
+        return int(m4.group(1)), int(m4.group(2))
+
+    # 4. MM/YY or MM-YY (e.g. 10/26, 03/28)
+    m5 = re.search(r"\b(0?[1-9]|1[0-2])[\/\-]([2-3]\d)\b", clean)
+    if m5:
+        return 2000 + int(m5.group(2)), int(m5.group(1))
+
+    return None
+
+
 class FoodAnalysisResult(BaseModel):
     """Comprehensive structured analysis result from Gemini."""
-    product_name: str | None = Field(default=None, description="Identifiable product name, or null.")
+    product_name: str | None = Field(
+        default=None,
+        description="Specific human-identifiable consumer product name (e.g. 'Soan Papdi', 'Honitus Cough Lozenges', 'Dry Fruit Cookies', 'Toned Milk'). Never return generic category words like 'Medicine' or 'Snacks'.",
+    )
     brand: str | None = Field(default=None, description="Brand name or manufacturer, or null.")
     food_category: str | None = Field(
         default=None,
@@ -268,16 +333,21 @@ class FoodAnalysisResult(BaseModel):
         return f"{name}{brand} — Status: {self.analysis_status}"
 
     @classmethod
-    def post_validate(cls, result: FoodAnalysisResult) -> FoodAnalysisResult:
+    def post_validate(
+        cls,
+        result: FoodAnalysisResult,
+        scan_date: datetime.date | None = None,
+    ) -> FoodAnalysisResult:
         """
         Enforce strict programmatic post-validation on analysis results:
         1. Apply deterministic product classification (medicines, dairy, beverages, etc.).
-        2. Resolve relative expiry durations (e.g. Best before 4 months from MFG).
-        3. Validate ISO format YYYY-MM-DD for selected_expiry_date.
-        4. Ensure manufacturing or packed_on dates are NEVER selected as expiry dates.
-        5. If raw text lacks day digits (e.g. 'OCT 2026'), normalized_date must be None.
-        6. If multiple conflicting expiry dates exist, enforce needs_review = True.
+        2. Normalize month-only dates (1st of month, or scan day for current-month MFG).
+        3. Resolve relative expiry durations (e.g. Best before 4 months from MFG).
+        4. Validate ISO format YYYY-MM-DD for selected_expiry_date.
+        5. Ensure manufacturing or packed_on dates are NEVER selected as expiry dates.
+        6. Automatically confirm verified dates with high confidence.
         """
+        import datetime
         import re
 
         # Step A: Deterministic Product Categorization
@@ -292,11 +362,9 @@ class FoodAnalysisResult(BaseModel):
             result.food_category = classifier_res.category
             result.classification_source = classifier_res.source
             result.classification_evidence = classifier_res.evidence
-            # If recognized as medicine, it is definitely a supported trackable item
             if classifier_res.category == CATEGORY_MEDICINE and result.analysis_status == "not_a_food_product":
                 result.analysis_status = "success"
         else:
-            # AI produced a category — enforce negative invariant: medicine is NEVER beverage
             if result.food_category and result.food_category.lower() == "beverage":
                 combined = f"{result.product_name or ''} {result.brand or ''} {all_candidate_text}".lower()
                 is_med, med_ev, _ = ProductClassifier._detect_medicine(combined)
@@ -309,6 +377,45 @@ class FoodAnalysisResult(BaseModel):
                 result.needs_review = True
                 if not result.review_reason:
                     result.review_reason = classifier_res.review_reason
+
+        # Step B0: Month-Only Date Normalization
+        # Rule: Dates with only month & year:
+        # - Manufacturing/packed: if of the current month of the scan, set to scan day;
+        #   otherwise set to 1st of that month.
+        # - Expiry/best-before: set to 1st of that month.
+        # - Automatically confirm with high confidence (>= 0.90).
+        effective_scan_date = getattr(result, "_scan_date", None) or scan_date or datetime.date.today()
+
+        for c in result.date_candidates:
+            needs_day_fill = False
+            y, m = None, None
+
+            if c.normalized_date and re.match(r"^\d{4}-\d{2}$", str(c.normalized_date).strip()):
+                needs_day_fill = True
+                y, m = map(int, str(c.normalized_date).strip().split("-"))
+            elif not c.normalized_date or not re.match(r"^\d{4}-\d{2}-\d{2}$", str(c.normalized_date).strip()):
+                ym = parse_month_year_from_text(c.raw_text)
+                if ym:
+                    needs_day_fill = True
+                    y, m = ym
+
+            if needs_day_fill and y is not None and m is not None:
+                if c.date_type in ("manufacturing", "packed_on"):
+                    if (y, m) == (effective_scan_date.year, effective_scan_date.month):
+                        c.normalized_date = f"{y:04d}-{m:02d}-{effective_scan_date.day:02d}"
+                        c.evidence = f"{c.evidence}; normalized to current scan day ({effective_scan_date.day:02d})".strip("; ")
+                    else:
+                        c.normalized_date = f"{y:04d}-{m:02d}-01"
+                        c.evidence = f"{c.evidence}; normalized to 1st of month".strip("; ")
+                    c.confidence = max(getattr(c, "confidence", 0.0), 0.90)
+                elif c.date_type in ("expiry", "use_by", "best_before"):
+                    c.normalized_date = f"{y:04d}-{m:02d}-01"
+                    c.evidence = f"{c.evidence}; normalized to 1st of month".strip("; ")
+                    c.confidence = max(getattr(c, "confidence", 0.0), 0.90)
+
+        # If selected_expiry_date was provided as YYYY-MM, normalize to YYYY-MM-01
+        if result.selected_expiry_date and re.match(r"^\d{4}-\d{2}$", result.selected_expiry_date.strip()):
+            result.selected_expiry_date = f"{result.selected_expiry_date.strip()}-01"
 
         # Step B: Relative Expiry & Shelf-Life Interpretation
         # Find verified manufacturing / packed_on date if present
@@ -330,7 +437,6 @@ class FoodAnalysisResult(BaseModel):
         )
 
         for rel in relative_matches:
-            # Check if this relative candidate already exists in date_candidates
             existing = [c for c in result.date_candidates if c.raw_text == rel.raw_text]
             if not existing:
                 result.date_candidates.append(
@@ -347,16 +453,33 @@ class FoodAnalysisResult(BaseModel):
                     if rel.normalized_date and not ex.normalized_date:
                         ex.normalized_date = rel.normalized_date
                         ex.evidence = rel.evidence
+                        ex.confidence = max(getattr(ex, "confidence", 0.0), 0.95)
 
-            # If calculated relative date has a valid normalized date and no explicit expiry date is selected
-            if rel.is_calculated and rel.normalized_date and not result.selected_expiry_date:
-                result.selected_expiry_date = rel.normalized_date
+            # If calculated relative date has a valid normalized date, set selected_expiry_date
+            if rel.is_calculated and rel.normalized_date:
+                if not result.selected_expiry_date:
+                    result.selected_expiry_date = rel.normalized_date
+                result.needs_review = False
+                result.review_reason = None
             elif rel.needs_review and not result.selected_expiry_date:
                 result.needs_review = True
                 if rel.review_reason and not result.review_reason:
                     result.review_reason = rel.review_reason
 
-        # Step C: Validate selected_expiry_date format
+        # Step C: Select expiry candidate if selected_expiry_date is still None
+        if not result.selected_expiry_date:
+            exp_cands = [
+                c for c in result.date_candidates
+                if c.date_type in ("expiry", "use_by", "best_before")
+                and c.normalized_date
+                and re.match(r"^\d{4}-\d{2}-\d{2}$", c.normalized_date)
+            ]
+            if len(exp_cands) == 1:
+                result.selected_expiry_date = exp_cands[0].normalized_date
+                result.needs_review = False
+                result.review_reason = None
+
+        # Step D: Validate selected_expiry_date format
         if result.selected_expiry_date:
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", result.selected_expiry_date):
                 result.selected_expiry_date = None
@@ -366,7 +489,7 @@ class FoodAnalysisResult(BaseModel):
                     or "Selected expiry date does not follow strict YYYY-MM-DD format."
                 )
 
-        # Step D: Ensure manufacturing / packed dates are NEVER selected as expiry
+        # Step E: Ensure manufacturing / packed dates are NEVER selected as expiry
         if result.selected_expiry_date:
             mfg_matches = [
                 c for c in result.date_candidates
@@ -383,7 +506,7 @@ class FoodAnalysisResult(BaseModel):
                 result.needs_review = True
                 result.review_reason = "Manufacturing or packing date was identified; not an expiry date."
 
-        # Step E: Check candidate dates format
+        # Step F: Check candidate dates format
         for c in result.date_candidates:
             if c.normalized_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", c.normalized_date):
                 c.normalized_date = None
@@ -393,10 +516,10 @@ class FoodAnalysisResult(BaseModel):
                     or "Date candidate does not have a valid YYYY-MM-DD date."
                 )
 
-        # Step F: If multiple conflicting expiry candidates exist
+        # Step G: If multiple conflicting expiry candidates exist
         exp_dates = {
             c.normalized_date for c in result.date_candidates
-            if c.date_type in ("expiry", "use_by") and c.normalized_date is not None
+            if c.date_type in ("expiry", "use_by", "best_before") and c.normalized_date is not None
         }
         if len(exp_dates) > 1:
             result.needs_review = True
@@ -406,7 +529,7 @@ class FoodAnalysisResult(BaseModel):
                 or f"Multiple conflicting expiry dates found ({', '.join(sorted(exp_dates))})."
             )
 
-        # Step G: If no unambiguous expiry date is selected, review is required
+        # Step H: Final review check
         if result.selected_expiry_date is None:
             result.needs_review = True
             if not result.review_reason:
@@ -424,6 +547,14 @@ class FoodAnalysisResult(BaseModel):
                         result.review_reason = "Only manufacturing or packing date detected; no expiry date visible."
                     else:
                         result.review_reason = "Date candidates detected but require manual confirmation."
+        else:
+            # If valid expiry date is selected, clear obsolete manual review reasons
+            if result.review_reason and any(
+                k in result.review_reason.lower()
+                for k in ["lacks precise full day", "requires manual confirmation", "only manufacturing or packing"]
+            ):
+                result.needs_review = False
+                result.review_reason = None
 
         return result
 
@@ -517,6 +648,7 @@ class GeminiAnalyzer:
         image_path: Path | str,
         on_retry: Callable[[int, int, float, str], None] | None = None,
         ocr_text: str | None = None,
+        scan_date: datetime.date | None = None,
     ) -> FoodAnalysisResult:
         """
         Analyze a captured food package image.
@@ -602,10 +734,10 @@ class GeminiAnalyzer:
 
                     parsed_res: FoodAnalysisResult | None = None
                     if hasattr(response, "parsed") and isinstance(response.parsed, FoodAnalysisResult):
-                        parsed_res = FoodAnalysisResult.post_validate(response.parsed)
+                        parsed_res = FoodAnalysisResult.post_validate(response.parsed, scan_date=scan_date)
                     elif hasattr(response, "text") and response.text:
                         res = FoodAnalysisResult.model_validate_json(response.text)
-                        parsed_res = FoodAnalysisResult.post_validate(res)
+                        parsed_res = FoodAnalysisResult.post_validate(res, scan_date=scan_date)
 
                     if parsed_res:
                         parsed_res.timing_ms = (time.perf_counter() - t0) * 1000.0

@@ -2,9 +2,9 @@ import { useState, type FormEvent } from 'react';
 import { useSuspenseQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import {
-  Flame,
+  Leaf,
+  ScanLine,
   ArrowRight,
-  ArrowUpRight,
   Refrigerator,
   Search,
   CalendarDays,
@@ -12,35 +12,71 @@ import {
   BookOpen,
   Plus,
   LoaderCircle,
+  ChevronRight,
+  MoreVertical,
+  LayoutGrid,
+  List,
+  Pencil,
+  Trash2,
+  Eye,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { toast } from 'sonner';
 import { dashboardQuery, productsQuery, settingsQuery, wasteQuery, service } from '@/services/api';
 import { daysFromToday, localISO } from '@/services/dates';
 import type { Product } from '@/services/types';
-import { resolveFoodImage } from '@/services/food-images';
+import { resolveFoodImage, categoryImages, tomatoesImg } from '@/services/food-images';
 import {
   Empty,
   Footer,
-  PageHero,
   StatCardsRow,
-  InventoryPhotoCard,
   dayLabel,
+  getTimeGreeting,
+  shortCategory,
 } from './common';
+import { formatProductDisplayName } from './product-identity';
 import { ProductDialog, type ProductDialogMode } from './product-dialog';
 
 const tabs = [
-  { label: 'All items', match: () => true },
+  { label: 'All', match: () => true },
   { label: 'Vegetables', match: (p: Product) => p.produce === 'Vegetable' || p.category === 'Fresh Produce' },
   { label: 'Dairy', match: (p: Product) => p.category === 'Dairy & Eggs' },
-  { label: 'Fruit', match: (p: Product) => p.produce === 'Fruit' },
+  { label: 'Fruits', match: (p: Product) => p.produce === 'Fruit' },
   { label: 'Pantry', match: (p: Product) => p.category === 'Pantry Staples' || p.category === 'Grains & Cereals' },
+  {
+    label: 'Others',
+    match: (p: Product) =>
+      p.category !== 'Dairy & Eggs' &&
+      p.category !== 'Fresh Produce' &&
+      p.category !== 'Pantry Staples' &&
+      p.category !== 'Grains & Cereals' &&
+      p.produce !== 'Fruit' &&
+      p.produce !== 'Vegetable',
+  },
 ] as const;
 
 const shortDate = (iso: string) => {
   try {
     return new Date(`${iso}T00:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  } catch {
+    return iso;
+  }
+};
+
+const fullDateWithYear = (iso: string) => {
+  try {
+    return new Date(`${iso}T00:00:00`).toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
   } catch {
     return iso;
   }
@@ -54,8 +90,11 @@ export function Dashboard() {
   const { data: wasteEntries } = useSuspenseQuery(wasteQuery);
 
   const [dialog, setDialog] = useState<ProductDialogMode>();
-  const [tab, setTab] = useState<string>('All items');
+  const [tab, setTab] = useState<string>('All');
   const [query, setQuery] = useState('');
+  const [sortOrder, setSortOrder] = useState<'soonest' | 'latest' | 'name'>('soonest');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+
   const [logWasteOpen, setLogWasteOpen] = useState(false);
   const [wasteForm, setWasteForm] = useState({
     name: '',
@@ -67,16 +106,58 @@ export function Dashboard() {
   const [wasteBusy, setWasteBusy] = useState(false);
   const [wasteError, setWasteError] = useState('');
 
-  const today = new Date();
-  const end = new Date();
-  end.setDate(end.getDate() + settings.alertWindow);
-  const range = `${today.getDate()} – ${end.getDate()} ${end.toLocaleDateString('en-GB', { month: 'long' })}`;
+  const greeting = getTimeGreeting();
 
-  const useFirst = data.expiring.slice(0, 2);
+  // Filter items according to category pill & search query
   const filter = tabs.find((t) => t.label === tab)?.match ?? (() => true);
-  const list = products.filter(
-    (p) => filter(p) && (!query || `${p.name} ${p.brand}`.toLowerCase().includes(query.toLowerCase()))
-  );
+  const list = products
+    .filter((p) => {
+      if (!filter(p)) return false;
+      if (!query) return true;
+      const lower = query.toLowerCase().trim();
+      const display = formatProductDisplayName(p).toLowerCase();
+      const rawName = (p.name || '').toLowerCase();
+      const brand = (p.brand || '').toLowerCase();
+      const cat = (p.category || '').toLowerCase();
+      return display.includes(lower) || rawName.includes(lower) || brand.includes(lower) || cat.includes(lower);
+    })
+    .sort((a, b) => {
+      if (sortOrder === 'name') {
+        return formatProductDisplayName(a).localeCompare(formatProductDisplayName(b));
+      }
+      const dayA = a.verified && a.date ? daysFromToday(a.date) : 9999;
+      const dayB = b.verified && b.date ? daysFromToday(b.date) : 9999;
+      return sortOrder === 'soonest' ? dayA - dayB : dayB - dayA;
+    });
+
+  // Group upcoming expiring items chronologically by date
+  const groupedExpiring = (() => {
+    const sorted = [...data.expiring].sort((a, b) => {
+      const dayA = a.date ? daysFromToday(a.date) : 9999;
+      const dayB = b.date ? daysFromToday(b.date) : 9999;
+      return dayA - dayB;
+    });
+
+    const groups: { dateStr: string; dateLabel: string; items: Product[] }[] = [];
+    const dateMap = new Map<string, Product[]>();
+
+    for (const p of sorted.slice(0, 10)) {
+      if (!p.date) continue;
+      const existing = dateMap.get(p.date) || [];
+      existing.push(p);
+      dateMap.set(p.date, existing);
+    }
+
+    for (const [dateStr, items] of dateMap.entries()) {
+      const d = daysFromToday(dateStr);
+      let dateLabel = fullDateWithYear(dateStr);
+      if (d === 0) dateLabel = `${fullDateWithYear(dateStr)} (Today)`;
+      else if (d === 1) dateLabel = `${fullDateWithYear(dateStr)} (Tomorrow)`;
+      groups.push({ dateStr, dateLabel, items });
+    }
+
+    return groups;
+  })();
 
   async function handleAddWaste(e: FormEvent) {
     e.preventDefault();
@@ -106,200 +187,358 @@ export function Dashboard() {
   }
 
   return (
-    <div className="page overview">
-      <PageHero
-        title="A little care. A lot less waste."
-        description="Keep your kitchen fresh and make every ingredient count."
-        addLink="/scan"
-        addLabel="Add Ingredients"
-      />
+    <div className="page dashboard-page">
+      {/* 1. Main Welcome Hero Banner matching reference image */}
+      <section className="dashboard-banner">
+        <div className="banner-left">
+          <h1 className="banner-title">{greeting}, Ayush!</h1>
+          <p className="banner-subtitle">Fresh food. Less waste. A healthier tomorrow.</p>
 
-      <StatCardsRow />
+          <div className="banner-action-card">
+            <div className="card-header-row">
+              <div className="card-leaf-icon">
+                <Leaf size={18} />
+              </div>
+              <div className="card-header-text">
+                <h3>Keep track of your kitchen</h3>
+                <p>Scan, manage, and never miss an expiry date.</p>
+              </div>
+            </div>
 
-      {/* Use First Section */}
-      <section className="section">
-        <div className="section-head">
-          <div>
-            <h2>
-              <Flame />
-              Use First
-              {data.expiring.length > 0 && (
-                <span className="attention">{data.expiring.length} need attention</span>
-              )}
-            </h2>
-            <p>Good ingredients. Just a little less time.</p>
+            <div className="card-buttons-row">
+              <Button
+                className="banner-primary-btn"
+                onClick={() => setDialog({ type: 'add' })}
+              >
+                <Plus size={16} />
+                <span>Add Ingredient</span>
+              </Button>
+
+              <Button
+                variant="outline"
+                className="banner-secondary-btn add-btn"
+                asChild
+              >
+                <Link to="/scan">
+                  <ScanLine size={16} />
+                  <span>Add Ingredients</span>
+                </Link>
+              </Button>
+            </div>
           </div>
-          <Link to="/timeline" className="text-link">
-            View all expiring <ArrowRight size={16} />
-          </Link>
         </div>
 
-        {useFirst.length ? (
-          <div className="use-first">
-            {useFirst.map((p) => {
-              const d = daysFromToday(p.date);
-              const imgSrc = resolveFoodImage(p);
-              return (
-                <button
-                  key={p.id}
-                  className="food-row"
-                  onClick={() => setDialog({ type: 'view', product: p })}
-                  aria-label={`Open ${p.name}`}
-                >
-                  <img src={imgSrc} alt="" width={126} height={126} loading="lazy" />
-                  <div className="food-row-body">
-                    <div>
-                      <div className="flex items-start justify-between gap-2">
-                        <strong>{p.name}</strong>
-                        <ArrowUpRight size={16} />
-                      </div>
-                      <div className="food-meta">
-                        {p.quantity && <span>{p.quantity}</span>}
-                        {p.quantity && <span>·</span>}
-                        <span className="inline-flex items-center gap-1">
-                          <Refrigerator size={12} />
-                          {p.storage || 'Fridge'}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="food-row-foot">
-                      <span className="use-badge">• {dayLabel(d)}</span>
-                      <span className="food-date">{shortDate(p.date)}</span>
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <Empty title="Nothing needs using up" message="No confirmed dates fall within your alert window." />
-        )}
+        <div className="banner-right">
+          <img
+            src="/banner-produce.png"
+            alt="Fresh produce and vegetables"
+            className="banner-produce-image"
+          />
+        </div>
       </section>
 
-      {/* Lower Two-Column Section: Inventory & Upcoming Expiry */}
-      <div className="lower">
-        <section>
-          <div className="section-head">
-            <h2>
-              Your inventory <span className="muted-count">({data.total})</span>
-            </h2>
-            <Link to="/inventory" search={{ q: '' }} className="text-link">
-              View inventory <ArrowRight size={16} />
+      {/* 2. Original Four Statistics Blocks (Mandatory Preserved Metrics) */}
+      <StatCardsRow />
+
+      {/* 3. Split Layout: Inventory on Left, Upcoming Expiry on Right */}
+      <div className="dashboard-grid">
+        {/* Left Column: Your Inventory */}
+        <section className="inventory-column">
+          <div className="inventory-header">
+            <div className="flex items-baseline gap-2">
+              <h2 className="inventory-title">Your Inventory</h2>
+              <span className="inventory-count">({products.length} items)</span>
+            </div>
+            <Link to="/inventory" search={{ q: '' }} className="view-all-link">
+              <span>View all</span>
+              <ArrowRight size={14} />
             </Link>
           </div>
 
-          <div className="inv-toolbar">
-            <div role="tablist" aria-label="Filter by type" className="tabs">
+          {/* Filter Pills and Toolbar Controls */}
+          <div className="inventory-toolbar-row">
+            <div role="tablist" aria-label="Filter by category" className="category-pills">
               {tabs.map((t) => (
                 <button
                   key={t.label}
                   role="tab"
                   aria-selected={tab === t.label}
-                  className={tab === t.label ? 'active' : ''}
+                  className={`category-pill ${tab === t.label ? 'active' : ''}`}
                   onClick={() => setTab(t.label)}
                 >
                   {t.label}
                 </button>
               ))}
             </div>
-            <div className="search-input small">
-              <Search />
-              <input
-                aria-label="Search ingredients"
-                placeholder="Search ingredients"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-              />
+
+            <div className="toolbar-actions">
+              <select
+                className="sort-dropdown"
+                aria-label="Sort inventory"
+                value={sortOrder}
+                onChange={(e) => setSortOrder(e.target.value as any)}
+              >
+                <option value="soonest">Sort: Expiry (Soonest)</option>
+                <option value="latest">Sort: Expiry (Latest)</option>
+                <option value="name">Sort: Name (A-Z)</option>
+              </select>
+
+              <div className="view-toggle">
+                <button
+                  className={`toggle-btn ${viewMode === 'grid' ? 'active' : ''}`}
+                  onClick={() => setViewMode('grid')}
+                  aria-label="Grid layout"
+                  title="Grid layout"
+                >
+                  <LayoutGrid size={15} />
+                </button>
+                <button
+                  className={`toggle-btn ${viewMode === 'list' ? 'active' : ''}`}
+                  onClick={() => setViewMode('list')}
+                  aria-label="List layout"
+                  title="List layout"
+                >
+                  <List size={15} />
+                </button>
+              </div>
             </div>
           </div>
 
+          {/* Product Cards Grid / List */}
           {list.length ? (
-            <div className="inv-grid">
-              {list.slice(0, 6).map((p) => (
-                <InventoryPhotoCard
-                  key={p.id}
-                  product={p}
-                  onClick={() => setDialog({ type: 'view', product: p })}
-                />
-              ))}
+            <div className={viewMode === 'grid' ? 'product-cards-grid' : 'product-cards-list'}>
+              {list.slice(0, 6).map((p) => {
+                const d = p.date ? daysFromToday(p.date) : 9999;
+                const isUrgent = d <= 2 && d >= 0;
+                const isExpired = d < 0;
+                const imgSrc = resolveFoodImage(p);
+                const fallbackSrc = categoryImages[p.category || 'Pantry Staples'] || tomatoesImg;
+                const displayName = formatProductDisplayName(p);
+                const formattedDate = p.date ? shortDate(p.date) : '';
+
+                return (
+                  <div
+                    key={p.id}
+                    className="product-card"
+                    onClick={() => setDialog({ type: 'view', product: p })}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setDialog({ type: 'view', product: p });
+                      }
+                    }}
+                  >
+                    {/* Card Photo & Floating Badge */}
+                    <div className="product-card-img-wrap">
+                      <img
+                        src={imgSrc}
+                        alt=""
+                        className="product-card-img"
+                        loading="lazy"
+                        onError={(e) => {
+                          const target = e.currentTarget;
+                          if (target.src !== fallbackSrc && !target.src.endsWith(fallbackSrc)) {
+                            target.src = fallbackSrc;
+                          }
+                        }}
+                      />
+                      <div className="product-card-floating-badge">
+                        {isExpired ? (
+                          <span className="badge-pill expired">
+                            <span className="badge-dot" />
+                            Expired
+                          </span>
+                        ) : isUrgent ? (
+                          <span className="badge-pill warning">
+                            <span className="badge-dot" />
+                            Expiring Soon
+                          </span>
+                        ) : (
+                          <span className="badge-pill fresh">
+                            <span className="badge-dot" />
+                            Fresh
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Card Body */}
+                    <div className="product-card-body">
+                      <div className="product-title-row">
+                        <strong className="product-name" title={displayName}>
+                          {displayName}
+                        </strong>
+
+                        {/* Three-dots menu */}
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            className="three-dots-btn"
+                            aria-label={`Options for ${displayName}`}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <MoreVertical size={16} />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-36">
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDialog({ type: 'view', product: p });
+                              }}
+                            >
+                              <Eye size={14} className="mr-2" />
+                              View details
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDialog({ type: 'edit', product: p });
+                              }}
+                            >
+                              <Pencil size={14} className="mr-2" />
+                              Edit
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDialog({ type: 'delete', product: p });
+                              }}
+                            >
+                              <Trash2 size={14} className="mr-2" />
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+
+                      <div className="product-meta-row">
+                        {p.quantity && <span>{p.quantity}</span>}
+                        {p.quantity && <span className="meta-sep">•</span>}
+                        <span className="inline-flex items-center gap-1">
+                          <Refrigerator size={12} className="text-muted-foreground" />
+                          {p.storage || 'Fridge'}
+                        </span>
+                      </div>
+
+                      <div className="product-expiry-status">
+                        {p.date && p.verified ? (
+                          <span className={`expiry-pill ${isUrgent ? 'warning' : isExpired ? 'expired' : 'safe'}`}>
+                            <span className="dot" />
+                            {dayLabel(d)}
+                          </span>
+                        ) : (
+                          <span className="expiry-pill neutral">
+                            <span className="dot" />
+                            No expiry date
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="product-footer-note">
+                        {p.verified && p.date
+                          ? `Confirmed expiry • ${formattedDate}`
+                          : 'Expiry not recorded'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
-            <Empty title="No matching ingredients" message="Try another tab or search term." />
+            <Empty title="No matching ingredients" message="Try another category or search term." />
           )}
         </section>
 
-        {/* Right column: Upcoming expiry */}
-        <aside className="upcoming">
-          <h2>
-            <CalendarDays />
-            Upcoming expiry
-          </h2>
-          <div className="upcoming-sub">
-            <span>{range}</span>
-            <span className="inline-flex items-center gap-1">
-              <CircleCheck size={14} className="text-emerald-700" />
-              Confirmed dates
-            </span>
+        {/* Right Column: Upcoming Expiry Panel */}
+        <aside className="upcoming-expiry-panel">
+          <div className="panel-header-row">
+            <div className="flex items-center gap-2">
+              <CalendarDays size={18} className="text-[#1E684A]" />
+              <h2 className="panel-title">Upcoming Expiry</h2>
+            </div>
+            <Link to="/timeline" className="view-all-link">
+              <span>View all</span>
+              <ArrowRight size={14} />
+            </Link>
           </div>
 
-          {data.expiring.length ? (
-            <ol className="timeline">
-              {data.expiring.slice(0, 4).map((p) => {
-                const d = daysFromToday(p.date);
-                const isUrgent = d <= 1;
-                const label =
-                  d === 0
-                    ? 'Today'
-                    : d === 1
-                    ? 'Tomorrow'
-                    : new Date(`${p.date}T00:00:00`).toLocaleDateString('en-GB', { weekday: 'long' });
-                const imgSrc = resolveFoodImage(p);
+          {groupedExpiring.length ? (
+            <div className="expiry-date-groups">
+              {groupedExpiring.map((group) => (
+                <div key={group.dateStr} className="date-group-block">
+                  <div className="date-group-title">{group.dateLabel}</div>
+                  <div className="date-group-items">
+                    {group.items.map((p) => {
+                      const d = p.date ? daysFromToday(p.date) : 9999;
+                      const dotClass = d <= 1 ? 'dot-urgent' : d <= 3 ? 'dot-warning' : 'dot-safe';
+                      const imgSrc = resolveFoodImage(p);
+                      const fallbackSrc = categoryImages[p.category || 'Pantry Staples'] || tomatoesImg;
+                      const displayName = formatProductDisplayName(p);
 
-                return (
-                  <li key={p.id} className={isUrgent ? 'tomorrow' : ''}>
-                    <div className="tl-head">
-                      <b>{label}</b>
-                      <span>{shortDate(p.date)}</span>
-                    </div>
-                    <button
-                      className="tl-item"
-                      onClick={() => setDialog({ type: 'view', product: p })}
-                      aria-label={`Open ${p.name}`}
-                    >
-                      <img src={imgSrc} alt="" width={40} height={40} loading="lazy" />
-                      <div className="min-w-0 flex-1 text-left">
-                        <strong>{p.name}</strong>
-                        <div className="food-meta">
-                          {[p.quantity, p.storage || 'Fridge'].filter(Boolean).join(' · ')}
+                      return (
+                        <div
+                          key={p.id}
+                          className="expiry-item-row"
+                          onClick={() => setDialog({ type: 'view', product: p })}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              setDialog({ type: 'view', product: p });
+                            }
+                          }}
+                        >
+                          <span className={`status-bullet ${dotClass}`} />
+                          <img
+                            src={imgSrc}
+                            alt=""
+                            className="expiry-item-thumb"
+                            loading="lazy"
+                            onError={(e) => {
+                              const target = e.currentTarget;
+                              if (target.src !== fallbackSrc && !target.src.endsWith(fallbackSrc)) {
+                                target.src = fallbackSrc;
+                              }
+                            }}
+                          />
+                          <div className="expiry-item-info">
+                            <strong className="item-name">{displayName}</strong>
+                            <div className="item-meta">
+                              {[p.quantity, p.storage || 'Fridge'].filter(Boolean).join(' • ')}
+                            </div>
+                          </div>
+                          <ChevronRight size={16} className="item-arrow" />
                         </div>
-                      </div>
-                      <ArrowRight size={16} />
-                    </button>
-                  </li>
-                );
-              })}
-            </ol>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
           ) : (
-            <p className="text-xs text-muted-foreground mt-4">
+            <p className="text-xs text-muted-foreground py-8 text-center">
               No confirmed dates in the next {settings.alertWindow} days.
             </p>
           )}
         </aside>
       </div>
 
-      {/* Waste Journal Section (Screenshot 2) */}
-      <section className="waste-section">
-        <div className="section-head">
+      {/* 4. Preserved Waste Journal Section */}
+      <section className="waste-journal-section">
+        <div className="section-header-row">
           <div>
-            <h2>
-              <BookOpen />
+            <h2 className="section-title flex items-center gap-2">
+              <BookOpen size={20} className="text-[#1E684A]" />
               Waste journal
             </h2>
-            <p>Small reflections for a more mindful kitchen.</p>
+            <p className="section-subtitle">Small reflections for a more mindful kitchen.</p>
           </div>
           <div className="flex items-center gap-4">
             <span className="text-sm font-medium text-foreground">
-              This month <b className="font-bold">₹{data.wasteThisMonth}</b>
+              This month <b className="font-bold text-[#1E684A]">₹{data.wasteThisMonth}</b>
             </span>
             <Button size="sm" variant="outline" className="gap-2" onClick={() => setLogWasteOpen(true)}>
               <Plus size={15} />
@@ -308,7 +547,7 @@ export function Dashboard() {
           </div>
         </div>
 
-        <div className="waste-card">
+        <div className="waste-table-card">
           <table className="waste-table">
             <thead>
               <tr>
@@ -350,6 +589,7 @@ export function Dashboard() {
 
       <Footer />
 
+      {/* Product View / Edit / Add Dialog */}
       {dialog && (
         <ProductDialog
           mode={dialog}

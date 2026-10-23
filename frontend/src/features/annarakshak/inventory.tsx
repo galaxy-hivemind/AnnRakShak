@@ -12,6 +12,7 @@ import {
   StatCardsRow,
   InventoryPhotoCard,
 } from './common';
+import { formatProductDisplayName } from './product-identity';
 import { ProductDialog, type ProductDialogMode } from './product-dialog';
 
 const tabs = [
@@ -46,9 +47,16 @@ export function Inventory() {
 
   const filter = tabs.find((t) => t.label === tab)?.match ?? (() => true);
   const rows = data
-    .filter(
-      (p) => filter(p) && (!query || `${p.name} ${p.brand}`.toLowerCase().includes(query.toLowerCase()))
-    )
+    .filter((p) => {
+      if (!filter(p)) return false;
+      if (!query) return true;
+      const lower = query.toLowerCase().trim();
+      const display = formatProductDisplayName(p).toLowerCase();
+      const rawName = (p.name || '').toLowerCase();
+      const brand = (p.brand || '').toLowerCase();
+      const cat = (p.category || '').toLowerCase();
+      return display.includes(lower) || rawName.includes(lower) || brand.includes(lower) || cat.includes(lower);
+    })
     .sort((a, b) => {
       const dayA = a.verified && a.date ? daysFromToday(a.date) : Infinity;
       const dayB = b.verified && b.date ? daysFromToday(b.date) : Infinity;
@@ -58,8 +66,8 @@ export function Inventory() {
   return (
     <div className="page inventory-page">
       <PageHero
-        title="Everything in your kitchen."
-        description="Know what you have, and what needs your attention."
+        title="Kitchen Inventory"
+        description="All items in stock, tracked with verified expiration dates."
         addLink="/scan"
         addLabel="Add Ingredients"
       />

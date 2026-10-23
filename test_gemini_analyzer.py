@@ -259,8 +259,8 @@ class TestStrictDateInterpretationRules(unittest.TestCase):
         self.assertTrue(result.needs_review)
         self.assertIn("manufacturing", (result.review_reason or "").lower())
 
-    def test_incomplete_date_month_year_only_no_inferred_day(self) -> None:
-        """If label has only month/year (e.g. 2026-10), day must not be inferred."""
+    def test_incomplete_date_month_year_only_normalized_to_first_of_month(self) -> None:
+        """If label has only month/year (e.g. 2026-10), day must default to 01 and auto-confirm."""
         mock_res = FoodAnalysisResult(
             product_name="Instant Noodles",
             brand="Maggi",
@@ -274,7 +274,7 @@ class TestStrictDateInterpretationRules(unittest.TestCase):
                     evidence="Only month and year printed",
                 )
             ],
-            selected_expiry_date="2026-10",  # Invalid day-less date
+            selected_expiry_date="2026-10",  # Raw month-only
             analysis_status="success",
             needs_review=False,
             review_reason=None,
@@ -288,9 +288,10 @@ class TestStrictDateInterpretationRules(unittest.TestCase):
         analyzer = GeminiAnalyzer(api_key="mock_key", client=mock_client)
         result = analyzer.analyze_image(self.test_img)
 
-        self.assertIsNone(result.selected_expiry_date)
-        self.assertTrue(result.needs_review)
-        self.assertIsNone(result.date_candidates[0].normalized_date)
+        # In the new specification, month-only expiry date is set to 1st of month and auto-confirmed
+        self.assertEqual(result.selected_expiry_date, "2026-10-01")
+        self.assertFalse(result.needs_review)
+        self.assertEqual(result.date_candidates[0].normalized_date, "2026-10-01")
 
     def test_ambiguous_conflicting_expiry_dates_require_review(self) -> None:
         """Multiple conflicting expiry candidates must trigger needs_review."""

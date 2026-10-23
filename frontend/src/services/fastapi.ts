@@ -15,6 +15,7 @@ import {
 } from './types';
 import { isExactDate, relativeDate, daysFromToday, productStatus } from './dates';
 import { resolveFoodImage } from './food-images';
+import { formatProductDisplayName } from '../features/annarakshak/product-identity';
 
 // Backend Response Schemas
 interface BackendProduct {
@@ -39,6 +40,7 @@ interface BackendProduct {
   image_metadata?: Record<string, any> | null;
   image_status?: string | null;
   image_source_type?: string | null;
+  display_name?: string | null;
 }
 
 interface BackendDateCandidate {
@@ -756,9 +758,18 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       }
     }
 
+    const humanName = formatProductDisplayName({
+      name: bp.display_name || bp.product_name,
+      brand: bp.brand,
+      category: cat,
+      displayName: bp.display_name,
+      notes: bp.notes || undefined,
+    });
+
     return {
       id: `PR-${bp.id}`,
       name: bp.product_name,
+      displayName: humanName,
       brand: bp.brand || '',
       category: cat,
       quantity,
@@ -786,6 +797,7 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       imageStatus: bp.image_status || undefined,
       imageSourceType: bp.image_source_type || undefined,
       imageMetadata: bp.image_metadata || undefined,
+      displayName: bp.display_name || undefined,
     };
   }
 
@@ -814,6 +826,13 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
         : `/api/scans/${bs.id}/image?index=${idx + 1}`
     );
 
+    const scanHumanName = formatProductDisplayName({
+      name: bs.product_name,
+      brand: bs.brand,
+      category: cat || undefined,
+      notes: bs.review_reason || (bs.date_candidates?.map((c) => c.raw_text).join(' ')),
+    });
+
     return {
       id: `SC-${bs.id}`,
       timestamp: bs.timestamp,
@@ -823,8 +842,9 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
             : this.baseUrl
             ? `${this.baseUrl}/api/scans/${bs.id}/image`
             : `/api/scans/${bs.id}/image`)
-        : resolveFoodImage({ name: bs.product_name || undefined, category: cat || 'Pantry Staples' }),
-      name: bs.product_name || 'Unidentified Item',
+        : resolveFoodImage({ name: scanHumanName || undefined, category: cat || 'Pantry Staples' }),
+      name: bs.product_name || '',
+      displayName: scanHumanName,
       brand: bs.brand || '',
       category: cat,
       quantity,

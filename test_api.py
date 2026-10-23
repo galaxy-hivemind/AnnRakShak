@@ -434,8 +434,8 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(data["selected_expiry_date"], "2027-04-15")
         self.assertEqual(len(data["date_candidates"]), 1)
 
-        # Check analyzer was called with image path
-        self.mock_analyzer.analyze_image.assert_called_once_with(str(test_img_path))
+        # Check analyzer was called with image path and scan_date
+        self.mock_analyzer.analyze_image.assert_called_once_with(str(test_img_path), scan_date=datetime.date.today())
 
     def test_reanalyze_scan_missing_image_file(self):
         scan_id = self.db.record_scan(

@@ -20,6 +20,7 @@ export function Scan() {
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [isSupplementary, setIsSupplementary] = useState(false);
+  const [isSubsequentScan, setIsSubsequentScan] = useState(false);
   const pendingOverrides = useRef<{
     name?: string;
     brand?: string;
@@ -31,6 +32,7 @@ export function Scan() {
   const streamRef = useRef<MediaStream | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const sequence = useRef(0);
+  const completedScansCount = useRef(0);
   const qc = useQueryClient();
 
   function stopCamera() {
@@ -169,6 +171,8 @@ export function Scan() {
       return;
     }
 
+    const isSubsequent = completedScansCount.current > 0;
+    setIsSubsequentScan(isSubsequent);
     setScan(undefined);
     setCapturedImage(imageData);
     setState('Analyzing');
@@ -182,8 +186,11 @@ export function Scan() {
         setError(result.reason || 'Analysis could not extract readable date evidence. Retry analysis or edit details manually.');
       } else {
         setState('Complete');
+        completedScansCount.current++;
       }
-      await qc.invalidateQueries();
+      if (result.productId || result.reviewStatus === 'Confirmed') {
+        await qc.invalidateQueries();
+      }
     } catch (err: unknown) {
       if (run !== sequence.current) return;
       setState('Analysis Failed');
@@ -255,6 +262,7 @@ export function Scan() {
   }
 
   function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    if (busy || isSubmitting.current) return;
     const file = e.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith('image/')) {
@@ -433,6 +441,7 @@ export function Scan() {
             <AnalysisPanel
               key={`${scan.id}-${scan.supplementaryImages?.length || 0}`}
               scan={scan}
+              isSubsequentScan={isSubsequentScan}
               onCaptureMoreInfo={handleCaptureMoreInfo}
               onChange={(s) => {
                 setScan(s);

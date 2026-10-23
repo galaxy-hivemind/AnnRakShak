@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, X, AlertCircle, Camera } from 'lucide-react';
+import { Check, RotateCcw, LoaderCircle, CircleHelp, Calendar, Plus, Minus, X, AlertCircle, Camera } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -54,13 +54,151 @@ export function isScanFullyResolved(scan: ScanRecord): boolean {
   return true;
 }
 
+export function evaluateAutoAcceptance(scan: ScanRecord): {
+  isEligible: boolean;
+  primaryCandidateId?: string;
+  reason?: string;
+} {
+  if (scan.analysisStatus !== 'Successful') {
+    return { isEligible: false, reason: 'Analysis was not successful' };
+  }
+  const cleanName = (scan.name || '').trim();
+  if (
+    cleanName.length < 2 ||
+    ['unknown', 'unknown item', 'unidentified item', 'product', 'item'].includes(cleanName.toLowerCase())
+  ) {
+    return { isEligible: false, reason: 'Missing or generic product identity' };
+  }
+
+  const candidates = scan.candidates || [];
+  const expiryCandidates = candidates.filter((c) =>
+    ['Expiry', 'Use By', 'Best Before'].includes(c.dateType)
+  );
+
+  if (expiryCandidates.length === 0) {
+    return { isEligible: false, reason: 'No expiry date detected on packaging' };
+  }
+
+  // Check for conflicting expiry dates
+  const validDates = Array.from(new Set(expiryCandidates.map((c) => c.date).filter(Boolean)));
+  if (validDates.length > 1) {
+    return { isEligible: false, reason: 'Conflicting expiry dates detected' };
+  }
+
+  // Exact day date check
+  const primaryCandidate = expiryCandidates.find((c) => isExactDate(c.date) && c.precision === 'day');
+  if (!primaryCandidate) {
+    return { isEligible: false, reason: 'Expiry date lacks exact day format' };
+  }
+
+  // Confidence check (established threshold >= 0.80)
+  const candidateConf = primaryCandidate.confidence !== undefined ? primaryCandidate.confidence : scan.confidenceScore;
+  if (candidateConf === undefined || candidateConf < 0.80) {
+    return { isEligible: false, reason: 'Confidence score below established threshold (0.80)' };
+  }
+
+  // Timeline consistency: Expiry must not precede Manufacturing
+  const mfgCandidates = candidates.filter((c) =>
+    ['Manufacturing', 'Packed On'].includes(c.dateType) && isExactDate(c.date)
+  );
+  for (const mfg of mfgCandidates) {
+    if (primaryCandidate.date < mfg.date) {
+      return { isEligible: false, reason: 'Expiry date is earlier than manufacturing date' };
+    }
+  }
+
+  // Explicit safety/review flags from model or post-validation
+  const reviewReason = (scan.reason || scan.decisionReason || '').toLowerCase();
+  if (
+    reviewReason.includes('conflict') ||
+    reviewReason.includes('ambiguous') ||
+    reviewReason.includes('unreadable') ||
+    reviewReason.includes('multiple printed dates')
+  ) {
+    return { isEligible: false, reason: 'Ambiguous or conflicting evidence flagged' };
+  }
+
+  return {
+    isEligible: true,
+    primaryCandidateId: primaryCandidate.id,
+  };
+}
+
+export function parsePersistedQuantity(raw: string | undefined | null): {
+  itemCount: number;
+  basePackaging: string;
+} {
+  if (!raw) {
+    return { itemCount: 1, basePackaging: '' };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { itemCount: 1, basePackaging: '' };
+  }
+
+  // Exact composite format: "<count> units (<base>)" or "<count> unit (<base>)"
+  const compositeMatch = trimmed.match(/^(\d+)\s*units?\s*\((.+)\)$/i);
+  if (compositeMatch) {
+    const parsedCount = parseInt(compositeMatch[1], 10);
+    const count = parsedCount >= 1 ? parsedCount : 1;
+    let base = compositeMatch[2].trim();
+    while (true) {
+      const innerMatch = base.match(/^(\d+)\s*units?\s*\((.+)\)$/i);
+      if (innerMatch) {
+        base = innerMatch[2].trim();
+      } else {
+        break;
+      }
+    }
+    if (/^\d+\s*units?$/i.test(base)) {
+      base = '';
+    }
+    return {
+      itemCount: count,
+      basePackaging: base,
+    };
+  }
+
+  // Exact standalone units format: "<count> units" or "<count> unit"
+  const standaloneUnitsMatch = trimmed.match(/^(\d+)\s*units?$/i);
+  if (standaloneUnitsMatch) {
+    const parsedCount = parseInt(standaloneUnitsMatch[1], 10);
+    return {
+      itemCount: parsedCount >= 1 ? parsedCount : 1,
+      basePackaging: '',
+    };
+  }
+
+  // Ordinary packaging description (e.g. "500 ml", "12 tablets", "6 eggs", "Box (large)")
+  return {
+    itemCount: 1,
+    basePackaging: trimmed,
+  };
+}
+
+export function computePersistedQuantity(itemCount: number, baseQuantity: string): string {
+  const { basePackaging } = parsePersistedQuantity(baseQuantity);
+  const cleanBase = basePackaging.trim();
+  const safeCount = Math.max(1, Math.floor(itemCount || 1));
+
+  if (safeCount <= 1) {
+    return cleanBase;
+  }
+  if (cleanBase) {
+    return `${safeCount} units (${cleanBase})`;
+  }
+  return `${safeCount} units`;
+}
+
 export function AnalysisPanel({
   scan,
+  isSubsequentScan = false,
   onChange,
   onConfirmed,
   onCaptureMoreInfo,
 }: {
   scan: ScanRecord;
+  isSubsequentScan?: boolean;
   onChange: (s: ScanRecord) => void;
   onConfirmed?: () => void;
   onCaptureMoreInfo?: (currentEdits: {
@@ -70,11 +208,14 @@ export function AnalysisPanel({
     quantity?: string;
   }) => void;
 }) {
+  const initialQtyParsed = parsePersistedQuantity(scan.quantity);
+
   // Inline editable fields
   const [productName, setProductName] = useState(scan.name || '');
   const [brand, setBrand] = useState(scan.brand || '');
   const [category, setCategory] = useState<Category | ''>(scan.category || '');
-  const [quantity, setQuantity] = useState(scan.quantity || '');
+  const [quantity, setQuantity] = useState(initialQtyParsed.basePackaging);
+  const [itemCount, setItemCount] = useState<number>(initialQtyParsed.itemCount);
 
   // Field reveal state for missing attributes
   const [revealedFields, setRevealedFields] = useState<Record<'brand' | 'category' | 'quantity', boolean>>({
@@ -87,18 +228,41 @@ export function AnalysisPanel({
   const [candidates, setCandidates] = useState<DateCandidate[]>(scan.candidates || []);
   const [editingDateId, setEditingDateId] = useState<string | null>(null);
 
-  // Sync state if scan updates (e.g. from supplementary scan consolidation)
+  const autoEval = evaluateAutoAcceptance(scan);
+  const isAutoAccepted = Boolean(isSubsequentScan && autoEval.isEligible && scan.reviewStatus !== 'Confirmed');
+  const userManuallyToggled = useRef<Record<string, boolean>>({});
+
+  // Sync state if scan updates (e.g. from supplementary scan consolidation or rescan)
   useEffect(() => {
     setProductName(scan.name || '');
     setBrand(scan.brand || '');
     setCategory(scan.category || '');
-    setQuantity(scan.quantity || '');
+    const parsedQty = parsePersistedQuantity(scan.quantity);
+    setQuantity(parsedQty.basePackaging);
+    setItemCount(parsedQty.itemCount);
     setCandidates(scan.candidates || []);
-  }, [scan.id, scan.name, scan.brand, scan.category, scan.quantity, scan.candidates]);
+    userManuallyToggled.current = {};
+    const evalResult = evaluateAutoAcceptance(scan);
+    const shouldAccept = Boolean(isSubsequentScan && evalResult.isEligible && scan.reviewStatus !== 'Confirmed');
+    if (shouldAccept && evalResult.primaryCandidateId) {
+      setVerifiedCandidates({ [evalResult.primaryCandidateId]: true });
+      setConfirmed(true);
+    } else {
+      setVerifiedCandidates({});
+      setConfirmed(false);
+    }
+  }, [scan.id, isSubsequentScan]);
 
   // Verification & Confirmation state
-  const [verifiedCandidates, setVerifiedCandidates] = useState<Record<string, boolean>>({});
-  const [confirmed, setConfirmed] = useState(false);
+  const [verifiedCandidates, setVerifiedCandidates] = useState<Record<string, boolean>>(() => {
+    if (isAutoAccepted && autoEval.primaryCandidateId) {
+      return { [autoEval.primaryCandidateId]: true };
+    }
+    return {};
+  });
+  const [confirmed, setConfirmed] = useState<boolean>(() => {
+    return isAutoAccepted;
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -118,10 +282,40 @@ export function AnalysisPanel({
   const isVerificationComplete = hasVerified && !hasMonthOnly;
 
   const toggleCandidate = (id: string) => {
+    userManuallyToggled.current[id] = true;
     setVerifiedCandidates((prev) => ({
       ...prev,
       [id]: !prev[id],
     }));
+  };
+
+  const handleItemCountChange = (newCount: number) => {
+    if (newCount < 1) return;
+    const whole = Math.floor(newCount);
+    setItemCount(whole);
+    if (hasLinkedProduct) {
+      const computed = computePersistedQuantity(whole, quantity);
+      triggerDebouncedSave({ quantity: computed });
+    }
+  };
+
+  const handleItemCountInputChange = (val: string) => {
+    if (val === '') {
+      setItemCount(1);
+      if (hasLinkedProduct) {
+        const computed = computePersistedQuantity(1, quantity);
+        triggerDebouncedSave({ quantity: computed });
+      }
+      return;
+    }
+    if (!/^\d+$/.test(val)) return;
+    const parsed = parseInt(val, 10);
+    if (parsed < 1) return;
+    setItemCount(parsed);
+    if (hasLinkedProduct) {
+      const computed = computePersistedQuantity(parsed, quantity);
+      triggerDebouncedSave({ quantity: computed });
+    }
   };
 
   async function persistSavedProductEdits(overrides?: {
@@ -138,7 +332,7 @@ export function AnalysisPanel({
       const nameVal = overrides?.name !== undefined ? overrides.name : productName;
       const brandVal = overrides?.brand !== undefined ? overrides.brand : brand;
       const categoryVal = overrides?.category !== undefined ? overrides.category : category;
-      const quantityVal = overrides?.quantity !== undefined ? overrides.quantity : quantity;
+      const quantityVal = overrides?.quantity !== undefined ? overrides.quantity : computePersistedQuantity(itemCount, quantity);
       const cList = overrides?.candidates !== undefined ? overrides.candidates : candidates;
 
       const expCand = cList.find((c) => ['Expiry', 'Use By', 'Best Before'].includes(c.dateType) && isExactDate(c.date));
@@ -242,11 +436,12 @@ export function AnalysisPanel({
     setError('');
     try {
       const verifiedIds = verifiedList.map((c) => c.id);
+      const finalQuantity = computePersistedQuantity(itemCount, quantity);
       const product = await service.confirmDate(scan.id, verifiedIds, {
         name: productName,
         brand,
         category,
-        quantity,
+        quantity: finalQuantity,
         candidates,
       });
       const updated = await service.getScanById(scan.id);
@@ -274,7 +469,9 @@ export function AnalysisPanel({
       setProductName(result.name || '');
       setBrand(result.brand || '');
       setCategory(result.category || '');
-      setQuantity(result.quantity || '');
+      const parsedQty = parsePersistedQuantity(result.quantity);
+      setQuantity(parsedQty.basePackaging);
+      setItemCount(parsedQty.itemCount);
       setCandidates(result.candidates || []);
       setVerifiedCandidates({});
       setConfirmed(false);
@@ -300,7 +497,7 @@ export function AnalysisPanel({
         name: productName,
         brand,
         category,
-        quantity,
+        quantity: computePersistedQuantity(itemCount, quantity),
       });
     } else {
       suppInputRef.current?.click();
@@ -403,6 +600,16 @@ export function AnalysisPanel({
             {scan.decisionReason || 'Product is stored in your kitchen inventory. Edits made below update your inventory item directly.'}
           </p>
         </div>
+      ) : isAutoAccepted ? (
+        <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg text-xs space-y-1" id="auto-acceptance-banner">
+          <div className="font-semibold text-primary flex items-center gap-1.5">
+            <Check size={14} />
+            <span>High-confidence date accepted · Review details & save</span>
+          </div>
+          <p className="text-muted-foreground">
+            Model extracted an exact expiry date with high confidence. You can inspect or edit dates and quantity below, then save directly to inventory.
+          </p>
+        </div>
       ) : (
         <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs space-y-1">
           <div className="font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
@@ -427,6 +634,61 @@ export function AnalysisPanel({
           </button>
         </div>
       )}
+
+      {/* Multi-Item Quantity Stepper Control */}
+      <div className="p-3 bg-muted/40 border border-border rounded-lg space-y-2" id="quantity-stepper-container">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <label htmlFor="quantity-counter-input" className="text-xs font-semibold text-foreground block">
+              Items to add
+            </label>
+            <span className="text-[11px] text-muted-foreground">
+              {itemCount === 1 ? 'Adding 1 item' : `Adding ${itemCount} identical items`}
+              {quantity.trim() ? ` · ${quantity.trim()} each` : ''}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5" role="group">
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              id="decrease-quantity-btn"
+              aria-label="Decrease units"
+              disabled={itemCount <= 1}
+              onClick={() => handleItemCountChange(itemCount - 1)}
+              className="h-8 w-8 rounded-md"
+            >
+              <Minus size={14} />
+            </Button>
+            <input
+              type="number"
+              id="quantity-counter-input"
+              aria-label="Units count"
+              min={1}
+              step={1}
+              value={itemCount}
+              onChange={(e) => handleItemCountInputChange(e.target.value)}
+              className="h-8 w-14 text-center text-sm font-semibold border rounded-md bg-background"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              id="increase-quantity-btn"
+              aria-label="Increase units"
+              onClick={() => handleItemCountChange(itemCount + 1)}
+              className="h-8 w-8 rounded-md"
+            >
+              <Plus size={14} />
+            </Button>
+          </div>
+        </div>
+        {itemCount > 1 && (
+          <p className="text-[11px] text-muted-foreground bg-muted/60 p-2 rounded border border-border/50">
+            ℹ️ Shortcut assumes all {itemCount} units share the same product details and dates. For items with differing expiry dates, scan packages individually.
+          </p>
+        )}
+      </div>
 
       {/* Direct Inline Product Metadata Editor */}
       <div className="p-3 bg-muted/30 border border-border rounded-lg space-y-3">
@@ -548,11 +810,18 @@ export function AnalysisPanel({
                 className="text-xs"
                 value={quantity}
                 onChange={(e) => {
-                  setQuantity(e.target.value);
-                  triggerDebouncedSave({ quantity: e.target.value });
+                  const newBase = e.target.value;
+                  setQuantity(newBase);
+                  if (hasLinkedProduct) {
+                    const computed = computePersistedQuantity(itemCount, newBase);
+                    triggerDebouncedSave({ quantity: computed });
+                  }
                 }}
                 onBlur={() => {
-                  if (hasLinkedProduct) void persistSavedProductEdits({ quantity });
+                  if (hasLinkedProduct) {
+                    const computed = computePersistedQuantity(itemCount, quantity);
+                    void persistSavedProductEdits({ quantity: computed });
+                  }
                 }}
                 placeholder="e.g. 500 ml or 2 packs"
               />
@@ -700,7 +969,13 @@ export function AnalysisPanel({
 
                     {/* Verification label */}
                     <div className="text-xs text-primary font-medium mt-1">
-                      {isChecked ? '☑ Verified on package' : '☐ Verified on package'}
+                      {isChecked ? (
+                        isAutoAccepted && !userManuallyToggled.current[c.id]
+                          ? '✨ Automatically accepted from packaging evidence'
+                          : '☑ Verified on package'
+                      ) : (
+                        '☐ Verified on package'
+                      )}
                     </div>
 
                     {/* Provenance & Classification badges */}
@@ -767,9 +1042,16 @@ export function AnalysisPanel({
               className="mt-1 shrink-0 cursor-pointer"
               checked={confirmed}
               disabled={isConfirmed}
-              onChange={(e) => setConfirmed(e.target.checked)}
+              onChange={(e) => {
+                userManuallyToggled.current['overall'] = true;
+                setConfirmed(e.target.checked);
+              }}
             />
-            <span>I have checked the printed evidence and confirm this exact date and date type.</span>
+            <span>
+              {isAutoAccepted
+                ? 'Extracted date accepted from packaging evidence. Check or edit details before saving.'
+                : 'I have checked the printed evidence and confirm this exact date and date type.'}
+            </span>
           </label>
 
           {!isVerificationComplete && (
@@ -793,7 +1075,7 @@ export function AnalysisPanel({
               disabled={busy || suppBusy || !confirmed || !isVerificationComplete}
             >
               {busy ? <LoaderCircle className="animate-spin" /> : <Check />}
-              Confirm Details
+              {isAutoAccepted ? 'Confirm Details & Save' : 'Confirm Details'}
             </Button>
             {showCaptureMoreInfo && (
               <Button
@@ -852,11 +1134,13 @@ export function AnalysisPanel({
 
 export function ScanDetailDialog({
   scan,
+  isSubsequentScan,
   onClose,
   onChange,
   onCaptureMoreInfo,
 }: {
   scan: ScanRecord;
+  isSubsequentScan?: boolean;
   onClose: () => void;
   onChange: (s: ScanRecord) => void;
   onCaptureMoreInfo?: (currentEdits: {
@@ -897,7 +1181,13 @@ export function ScanDetailDialog({
             />
           ))}
         </div>
-        <AnalysisPanel key={scan.id} scan={scan} onChange={onChange} onCaptureMoreInfo={onCaptureMoreInfo} />
+        <AnalysisPanel
+          key={scan.id}
+          scan={scan}
+          isSubsequentScan={isSubsequentScan}
+          onChange={onChange}
+          onCaptureMoreInfo={onCaptureMoreInfo}
+        />
       </DialogContent>
     </Dialog>
   );

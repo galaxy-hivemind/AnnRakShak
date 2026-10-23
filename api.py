@@ -144,6 +144,7 @@ class ProductResponse(BaseModel):
     image_metadata: dict[str, Any] | None = None
     image_status: str | None = None
     image_source_type: str | None = None
+    display_name: str | None = None
 
 
 class ProductCreate(BaseModel):
@@ -476,6 +477,7 @@ def serialize_product(
         image_metadata=eff_image_meta,
         image_status=p.image_status,
         image_source_type=p.image_source_type,
+        display_name=p.display_name,
     )
 
 
@@ -1288,10 +1290,11 @@ async def reanalyze_scan(
 
     # Offload analysis to worker thread to avoid blocking FastAPI event loop
     t_gem_0 = time.perf_counter()
+    current_scan_date = datetime.date.today()
     if ocr_text:
-        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path), ocr_text=ocr_text)
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path), ocr_text=ocr_text, scan_date=current_scan_date)
     else:
-        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path))
+        result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(img_path), scan_date=current_scan_date)
     gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
     # Assess confidence and auto-save eligibility
@@ -1576,13 +1579,14 @@ async def add_supplementary_scan(
 
         # 5. Supplementary Gemini AI analysis
         t_gem_0 = time.perf_counter()
+        current_scan_date = datetime.date.today()
         if ocr_text:
             supp_result: FoodAnalysisResult = await asyncio.to_thread(
-                analyzer.analyze_image, str(image_path), ocr_text=ocr_text
+                analyzer.analyze_image, str(image_path), ocr_text=ocr_text, scan_date=current_scan_date
             )
         else:
             supp_result: FoodAnalysisResult = await asyncio.to_thread(
-                analyzer.analyze_image, str(image_path)
+                analyzer.analyze_image, str(image_path), scan_date=current_scan_date
             )
         gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
@@ -1937,10 +1941,11 @@ async def create_scan(
 
         # 5. Gemini AI Analysis (asynchronous in worker thread with OCR context)
         t_gem_0 = time.perf_counter()
+        current_scan_date = datetime.date.today()
         if ocr_text:
-            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), ocr_text=ocr_text)
+            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), ocr_text=ocr_text, scan_date=current_scan_date)
         else:
-            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path))
+            result: FoodAnalysisResult = await asyncio.to_thread(analyzer.analyze_image, str(image_path), scan_date=current_scan_date)
         gemini_ms = (time.perf_counter() - t_gem_0) * 1000.0
 
         # 5b. Barcode detection (from cv2 image, local OCR, or AI model result)

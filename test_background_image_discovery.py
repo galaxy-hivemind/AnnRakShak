@@ -303,7 +303,7 @@ class TestBackgroundImageDiscovery(unittest.TestCase):
             product_identity="Obscure Local Biscuit",
         )
 
-        success = process_image_discovery_job(job_id, self.db, resolver=mock_resolver)
+        success = process_image_discovery_job(job_id, self.db, resolver=mock_resolver, enable_ai_fallback=False)
         self.assertTrue(success)
 
         job = self.db.get_image_job(job_id)

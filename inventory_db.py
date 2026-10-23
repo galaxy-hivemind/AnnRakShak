@@ -223,8 +223,15 @@ class ProductRecord:
     image_source_type: str | None = None
     image_metadata: dict[str, Any] | None = None
 
+    @property
+    def display_name(self) -> str:
+        from product_identity import derive_display_name
+        return derive_display_name(self.product_name, self.brand, self.food_category, notes=self.notes)
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["display_name"] = self.display_name
+        return d
 
     def current_status(self, ref_date: datetime.date | None = None, warning_days: int = DEFAULT_WARNING_DAYS) -> str:
         """Calculate live status against today's or injected calendar date."""
@@ -1945,6 +1952,18 @@ class InventoryDatabase:
                     """
                     UPDATE image_discovery_jobs
                     SET status = 'cancelled', last_error = 'Manual image selection preserved', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, job_id),
+                )
+                return False
+
+            if image_source_type == "generated" and p_src in ("catalog", "web", "manual"):
+                # Real catalog/web images take precedence over generated illustrations
+                conn.execute(
+                    """
+                    UPDATE image_discovery_jobs
+                    SET status = 'cancelled', last_error = 'Verified real product image takes precedence', completed_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (now, now, job_id),
