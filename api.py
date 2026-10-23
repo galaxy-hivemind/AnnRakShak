@@ -166,6 +166,7 @@ class ProductCreate(BaseModel):
     quantity: str | None = Field(default=None, description="Product quantity or net weight.")
     force: bool = Field(default=False, description="Set True to override duplicate product warnings.")
     scan_id: int | None = Field(default=None, description="Optional scan ID to associate and attach date candidates from.")
+    image_path: str | None = Field(default=None, description="Optional image path or preset image URL.")
 
     @field_validator("product_name")
     @classmethod
@@ -871,6 +872,10 @@ def get_product_image(
         if p.image_path.startswith("http://") or p.image_path.startswith("https://"):
             from fastapi.responses import RedirectResponse
             return RedirectResponse(url=p.image_path, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        if p.image_path.startswith("/presets/"):
+            local_preset = Path("frontend/public") / p.image_path.lstrip("/")
+            if local_preset.exists():
+                return FileResponse(path=local_preset, media_type="image/jpeg")
         img_path = Path(p.image_path)
         if img_path.exists() and img_path.is_file():
             ext = img_path.suffix.lower()
@@ -945,8 +950,30 @@ def create_product(
     if barcode and (not notes or "Barcode:" not in notes):
         notes = f"Barcode: {barcode} | {notes}" if notes else f"Barcode: {barcode}"
 
+    preset_images = {
+        "milk": "/presets/milk.jpg",
+        "grape": "/presets/grapes.jpg",
+        "grapes": "/presets/grapes.jpg",
+        "carrot": "/presets/carrot.jpg",
+        "cabbage": "/presets/cabbage.jpg",
+        "spinach": "/presets/spinach.jpg",
+        "chocolate": "/presets/chocolate.jpg",
+    }
+    preset_match = None
+    if payload.product_name:
+        p_name_lower = payload.product_name.lower().strip()
+        for k, p_url in preset_images.items():
+            if k in p_name_lower:
+                preset_match = p_url
+                break
+
+    if payload.image_path:
+        disp_img = payload.image_path
+    elif not disp_img and preset_match:
+        disp_img = preset_match
+
     init_img_status = "resolved" if disp_img else "pending"
-    init_img_src = "catalog" if disp_img else "fallback"
+    init_img_src = "manual" if (payload.image_path or preset_match) else ("catalog" if disp_img else "fallback")
 
     product_id = db.add_product(
         product_name=payload.product_name,

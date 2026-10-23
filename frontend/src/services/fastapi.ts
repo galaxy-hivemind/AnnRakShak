@@ -378,6 +378,12 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       notes: data.notes?.trim() || null,
       force: true, // Allow user-driven additions from UI
     };
+    if (data.quantity) {
+      payload.quantity = data.quantity.trim();
+    }
+    if (data.image) {
+      payload.image_path = data.image.trim();
+    }
     if (data.scanId) {
       try {
         payload.scan_id = parseId(data.scanId);
@@ -782,9 +788,9 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
       verified: bp.date_status === 'confirmed',
       image: (() => {
         let prodImg = bp.image_path || undefined;
-        if (prodImg && (prodImg.startsWith('http://') || prodImg.startsWith('https://') || prodImg.startsWith('data:'))) {
-          // Direct remote or data URL
-        } else if (prodImg && !prodImg.startsWith('/captures/') && !prodImg.includes('/assets/')) {
+        if (prodImg && (prodImg.startsWith('http://') || prodImg.startsWith('https://') || prodImg.startsWith('data:') || prodImg.startsWith('/presets/'))) {
+          // Direct remote, data URL, or frontend preset route
+        } else if (prodImg && !prodImg.startsWith('/captures/') && !prodImg.includes('/assets/') && !prodImg.startsWith('/presets/')) {
           prodImg = typeof process !== 'undefined' && process.env?.FASTAPI_URL && this.baseUrl === process.env.FASTAPI_URL
             ? `/api/products/${bp.id}/image`
             : this.baseUrl

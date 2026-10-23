@@ -12,6 +12,13 @@ import grainsImg from '@/assets/cat-grains.jpg';
 import snacksImg from '@/assets/cat-snacks.jpg';
 import pantryImg from '@/assets/cat-pantry.jpg';
 
+import milkPreset from '@/assets/presets/milk.jpg';
+import grapesPreset from '@/assets/presets/grapes.jpg';
+import carrotPreset from '@/assets/presets/carrot.jpg';
+import cabbagePreset from '@/assets/presets/cabbage.jpg';
+import spinachPreset from '@/assets/presets/spinach.jpg';
+import chocolatePreset from '@/assets/presets/chocolate.jpg';
+
 export {
   milkImg,
   tomatoesImg,
@@ -26,6 +33,12 @@ export {
   grainsImg,
   snacksImg,
   pantryImg,
+  milkPreset,
+  grapesPreset,
+  carrotPreset,
+  cabbagePreset,
+  spinachPreset,
+  chocolatePreset,
 };
 
 export const categoryImages: Record<string, string> = {
@@ -37,6 +50,92 @@ export const categoryImages: Record<string, string> = {
   'Pantry Staples': pantryImg,
 };
 
+export interface DemoPreset {
+  key: string;
+  label: string;
+  image: string;
+  backendPath: string;
+  category: 'Dairy & Eggs' | 'Fresh Produce' | 'Snacks' | 'Beverages' | 'Pantry Staples' | 'Grains & Cereals';
+  produce?: 'Vegetable' | 'Fruit';
+  quantity: string;
+  storage: 'Fridge' | 'Pantry' | 'Freezer';
+}
+
+export const DEMO_PRESETS: Record<string, DemoPreset> = {
+  milk: {
+    key: 'milk',
+    label: 'Milk',
+    image: milkPreset,
+    backendPath: '/presets/milk.jpg',
+    category: 'Dairy & Eggs',
+    quantity: '1 L',
+    storage: 'Fridge',
+  },
+  grapes: {
+    key: 'grapes',
+    label: 'Grapes',
+    image: grapesPreset,
+    backendPath: '/presets/grapes.jpg',
+    category: 'Fresh Produce',
+    produce: 'Fruit',
+    quantity: '400 g',
+    storage: 'Fridge',
+  },
+  carrot: {
+    key: 'carrot',
+    label: 'Carrot',
+    image: carrotPreset,
+    backendPath: '/presets/carrot.jpg',
+    category: 'Fresh Produce',
+    produce: 'Vegetable',
+    quantity: '500 g',
+    storage: 'Fridge',
+  },
+  cabbage: {
+    key: 'cabbage',
+    label: 'Cabbage',
+    image: cabbagePreset,
+    backendPath: '/presets/cabbage.jpg',
+    category: 'Fresh Produce',
+    produce: 'Vegetable',
+    quantity: '1 head',
+    storage: 'Fridge',
+  },
+  spinach: {
+    key: 'spinach',
+    label: 'Spinach',
+    image: spinachPreset,
+    backendPath: '/presets/spinach.jpg',
+    category: 'Fresh Produce',
+    produce: 'Vegetable',
+    quantity: '250 g',
+    storage: 'Fridge',
+  },
+  chocolate: {
+    key: 'chocolate',
+    label: 'Chocolate',
+    image: chocolatePreset,
+    backendPath: '/presets/chocolate.jpg',
+    category: 'Snacks',
+    quantity: '100 g',
+    storage: 'Pantry',
+  },
+};
+
+export function matchPresetFood(name?: string, image?: string): DemoPreset | null {
+  const check = `${name || ''} ${image || ''}`.toLowerCase().trim();
+  if (!check) return null;
+
+  if (check.includes('spinach') || check.includes('palak')) return DEMO_PRESETS.spinach;
+  if (check.includes('milk') || check.includes('doodh')) return DEMO_PRESETS.milk;
+  if (check.includes('grape') || check.includes('angoor')) return DEMO_PRESETS.grapes;
+  if (check.includes('carrot') || check.includes('gajar')) return DEMO_PRESETS.carrot;
+  if (check.includes('cabbage') || check.includes('patta gobhi') || check.includes('gobhi') || check.includes('banda gobhi')) return DEMO_PRESETS.cabbage;
+  if (check.includes('chocolate') || check.includes('choco') || check.includes('cocoa')) return DEMO_PRESETS.chocolate;
+
+  return null;
+}
+
 export function resolveFoodImage(item?: {
   name?: string;
   category?: string;
@@ -44,7 +143,13 @@ export function resolveFoodImage(item?: {
 }): string {
   if (!item) return tomatoesImg;
 
-  // If a real image was provided (data URI, uploads, or static jpg/png from assets) and not a generic SVG
+  // Direct match for preset demo items
+  const preset = matchPresetFood(item.name, item.image);
+  if (preset) {
+    return preset.image;
+  }
+
+  // If a real image was provided (data URI, uploads, or static jpg/png from assets/presets) and not a generic SVG
   if (
     item.image &&
     !item.image.endsWith('.svg') &&
@@ -52,10 +157,13 @@ export function resolveFoodImage(item?: {
       item.image.startsWith('/captures/') ||
       item.image.startsWith('/api/') ||
       item.image.startsWith('http') ||
+      item.image.startsWith('/presets/') ||
       item.image.includes('/assets/'))
   ) {
     return item.image;
   }
+
+  if (preset) return preset.image;
 
   const name = (item.name || '').toLowerCase();
 
