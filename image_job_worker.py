@@ -186,6 +186,12 @@ def process_image_discovery_job(
             return success
         else:
             # Priority 2: Cropping the scanned image (Final Endpoint)
+            # If product is already cropped and exists on disk, preserve it as the final endpoint
+            if product.image_source_type == "crop" and product.image_path and os.path.exists(product.image_path):
+                logger.info("Job %d web search found no match; retaining existing cropped image %s for product %d ('%s')", job_id, product.image_path, product_id, curr_ident)
+                db.apply_no_match_product_image(product_id, job_id)
+                return True
+
             if source_img and os.path.exists(source_img):
                 logger.info("Job %d web search found no match; cropping scanned image as final endpoint for product %d ('%s')...", job_id, product_id, curr_ident)
                 try:
@@ -219,7 +225,7 @@ def process_image_discovery_job(
                 except Exception as crop_err:
                     logger.warning("Scanned image crop encountered error: %s", crop_err)
 
-            # Fallback: Only if NO scanned image was present (e.g. manual text entry without a photo)
+            # Fallback: Only if NO scanned image was present at all (e.g. manual text entry without a photo)
             logger.info("Applying default category image for product %d ('%s') as no scanned image was available.", product_id, curr_ident)
             db.apply_no_match_product_image(product_id, job_id)
             return True

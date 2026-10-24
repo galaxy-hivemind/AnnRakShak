@@ -23,6 +23,7 @@ import base64
 import datetime
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -924,6 +925,9 @@ def create_product(
     image_meta = None
     disp_img = None
 
+    init_img_src = "fallback"
+    init_img_status = "pending"
+
     if payload.scan_id:
         scan = db.get_scan(payload.scan_id)
         candidate_dates = db.get_scan_date_candidates(payload.scan_id)
@@ -931,6 +935,8 @@ def create_product(
             image_meta = scan.image_metadata
             if image_meta and image_meta.get("image_status") in ("verified_web_image", "web_verified"):
                 disp_img = image_meta.get("image_url") or image_meta.get("local_path")
+                init_img_src = "catalog"
+                init_img_status = "resolved"
             if scan.raw_json:
                 try:
                     import json
@@ -938,6 +944,33 @@ def create_product(
                     barcode = parsed.get("barcode")
                 except Exception:
                     pass
+
+            # Pre-crop packaging from scan image immediately so the user can identify the product at a glance
+            if not disp_img and scan.image_path and os.path.exists(scan.image_path):
+                try:
+                    from ai_image_generator import get_ai_image_generator
+                    ai_gen = get_ai_image_generator()
+                    crop_res = ai_gen.generate_ai_crop_studio_image(
+                        product_name=payload.product_name,
+                        brand=payload.brand,
+                        category=payload.food_category,
+                        product_id=None,
+                        source_image_path=scan.image_path,
+                    )
+                    if crop_res.success and crop_res.image_path:
+                        disp_img = crop_res.image_path
+                        init_img_src = "crop"
+                        init_img_status = "resolved"
+                        image_meta = {
+                            "source": "ai_crop_isolated",
+                            "model": crop_res.model_name,
+                            "width": crop_res.width,
+                            "height": crop_res.height,
+                            "content_type": crop_res.content_type,
+                            "is_verified": True,
+                        }
+                except Exception as crop_err:
+                    logger.warning("Could not pre-crop scan image on product creation: %s", crop_err)
 
     notes = payload.notes
     if payload.quantity:
@@ -959,21 +992,24 @@ def create_product(
         "spinach": "/presets/spinach.jpg",
         "chocolate": "/presets/chocolate.jpg",
     }
-    preset_match = None
-    if payload.product_name:
-        p_name_lower = payload.product_name.lower().strip()
-        for k, p_url in preset_images.items():
-            if k in p_name_lower:
-                preset_match = p_url
-                break
 
     if payload.image_path:
         disp_img = payload.image_path
-    elif not disp_img and preset_match:
-        disp_img = preset_match
-
-    init_img_status = "resolved" if disp_img else "pending"
-    init_img_src = "manual" if (payload.image_path or preset_match) else ("catalog" if disp_img else "fallback")
+        init_img_src = "manual"
+        init_img_status = "resolved"
+    elif not payload.scan_id and not disp_img:
+        # Presets only apply to manual text additions without a scan, using whole-word boundary matching
+        preset_match = None
+        if payload.product_name:
+            p_name_lower = payload.product_name.lower().strip()
+            for k, p_url in preset_images.items():
+                if re.search(rf"\b{re.escape(k)}\b", p_name_lower):
+                    preset_match = p_url
+                    break
+        if preset_match:
+            disp_img = preset_match
+            init_img_src = "manual"
+            init_img_status = "resolved"
 
     product_id = db.add_product(
         product_name=payload.product_name,
@@ -1000,8 +1036,9 @@ def create_product(
             detail="Failed to retrieve newly created product.",
         )
 
-    # Prompt save guaranteed: Start background image discovery only after successful save
-    if not disp_img:
+    # Start background web discovery if no verified catalog image is present yet
+    # (even if cropped, query Open Food Facts/web to attempt exact product catalog match)
+    if init_img_src != "catalog" and init_img_src != "manual":
         ident = f"{(payload.brand or '').strip()} {payload.product_name.strip()}".strip()
         job_id = db.create_image_job(product_id=product_id, normalized_identity=ident)
         background_tasks.add_task(process_image_discovery_job, job_id, db)
@@ -2040,6 +2077,32 @@ async def create_scan(
             notes_str = " | ".join(notes_parts) if notes_parts else None
 
             try:
+                prod_img_src = "catalog" if product_display_image else "fallback"
+                if not product_display_image and image_path and os.path.exists(str(image_path)):
+                    try:
+                        from ai_image_generator import get_ai_image_generator
+                        ai_gen = get_ai_image_generator()
+                        crop_res = ai_gen.generate_ai_crop_studio_image(
+                            product_name=result.product_name,
+                            brand=result.brand,
+                            category=result.food_category,
+                            product_id=None,
+                            source_image_path=str(image_path),
+                        )
+                        if crop_res.success and crop_res.image_path:
+                            product_display_image = crop_res.image_path
+                            prod_img_src = "crop"
+                            image_meta_dict = {
+                                "source": "ai_crop_isolated",
+                                "model": crop_res.model_name,
+                                "width": crop_res.width,
+                                "height": crop_res.height,
+                                "content_type": crop_res.content_type,
+                                "is_verified": True,
+                            }
+                    except Exception as auto_crop_err:
+                        logger.warning("Auto-save crop error: %s", auto_crop_err)
+
                 product_id = db.add_product(
                     product_name=result.product_name,
                     brand=result.brand,
@@ -2056,14 +2119,14 @@ async def create_scan(
                     force=True,
                     scan_id=scan_id,
                     image_status="resolved" if product_display_image else "pending",
-                    image_source_type="catalog" if product_display_image else "fallback",
+                    image_source_type=prod_img_src,
                     image_metadata=image_meta_dict,
                 )
                 auto_saved = True
                 decision_reason = assessment.decision_reason
 
-                # Asynchronous Background Discovery for auto-saved product if no verified image is cached yet
-                if not product_display_image:
+                # Asynchronous Background Discovery for auto-saved product if no verified catalog image is cached yet
+                if prod_img_src != "catalog":
                     ident = f"{(result.brand or '').strip()} {result.product_name.strip()}".strip()
                     job_id = db.create_image_job(product_id=product_id, normalized_identity=ident)
                     background_tasks.add_task(process_image_discovery_job, job_id, db, resolver=image_resolver)

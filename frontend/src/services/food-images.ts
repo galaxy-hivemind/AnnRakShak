@@ -126,12 +126,15 @@ export function matchPresetFood(name?: string, image?: string): DemoPreset | nul
   const check = `${name || ''} ${image || ''}`.toLowerCase().trim();
   if (!check) return null;
 
-  if (check.includes('spinach') || check.includes('palak')) return DEMO_PRESETS.spinach;
-  if (check.includes('milk') || check.includes('doodh')) return DEMO_PRESETS.milk;
-  if (check.includes('grape') || check.includes('angoor')) return DEMO_PRESETS.grapes;
-  if (check.includes('carrot') || check.includes('gajar')) return DEMO_PRESETS.carrot;
-  if (check.includes('cabbage') || check.includes('patta gobhi') || check.includes('gobhi') || check.includes('banda gobhi')) return DEMO_PRESETS.cabbage;
-  if (check.includes('chocolate') || check.includes('choco') || check.includes('cocoa')) return DEMO_PRESETS.chocolate;
+  // Use whole-word boundary matching so 'milkybar' does not match 'milk'
+  const hasWord = (word: string) => new RegExp(`(^|\\s|[^a-z0-9])${word}($|\\s|[^a-z0-9])`, 'i').test(check);
+
+  if (hasWord('spinach') || hasWord('palak')) return DEMO_PRESETS.spinach;
+  if (hasWord('milk') || hasWord('doodh')) return DEMO_PRESETS.milk;
+  if (hasWord('grape') || hasWord('grapes') || hasWord('angoor')) return DEMO_PRESETS.grapes;
+  if (hasWord('carrot') || hasWord('carrots') || hasWord('gajar')) return DEMO_PRESETS.carrot;
+  if (hasWord('cabbage') || hasWord('patta gobhi') || hasWord('gobhi') || hasWord('banda gobhi')) return DEMO_PRESETS.cabbage;
+  if (hasWord('chocolate') || hasWord('cocoa')) return DEMO_PRESETS.chocolate;
 
   return null;
 }
@@ -143,27 +146,26 @@ export function resolveFoodImage(item?: {
 }): string {
   if (!item) return tomatoesImg;
 
-  // Direct match for preset demo items
-  const preset = matchPresetFood(item.name, item.image);
-  if (preset) {
-    return preset.image;
-  }
-
-  // If a real image was provided (data URI, uploads, or static jpg/png from assets/presets) and not a generic SVG
+  // 1. If an actual image was provided (web URL, API image, cropped scan, data URI), ALWAYS respect and display it!
   if (
     item.image &&
     !item.image.endsWith('.svg') &&
     (item.image.startsWith('data:') ||
       item.image.startsWith('/captures/') ||
       item.image.startsWith('/api/') ||
-      item.image.startsWith('http') ||
+      item.image.startsWith('http://') ||
+      item.image.startsWith('https://') ||
       item.image.startsWith('/presets/') ||
       item.image.includes('/assets/'))
   ) {
     return item.image;
   }
 
-  if (preset) return preset.image;
+  // 2. Only if NO real image is available, check demo preset whole-word match
+  const preset = matchPresetFood(item.name, item.image);
+  if (preset) {
+    return preset.image;
+  }
 
   const name = (item.name || '').toLowerCase();
 

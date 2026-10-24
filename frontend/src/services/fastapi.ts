@@ -796,6 +796,12 @@ export class FastApiFoodSafetyService implements FoodSafetyService {
             : this.baseUrl
             ? `${this.baseUrl}/api/products/${bp.id}/image`
             : `/api/products/${bp.id}/image`;
+        } else if (!prodImg && bp.scan_id) {
+          prodImg = typeof process !== 'undefined' && process.env?.FASTAPI_URL && this.baseUrl === process.env.FASTAPI_URL
+            ? `/api/products/${bp.id}/image`
+            : this.baseUrl
+            ? `${this.baseUrl}/api/products/${bp.id}/image`
+            : `/api/products/${bp.id}/image`;
         }
         return resolveFoodImage({ name: bp.product_name, category: cat, image: prodImg });
       })(),

@@ -279,7 +279,8 @@ class AIProductImageGenerator:
             box_crop = img[ymin:ymax, xmin:xmax]
             bh, bw = box_crop.shape[:2]
             if bh < 40 or bw < 40:
-                return False
+                box_crop = img
+                bh, bw = box_crop.shape[:2]
 
             scale = min(430.0 / bw, 470.0 / bh)
             new_w = max(50, int(bw * scale))
@@ -313,7 +314,20 @@ class AIProductImageGenerator:
             cv2.imwrite(str(target_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 94])
             return True
         except Exception as e:
-            logger.warning("Error rendering isolated studio box: %s", e)
+            logger.warning("Error rendering isolated studio box: %s; attempting direct fallback crop", e)
+            try:
+                img = cv2.imread(source_image_path)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    dim = min(h, w)
+                    sy = (h - dim) // 2
+                    sx = (w - dim) // 2
+                    crop = img[sy:sy+dim, sx:sx+dim]
+                    resized = cv2.resize(crop, (600, 600), interpolation=cv2.INTER_AREA)
+                    cv2.imwrite(str(target_path), resized, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    return True
+            except Exception as direct_err:
+                logger.error("Direct fallback crop failed: %s", direct_err)
             return False
 
     def synthesize_studio_image(
@@ -713,7 +727,7 @@ class AIProductImageGenerator:
                 created_at=time.time(),
             )
 
-        # 1. Try Intelligent AI Crop first if source image is available
+        # 1. Scanned products must strictly use crop as final endpoint and NEVER AI image generation from scratch
         if source_image_path and os.path.exists(source_image_path):
             crop_res = self.generate_ai_crop_studio_image(
                 product_name=product_name,
@@ -722,10 +736,9 @@ class AIProductImageGenerator:
                 product_id=product_id,
                 source_image_path=source_image_path,
             )
-            if crop_res.success and crop_res.image_path:
-                return crop_res
+            return crop_res
 
-        # 2. Next in line: AI Image Generation from Scratch
+        # 2. Next in line: AI Image Generation from Scratch (strictly for non-scanned/manual entries if enabled)
         return self.generate_product_image_from_scratch(
             product_name=product_name,
             brand=brand,

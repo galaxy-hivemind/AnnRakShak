@@ -867,6 +867,90 @@ class TestBackgroundImageDiscovery(unittest.TestCase):
         saved_img = cv2.imread(res.image_path)
         self.assertEqual(saved_img.shape, (600, 600, 3))
 
+    def test_35_scanned_product_never_uses_ai_scratch_generation_or_milk_preset(self):
+        """
+        Ensure scanned product like Milkybar:
+        1. Never defaults to /presets/milk.jpg.
+        2. Never falls back to scratch AI generation.
+        3. Web search -> Cropping scanned image as final endpoint.
+        """
+        import numpy as np
+        import cv2
+        dummy_scan_path = Path(self.temp_dir) / "milkybar_scan.jpg"
+        img = np.full((500, 500, 3), 220, dtype=np.uint8)
+        cv2.rectangle(img, (100, 150), (400, 350), (255, 255, 255), -1)
+        cv2.imwrite(str(dummy_scan_path), img)
+
+        from gemini_analyzer import FoodAnalysisResult
+        scan_id = self.db.record_scan(
+            image_path=str(dummy_scan_path),
+            result=FoodAnalysisResult(
+                product_name="Milkybar",
+                brand="Nestle",
+                food_category="Snacks",
+                confidence=0.9,
+                barcode="8901058852394",
+                selected_expiry_date="2027-01-01",
+                analysis_status="success",
+                needs_review=False,
+            ),
+        )
+
+        from api import app, get_db
+        from fastapi.testclient import TestClient
+        app.dependency_overrides[get_db] = lambda: self.db
+        try:
+            client = TestClient(app)
+            # Create product via API with scan_id
+            resp = client.post(
+                "/api/products",
+                json={
+                    "product_name": "Milkybar",
+                    "brand": "Nestle",
+                    "food_category": "Snacks",
+                    "date_type": "Expiry",
+                    "normalized_date": "2027-01-01",
+                    "date_status": "confirmed",
+                    "scan_id": scan_id,
+                },
+            )
+            self.assertEqual(resp.status_code, 201)
+            data = resp.json()
+
+            # Must NOT be /presets/milk.jpg
+            self.assertNotEqual(data.get("image_path"), "/presets/milk.jpg")
+            # Must be cropped or catalog, never generated
+            self.assertIn(data.get("image_source_type"), ("crop", "catalog"))
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    def test_36_milkybar_manual_creation_does_not_match_milk_preset(self):
+        """
+        Verify that creating 'Milkybar' manually without a scan does not
+        substring-match preset 'milk'.
+        """
+        from api import app, get_db
+        from fastapi.testclient import TestClient
+        app.dependency_overrides[get_db] = lambda: self.db
+        try:
+            client = TestClient(app)
+            resp = client.post(
+                "/api/products",
+                json={
+                    "product_name": "Milkybar",
+                    "brand": "Nestle",
+                    "food_category": "Snacks",
+                    "date_type": "Expiry",
+                    "normalized_date": "2027-01-01",
+                    "date_status": "confirmed",
+                },
+            )
+            self.assertEqual(resp.status_code, 201)
+            data = resp.json()
+            self.assertNotEqual(data.get("image_path"), "/presets/milk.jpg")
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
 
 if __name__ == "__main__":
     unittest.main()
