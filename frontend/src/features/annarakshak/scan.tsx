@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Camera, ScanLine, Upload, RotateCcw, X, Check, LoaderCircle, Trash2, Plus } from 'lucide-react';
+import { Camera, ScanLine, Upload, RotateCcw, X, Check, LoaderCircle, Trash2, Plus, Layers } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -131,6 +131,13 @@ export function Scan() {
   }) {
     if (edits) {
       pendingOverrides.current = edits;
+    } else if (scan) {
+      pendingOverrides.current = {
+        name: scan.name,
+        brand: scan.brand,
+        category: scan.category,
+        quantity: scan.quantity,
+      };
     }
     setIsSupplementary(true);
     setError('');
@@ -350,15 +357,24 @@ export function Scan() {
                 height={380}
               />
             ) : (
-              <>
-                <div className="camera-frame">
-                  <Camera size={42} strokeWidth={1} />
+              <button
+                type="button"
+                onClick={() => void startCamera()}
+                className="camera-ready-btn w-full h-full flex flex-col items-center justify-center cursor-pointer group focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 transition-all p-6 rounded-xl hover:bg-muted/80 active:scale-[0.99]"
+                aria-label="Camera ready - Click to start camera"
+                title="Click to start camera"
+              >
+                <div className="camera-frame group-hover:border-primary group-hover:text-primary group-hover:scale-105 group-hover:shadow-md transition-all duration-200">
+                  <Camera size={44} strokeWidth={1.2} className="transition-transform duration-200 group-hover:scale-110" />
                 </div>
-                <p className="text-xs text-muted-foreground mt-5">Camera ready</p>
-                <p className="text-[11px] text-muted-foreground mt-1">
-                  Start camera to capture packaging or upload a photo
+                <p className="text-xs font-semibold text-foreground/85 mt-5 group-hover:text-primary transition-colors flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  Camera ready · Click to start
                 </p>
-              </>
+                <p className="text-[11px] text-muted-foreground mt-1 group-hover:text-foreground/75 transition-colors">
+                  Tap to capture packaging with your camera or webcam
+                </p>
+              </button>
             )}
 
             {busy && (
@@ -373,48 +389,107 @@ export function Scan() {
           <div className="scan-actions">
             {state === 'Streaming' ? (
               <>
-                <Button onClick={handleCapture} disabled={busy}>
-                  <ScanLine />
-                  Capture & Scan
+                <Button onClick={handleCapture} disabled={busy} className="flex-1 min-w-0">
+                  <ScanLine size={15} />
+                  <span>Capture & Scan</span>
                 </Button>
-                <Button variant="outline" onClick={handleCancel}>
-                  <X />
-                  Cancel
+                <Button variant="outline" onClick={handleCancel} className="shrink-0">
+                  <X size={15} />
+                  <span>Cancel</span>
                 </Button>
               </>
             ) : state === 'Analyzing' ? (
-              <Button variant="ghost" onClick={handleCancel} disabled={busy}>
-                <X />
-                Cancel
+              <Button variant="ghost" onClick={handleCancel} disabled={busy} className="w-full">
+                <X size={15} />
+                <span>Cancel</span>
               </Button>
             ) : capturedImage || scan ? (
               <>
-                <Button onClick={() => void startCamera()}>
-                  <Camera />
-                  Start Camera
+                <Button
+                  onClick={() => void startCamera()}
+                  className="flex-1 min-w-0 font-medium"
+                  title="Start Camera"
+                >
+                  <Camera size={15} />
+                  <span className="truncate">Start Camera</span>
                 </Button>
-                <Button variant="outline" onClick={handleRetake}>
-                  <RotateCcw />
-                  Retake Photo
+
+                <Button
+                  variant="secondary"
+                  onClick={() => void handleCaptureMoreInfo()}
+                  disabled={!scan || busy}
+                  className="flex-1 min-w-0 font-medium bg-primary/10 text-primary hover:bg-primary/20 border border-primary/20"
+                  title="Capture more info for current scan"
+                  aria-label="Capture more Info"
+                >
+                  <Layers size={15} />
+                  <span className="truncate">Capture more Info</span>
                 </Button>
-                <Button variant="outline" onClick={() => input.current?.click()}>
-                  <Upload />
-                  Upload Image
+
+                <Button
+                  variant="outline"
+                  onClick={handleRetake}
+                  disabled={busy}
+                  className="flex-1 min-w-0 font-medium"
+                  title="Retake Photo"
+                >
+                  <RotateCcw size={15} />
+                  <span className="truncate">Retake Photo</span>
                 </Button>
-                <Button variant="ghost" onClick={handleCancel}>
-                  <X />
-                  Clear
+
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => input.current?.click()}
+                  className="shrink-0 h-9 w-9 text-muted-foreground hover:text-foreground hover:border-primary/50"
+                  title="Upload image"
+                  aria-label="Upload image"
+                >
+                  <Upload size={16} />
+                </Button>
+
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleCancel}
+                  className="shrink-0 h-9 w-9 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                  title="Clear scan"
+                  aria-label="Clear scan"
+                >
+                  <X size={16} />
                 </Button>
               </>
             ) : (
               <>
-                <Button onClick={() => void startCamera()}>
-                  <Camera />
-                  Start Camera
+                <Button
+                  onClick={() => void startCamera()}
+                  className="flex-1 min-w-0 font-medium"
+                  title="Start Camera"
+                >
+                  <Camera size={15} />
+                  <span className="truncate">Start Camera</span>
                 </Button>
-                <Button variant="outline" onClick={() => input.current?.click()}>
-                  <Upload />
-                  Upload Image
+
+                <Button
+                  variant="secondary"
+                  onClick={() => void startCamera(true)}
+                  className="flex-1 min-w-0 font-medium bg-primary/10 text-primary hover:bg-primary/20 border border-primary/20"
+                  title="Capture more info"
+                  aria-label="Capture more Info"
+                >
+                  <Layers size={15} />
+                  <span className="truncate">Capture more Info</span>
+                </Button>
+
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => input.current?.click()}
+                  className="shrink-0 h-9 w-9 text-muted-foreground hover:text-foreground hover:border-primary/50"
+                  title="Upload image"
+                  aria-label="Upload image"
+                >
+                  <Upload size={16} />
                 </Button>
               </>
             )}

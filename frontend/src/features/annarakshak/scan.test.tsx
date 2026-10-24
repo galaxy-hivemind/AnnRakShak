@@ -351,7 +351,7 @@ describe('Scan Page Completion & Persistence Flow', () => {
     });
 
     // Capture More Info button should be available
-    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    const captureMoreBtn = screen.getAllByRole('button', { name: /Capture More Info/i })[0];
     expect(captureMoreBtn).toBeInTheDocument();
 
     // Click Capture More Info
@@ -398,7 +398,7 @@ describe('Scan Page Completion & Persistence Flow', () => {
       expect(screen.getByDisplayValue('Fresh Whole Milk')).toBeInTheDocument();
     });
 
-    const captureMoreBtn = screen.getByRole('button', { name: /Capture More Info/i });
+    const captureMoreBtn = screen.getAllByRole('button', { name: /Capture More Info/i })[0];
     fireEvent.click(captureMoreBtn);
 
     const fileInput2 = screen.getByLabelText('Upload packaging image') as HTMLInputElement;
@@ -417,7 +417,7 @@ describe('Scan Page Completion & Persistence Flow', () => {
 
     // Original scan data must be preserved and still visible
     expect(screen.getByDisplayValue('Fresh Whole Milk')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Capture More Info/i })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Capture More Info/i })[0]).toBeInTheDocument();
   });
 });
 
