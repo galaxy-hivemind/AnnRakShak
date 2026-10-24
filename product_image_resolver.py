@@ -53,7 +53,7 @@ logger = logging.getLogger("AnnaRakshak.ImageResolver")
 # Timeouts, Limits & SSRF Controls
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
 DOWNLOAD_TIMEOUT_SECONDS = 5.0
-MAX_CATALOG_SEARCH_REQUESTS = 6
+MAX_CATALOG_SEARCH_REQUESTS = 12
 MIN_IMAGE_DIMENSION = 100
 MAX_IMAGE_DIMENSION = 5000
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -785,10 +785,13 @@ class ProductImageResolver:
         existing_metadata: dict[str, Any] | None = None,
         is_supplementary: bool = False,
         deadline: float | None = None,
+        source_image_path: str | Path | None = None,
     ) -> ImageMetadata:
         """
         Main entry point for resolving a product's display image.
-        Deduplicates supplementary requests and adheres to strict provider order.
+        Deduplicates supplementary requests and adheres to strict provider order:
+          1. Web search (Image barcode & Google/catalog progressive text search)
+          2. Category fallback (if no crop image or scan is present).
         Thread-safe single-flight mechanism prevents concurrent duplicate lookups.
         """
         # Fast exit if disabled by environment
@@ -849,6 +852,21 @@ class ProductImageResolver:
             self._in_flight.add(key)
 
         try:
+            # Image-based search: If no barcode was passed, attempt barcode detection from scanned photo
+            if not barcode and source_image_path and os.path.exists(str(source_image_path)):
+                try:
+                    from barcode_detector import detect_barcodes_from_image
+                    detected_bcs = detect_barcodes_from_image(str(source_image_path))
+                    if detected_bcs:
+                        for cand_bc in detected_bcs:
+                            clean_cand = re.sub(r"\D", "", str(cand_bc))
+                            if is_valid_gtin_checksum(clean_cand):
+                                barcode = clean_cand
+                                logger.info("Image-based web search: Discovered barcode '%s' from scan image %s", barcode, source_image_path)
+                                break
+                except Exception as img_bc_err:
+                    logger.debug("Image barcode extraction note: %s", img_bc_err)
+
             # Product identity string for provenance
             identity_str = f"{brand.strip()} {product_name.strip()}" if brand and product_name else (product_name or "Unknown Item")
 
@@ -1033,9 +1051,16 @@ class ProductImageResolver:
 
         catalog_requests_count = 0
 
-        for query in queries[:4]:
+        # Primary catalog gets priority across all progressive queries
+        primary_cat = catalogs[0]
+        secondary_cats = catalogs[1:]
+
+        for query in queries[:5]:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Execution budget exceeded during catalog search")
+
+            if catalog_requests_count >= MAX_CATALOG_SEARCH_REQUESTS:
+                break
 
             params = {
                 "search_terms": query,
@@ -1046,42 +1071,32 @@ class ProductImageResolver:
                 "fields": "code,product_name,brands,image_url,image_front_url,image_front_small_url",
             }
 
-            for cat_name, cat_url in catalogs:
+            cat_name, cat_url = primary_cat
+            catalog_requests_count += 1
+            products = []
+            for attempt in range(2):
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Execution budget exceeded during catalog search")
-
-                if catalog_requests_count >= MAX_CATALOG_SEARCH_REQUESTS:
-                    logger.debug("Reached maximum catalog search requests (%d); stopping broader catalog scan.", MAX_CATALOG_SEARCH_REQUESTS)
+                try:
+                    resp = client.get(cat_url, params=params)
+                    if resp.status_code in (502, 503, 504) and attempt == 0:
+                        time.sleep(0.25)
+                        continue
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json()
+                    products = data.get("products", [])
                     break
-                catalog_requests_count += 1
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    if attempt == 0:
+                        time.sleep(0.25)
+                        continue
+                    break
+                except Exception as e:
+                    logger.debug("Exception searching %s for '%s': %s", cat_name, query, e)
+                    break
 
-                products = []
-                for attempt in range(2):
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError("Execution budget exceeded during catalog search")
-                    try:
-                        resp = client.get(cat_url, params=params)
-                        if resp.status_code in (502, 503, 504) and attempt == 0:
-                            time.sleep(0.25)
-                            continue
-                        if resp.status_code != 200:
-                            break
-                        data = resp.json()
-                        products = data.get("products", [])
-                        break
-                    except (httpx.TimeoutException, httpx.NetworkError):
-                        if attempt == 0:
-                            time.sleep(0.25)
-                            continue
-                        break
-                    except Exception as e:
-                        logger.debug("Exception searching %s for '%s': %s", cat_name, query, e)
-                        break
-
-                if not products:
-                    continue
-
-                # Rank candidates
+            if products:
                 ranked_candidates = []
                 min_threshold = 45.0 if (brand and brand.strip()) else 25.0
                 for cand in products:
@@ -1096,7 +1111,6 @@ class ProductImageResolver:
 
                 ranked_candidates.sort(key=lambda x: x[0], reverse=True)
 
-                # Try downloading and validating in rank order
                 for score, cand, img_url in ranked_candidates:
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError("Execution budget exceeded during candidate image download")
@@ -1120,8 +1134,61 @@ class ProductImageResolver:
                             height=meta_dict.get("height"),
                             created_at=time.time(),
                         )
-                    else:
-                        logger.info("Candidate image %s failed validation: %s; trying next candidate", img_url, err)
+
+        # If primary catalog found no match, check secondary catalogs if budget remains
+        for cat_name, cat_url in secondary_cats:
+            for query in queries[:2]:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Execution budget exceeded during catalog search")
+                if catalog_requests_count >= MAX_CATALOG_SEARCH_REQUESTS:
+                    break
+                catalog_requests_count += 1
+
+                params = {
+                    "search_terms": query,
+                    "search_simple": 1,
+                    "action": "process",
+                    "json": 1,
+                    "page_size": 10,
+                    "fields": "code,product_name,brands,image_url,image_front_url,image_front_small_url",
+                }
+                products = []
+                try:
+                    resp = client.get(cat_url, params=params)
+                    if resp.status_code == 200:
+                        products = resp.json().get("products", [])
+                except Exception:
+                    pass
+
+                if products:
+                    ranked = []
+                    min_threshold = 45.0 if (brand and brand.strip()) else 25.0
+                    for cand in products:
+                        c_name = cand.get("product_name") or ""
+                        c_brand = cand.get("brands") or ""
+                        score = score_candidate(c_brand, c_name, brand, product_name, has_front_img=bool(cand.get("image_front_url")))
+                        if score >= min_threshold:
+                            img_url = cand.get("image_front_url") or cand.get("image_url")
+                            if img_url:
+                                ranked.append((score, cand, img_url))
+                    ranked.sort(key=lambda x: x[0], reverse=True)
+                    for score, cand, img_url in ranked:
+                        success, _, meta_dict, _ = download_and_validate_web_image(img_url, target_dir=self.cache_dir, client=client)
+                        if success:
+                            cand_brand = cand.get("brands") or brand or ""
+                            cand_name = cand.get("product_name") or product_name
+                            return ImageMetadata(
+                                source=f"{cat_name}_search",
+                                original_url=img_url,
+                                cached_path=meta_dict.get("cached_path"),
+                                status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+                                barcode=barcode or cand.get("code"),
+                                product_identity=f"{cand_brand} {cand_name}".strip() or identity_str,
+                                content_type=meta_dict.get("content_type"),
+                                width=meta_dict.get("width"),
+                                height=meta_dict.get("height"),
+                                created_at=time.time(),
+                            )
 
         # Fallback to Wikipedia / Wikimedia image search if catalogs found no suitable image
         wiki_meta = self._lookup_wikipedia_search(product_name, brand, barcode, identity_str, client, deadline=deadline)
@@ -1211,15 +1278,62 @@ class ProductImageResolver:
     ) -> ImageMetadata | None:
         """
         Optional Stage 3: General web image search if API keys are configured.
-        Supports Google Custom Search API if GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX are present.
+        Supports:
+          - SerpAPI Google Images search if SERPAPI_API_KEY is present.
+          - Google Custom Search API if GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX are present.
         If not configured, returns None silently.
         """
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("Execution budget exceeded during web search")
 
+        if not product_name:
+            return None
+
+        # 1. SerpAPI Google Images Search (if configured)
+        serp_key = os.environ.get("SERPAPI_API_KEY")
+        if serp_key:
+            try:
+                serp_query = f"{brand or ''} {product_name} packaging product".strip()
+                serp_params = {
+                    "engine": "google_images",
+                    "q": serp_query,
+                    "api_key": serp_key,
+                    "num": 5,
+                }
+                resp = client.get("https://serpapi.com/search.json", params=serp_params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("images_results", []):
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError("Execution budget exceeded during web image download")
+                        img_url = item.get("original") or item.get("thumbnail")
+                        if not img_url:
+                            continue
+                        success, _, meta_dict, _ = download_and_validate_web_image(
+                            img_url,
+                            target_dir=self.cache_dir,
+                            client=client,
+                        )
+                        if success:
+                            return ImageMetadata(
+                                source="google_images_search",
+                                original_url=img_url,
+                                cached_path=meta_dict.get("cached_path"),
+                                status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
+                                barcode=barcode,
+                                product_identity=identity_str,
+                                content_type=meta_dict.get("content_type"),
+                                width=meta_dict.get("width"),
+                                height=meta_dict.get("height"),
+                                created_at=time.time(),
+                            )
+            except Exception as e:
+                logger.debug("SerpAPI Google Images search exception: %s", e)
+
+        # 2. Google Custom Search Engine (if configured)
         api_key = os.environ.get("GOOGLE_CSE_API_KEY") or os.environ.get("IMAGE_SEARCH_API_KEY")
         cx = os.environ.get("GOOGLE_CSE_CX")
-        if not api_key or not cx or not product_name:
+        if not api_key or not cx:
             return None
 
         query = f"{brand or ''} {product_name} packaging product".strip()
@@ -1255,7 +1369,7 @@ class ProductImageResolver:
                 )
                 if success:
                     return ImageMetadata(
-                        source="web_search",
+                        source="google_cse_search",
                         original_url=img_url,
                         cached_path=meta_dict.get("cached_path"),
                         status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,

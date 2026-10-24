@@ -1352,6 +1352,7 @@ async def reanalyze_scan(
             category=result.food_category,
             existing_metadata=scan.image_metadata,
             is_supplementary=False,
+            source_image_path=scan.image_path,
         )
     except Exception as e:
         logger.warning("Product image resolution failed gracefully during reanalyze: %s", e)
@@ -1679,6 +1680,7 @@ async def add_supplementary_scan(
                 category=merged_res.food_category,
                 existing_metadata=scan.image_metadata,
                 is_supplementary=True,
+                source_image_path=str(image_path) if image_path else scan.image_path,
             )
         except Exception as e:
             logger.warning("Product image resolution failed gracefully during supplementary scan: %s", e)

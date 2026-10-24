@@ -147,11 +147,19 @@ def process_image_discovery_job(
         db.cancel_image_jobs_for_product(product_id, reason="Product identity changed")
         return False
 
-    # 3. Resolve Product Details
+    # 3. Resolve Product Details and Scanned Photo
     barcode = extract_barcode_from_product(product)
     image_resolver = resolver or get_image_resolver()
 
-    # 4. Perform Image Discovery
+    source_img = None
+    if product.scan_id:
+        scan_rec = db.get_scan(product.scan_id)
+        if scan_rec and scan_rec.image_path and os.path.exists(scan_rec.image_path):
+            source_img = scan_rec.image_path
+    if not source_img and product.image_path and os.path.exists(product.image_path):
+        source_img = product.image_path
+
+    # 4. Perform Image Discovery: Priority 1 — Web Search (Image barcode & Google/catalog progressive text search)
     try:
         meta: ImageMetadata = image_resolver.resolve_product_image(
             product_name=product.product_name,
@@ -160,6 +168,7 @@ def process_image_discovery_job(
             category=product.food_category,
             is_supplementary=False,
             deadline=deadline,
+            source_image_path=source_img,
         )
 
         if meta.is_verified and (meta.image_url or meta.local_path):
@@ -173,90 +182,45 @@ def process_image_discovery_job(
                 image_metadata=meta.to_dict(),
                 image_source_type=src_type,
             )
-            logger.info("Job %d resolved for product %d: %s (applied=%s)", job_id, product_id, image_target, success)
+            logger.info("Job %d resolved via web search for product %d: %s (applied=%s)", job_id, product_id, image_target, success)
             return success
         else:
-            do_ai = enable_ai_fallback if enable_ai_fallback is not None else (os.environ.get("ENABLE_AI_IMAGE_FALLBACK", "1").lower() in ("1", "true"))
-            if do_ai:
-                logger.info("Job %d web search found no match for product %d ('%s'). Proceeding to AI image pipeline...", job_id, product_id, curr_ident)
+            # Priority 2: Cropping the scanned image (Final Endpoint)
+            if source_img and os.path.exists(source_img):
+                logger.info("Job %d web search found no match; cropping scanned image as final endpoint for product %d ('%s')...", job_id, product_id, curr_ident)
                 try:
                     from ai_image_generator import get_ai_image_generator
                     ai_gen = get_ai_image_generator()
-                    source_img = None
-                    if product.scan_id:
-                        scan_rec = db.get_scan(product.scan_id)
-                        if scan_rec and scan_rec.image_path and os.path.exists(scan_rec.image_path):
-                            source_img = scan_rec.image_path
-                    if not source_img and product.image_path and os.path.exists(product.image_path):
-                        source_img = product.image_path
-
-                    # Stage 2: Intelligent AI Crop / Isolation (first in line after web search)
-                    # Isolates packaging box cleanly onto warm cream studio background with floor drop shadow
-                    if source_img and os.path.exists(source_img):
-                        logger.info("Attempting Intelligent AI crop isolation for product %d ('%s')...", product_id, curr_ident)
-                        crop_res = ai_gen.generate_ai_crop_studio_image(
-                            product_name=product.product_name,
-                            brand=product.brand,
-                            category=product.food_category,
-                            product_id=product_id,
-                            source_image_path=source_img,
-                        )
-                        if crop_res.success and crop_res.image_path:
-                            meta_dict = {
-                                "source": "ai_crop_isolated",
-                                "model": crop_res.model_name,
-                                "width": crop_res.width,
-                                "height": crop_res.height,
-                                "content_type": crop_res.content_type,
-                                "is_verified": True,
-                            }
-                            success = db.apply_resolved_product_image(
-                                product_id=product_id,
-                                job_id=job_id,
-                                image_path=crop_res.image_path,
-                                image_metadata=meta_dict,
-                                image_source_type="generated",
-                            )
-                            logger.info("Job %d resolved with Intelligent AI Crop for product %d: %s (applied=%s)", job_id, product_id, crop_res.image_path, success)
-                            return success
-
-                    # Stage 3: AI Image Generation from Scratch (if AI crop unavailable or not possible)
-                    # Generates a brand-new pristine product packaging image based on packaging characteristics
-                    logger.info("Attempting AI image generation from scratch for product %d ('%s')...", product_id, curr_ident)
-                    scratch_res = ai_gen.generate_product_image_from_scratch(
+                    crop_res = ai_gen.generate_ai_crop_studio_image(
                         product_name=product.product_name,
                         brand=product.brand,
                         category=product.food_category,
                         product_id=product_id,
                         source_image_path=source_img,
                     )
-                    if scratch_res.success and scratch_res.image_path:
+                    if crop_res.success and crop_res.image_path:
                         meta_dict = {
-                            "source": "ai_generated",
-                            "model": scratch_res.model_name,
-                            "width": scratch_res.width,
-                            "height": scratch_res.height,
-                            "content_type": scratch_res.content_type,
+                            "source": "ai_crop_isolated",
+                            "model": crop_res.model_name,
+                            "width": crop_res.width,
+                            "height": crop_res.height,
+                            "content_type": crop_res.content_type,
                             "is_verified": True,
-                            "prompt": scratch_res.prompt_used,
                         }
                         success = db.apply_resolved_product_image(
                             product_id=product_id,
                             job_id=job_id,
-                            image_path=scratch_res.image_path,
+                            image_path=crop_res.image_path,
                             image_metadata=meta_dict,
-                            image_source_type="generated",
+                            image_source_type="crop",
                         )
-                        logger.info("Job %d resolved with AI image generated from scratch for product %d: %s (applied=%s)", job_id, product_id, scratch_res.image_path, success)
+                        logger.info("Job %d resolved with cropped scanned image for product %d: %s (applied=%s)", job_id, product_id, crop_res.image_path, success)
                         return success
-                    else:
-                        logger.info("AI image generation from scratch returned status=%s: %s", scratch_res.status, scratch_res.error_message)
+                except Exception as crop_err:
+                    logger.warning("Scanned image crop encountered error: %s", crop_err)
 
-                except Exception as ai_err:
-                    logger.warning("AI image pipeline encountered an error: %s", ai_err)
-
-            # Stage 4: Category default placeholder (ABSOLUTE LAST RESORT ONLY)
-            logger.info("Applying default category image as absolute last resort for product %d ('%s')", product_id, curr_ident)
+            # Fallback: Only if NO scanned image was present (e.g. manual text entry without a photo)
+            logger.info("Applying default category image for product %d ('%s') as no scanned image was available.", product_id, curr_ident)
             db.apply_no_match_product_image(product_id, job_id)
             return True
 

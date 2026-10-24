@@ -765,6 +765,109 @@ class TestBackgroundImageDiscovery(unittest.TestCase):
         second_processed = process_due_image_jobs(self.db, limit=5, resolver=mock_resolver)
         self.assertEqual(second_processed, 0)
 
+    def test_32_pipeline_priority_web_search_to_cropped_image(self):
+        """
+        Validate strict priority:
+        Web Search -> Cropping Scanned Image as Final Endpoint.
+        When web search returns no match, but product has a scan photo,
+        crops the scanned image as the final endpoint without scratch generation.
+        """
+        # Create dummy scan image
+        import numpy as np
+        import cv2
+        dummy_scan_path = Path(self.temp_dir) / "dummy_scan.jpg"
+        test_img = np.full((400, 400, 3), 180, dtype=np.uint8)
+        cv2.rectangle(test_img, (100, 50), (300, 350), (50, 100, 200), -1)
+        cv2.imwrite(str(dummy_scan_path), test_img)
+
+        prod_id = self.db.add_product(
+            product_name="Orange Juice",
+            brand="Paper Boat",
+            food_category="Beverages",
+            image_path=str(dummy_scan_path),
+        )
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Paper Boat Orange Juice")
+
+        # Mock resolver returns NO MATCH
+        mock_resolver = MagicMock(spec=ProductImageResolver)
+        mock_resolver.resolve_product_image.return_value = ImageMetadata(
+            source="category_fallback",
+            original_url=None,
+            cached_path=None,
+            status=ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH,
+            barcode=None,
+            product_identity="Paper Boat Orange Juice",
+        )
+
+        success = process_image_discovery_job(job_id=job_id, db=self.db, resolver=mock_resolver)
+        self.assertTrue(success)
+
+        # Confirm product was resolved with cropped image as final endpoint
+        prod = self.db.get_product(prod_id)
+        self.assertEqual(prod.image_status, "resolved")
+        self.assertEqual(prod.image_source_type, "crop")
+        self.assertIsNotNone(prod.image_path)
+        self.assertTrue(os.path.exists(prod.image_path))
+
+    def test_33_pipeline_priority_no_scan_falls_back_to_default(self):
+        """
+        When web search has no match and NO scanned photo is available,
+        falls back cleanly to default category placeholder.
+        """
+        prod_id = self.db.add_product(
+            product_name="Unknown Herb",
+            food_category="Produce",
+        )
+        job_id = self.db.create_image_job(product_id=prod_id, normalized_identity="Unknown Herb")
+
+        mock_resolver = MagicMock(spec=ProductImageResolver)
+        mock_resolver.resolve_product_image.return_value = ImageMetadata(
+            source="category_fallback",
+            original_url=None,
+            cached_path=None,
+            status=ImageResolutionStatus.SEARCH_ATTEMPTED_NO_MATCH,
+            barcode=None,
+            product_identity="Unknown Herb",
+        )
+
+        success = process_image_discovery_job(job_id=job_id, db=self.db, resolver=mock_resolver)
+        self.assertTrue(success)
+
+        prod = self.db.get_product(prod_id)
+        self.assertEqual(prod.image_status, "no_match")
+        self.assertEqual(prod.image_source_type, "fallback")
+
+    def test_34_opencv_crop_fallback_produces_valid_studio_image(self):
+        """
+        Test that generate_ai_crop_studio_image with OpenCV fallback produces
+        a valid 600x600 studio image centered on warm cream background with shadow.
+        """
+        from ai_image_generator import AIProductImageGenerator
+        import numpy as np
+        import cv2
+
+        generator = AIProductImageGenerator(output_dir=Path(self.temp_dir) / "gen")
+        dummy_scan_path = Path(self.temp_dir) / "test_pkg.jpg"
+        img = np.full((720, 1280, 3), 200, dtype=np.uint8)
+        # Draw simulated bottle in center
+        cv2.rectangle(img, (500, 150), (780, 600), (40, 120, 240), -1)
+        cv2.imwrite(str(dummy_scan_path), img)
+
+        res = generator.generate_ai_crop_studio_image(
+            product_name="Test Beverage",
+            brand="Test Brand",
+            category="Beverages",
+            product_id=999,
+            source_image_path=str(dummy_scan_path),
+        )
+        self.assertTrue(res.success)
+        self.assertEqual(res.status, "generated")
+        self.assertTrue(os.path.exists(res.image_path))
+        
+        saved_img = cv2.imread(res.image_path)
+        self.assertEqual(saved_img.shape, (600, 600, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -413,6 +413,79 @@ class AIProductImageGenerator:
             created_at=time.time(),
         )
 
+    def detect_packaging_box(
+        self,
+        source_image_path: str,
+        product_name: str | None = None,
+        brand: str | None = None,
+        category: str | None = None,
+    ) -> list[int]:
+        """
+        Detect packaging box_2d coordinates [ymin, xmin, ymax, xmax] (normalized 0..1000).
+        1. Attempts Gemini Vision extraction.
+        2. If Gemini Vision is unavailable, timed out, or quota exhausted (429),
+           uses OpenCV gradient contour & saliency detection to isolate the package.
+        """
+        # 1. Try Gemini Vision if client is available
+        try:
+            details = self.extract_packaging_details_and_prompt(source_image_path, product_name or "", brand, category)
+            box_coords = details.get("box_2d") if isinstance(details, dict) else None
+            if box_coords and len(box_coords) == 4 and all(isinstance(v, (int, float)) for v in box_coords):
+                return [int(v) for v in box_coords]
+        except Exception as e:
+            logger.debug("Gemini Vision box detection note: %s", e)
+
+        # 2. OpenCV Center Package Isolation Fallback
+        try:
+            img = cv2.imread(source_image_path)
+            if img is not None:
+                h, w = img.shape[:2]
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                mag = cv2.magnitude(grad_x, grad_y)
+                mag_u8 = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                _, thresh = cv2.threshold(mag_u8, 30, 255, cv2.THRESH_BINARY)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+                closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+                contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                center_x, center_y = w / 2, h / 2
+                best_box = None
+                best_score = -1e9
+                min_area = (w * h) * 0.04
+                max_area = (w * h) * 0.95
+
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < min_area or area > max_area:
+                        continue
+                    x, y, bw, bh = cv2.boundingRect(cnt)
+                    if bw < 50 or bh < 50:
+                        continue
+                    cx = x + bw / 2
+                    cy = y + bh / 2
+                    dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2) / np.sqrt(center_x**2 + center_y**2)
+                    score = (area / (w * h)) - (dist * 0.5)
+                    if score > best_score:
+                        best_score = score
+                        best_box = (x, y, bw, bh)
+
+                if best_box:
+                    x, y, bw, bh = best_box
+                    ymin = int(max(0, y) / h * 1000)
+                    xmin = int(max(0, x) / w * 1000)
+                    ymax = int(min(h, y + bh) / h * 1000)
+                    xmax = int(min(w, x + bw) / w * 1000)
+                    return [ymin, xmin, ymax, xmax]
+
+                # Default centered packaging framing
+                return [100, 160, 900, 840]
+        except Exception as e:
+            logger.debug("OpenCV package box fallback note: %s", e)
+
+        return [100, 160, 900, 840]
+
     def generate_ai_crop_studio_image(
         self,
         product_name: str,
@@ -422,17 +495,16 @@ class AIProductImageGenerator:
         source_image_path: str | None = None,
     ) -> GeneratedImageResult:
         """
-        Stage 2 of image pipeline: Intelligent AI Crop.
-        Uses Gemini Vision to detect the retail packaging container box_2d,
-        applies a 3.5% safety inset to eliminate fingers/hands/room walls,
-        and isolates the package on #FAF7F2 warm cream background with floor drop shadow.
-        This produces the exact isolated studio images admired for Chanduram's and DBH Osmania Biscuits.
+        Stage 2 / Final Endpoint: Cropping the scanned image.
+        Isolates the retail packaging cleanly and renders it centered on
+        a warm cream studio canvas (#FAF7F2) with soft natural drop shadow.
+        Acts as the definitive endpoint when web search does not find a match.
         """
         if not source_image_path or not os.path.exists(source_image_path):
             return GeneratedImageResult(
                 success=False,
                 status="crop_unavailable",
-                error_message="No source image available for AI crop",
+                error_message="No source image available for crop",
                 created_at=time.time(),
             )
 
@@ -453,14 +525,13 @@ class AIProductImageGenerator:
                         width=img_check.shape[1],
                         height=img_check.shape[0],
                         content_type="image/jpeg",
-                        model_name="gemini-vision-isolated-studio",
+                        model_name="ai-crop-isolated-studio",
                         created_at=target_path.stat().st_mtime,
                     )
             except Exception:
                 pass
 
-        details = self.extract_packaging_details_and_prompt(source_image_path, product_name, brand, category)
-        box_coords = details.get("box_2d") if isinstance(details, dict) else None
+        box_coords = self.detect_packaging_box(source_image_path, product_name, brand, category)
         if box_coords and len(box_coords) == 4:
             rendered = self.render_isolated_studio_box(source_image_path, box_coords, target_path)
             if rendered:
@@ -472,14 +543,14 @@ class AIProductImageGenerator:
                     width=600,
                     height=600,
                     content_type="image/jpeg",
-                    model_name="gemini-vision-isolated-studio",
+                    model_name="ai-crop-isolated-studio",
                     created_at=time.time(),
                 )
 
         return GeneratedImageResult(
             success=False,
             status="crop_unavailable",
-            error_message="Gemini Vision could not isolate a packaging box",
+            error_message="Could not render packaging crop box",
             created_at=time.time(),
         )
 
