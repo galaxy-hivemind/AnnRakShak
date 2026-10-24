@@ -98,17 +98,20 @@ class TestAIProductImageGenerator(unittest.TestCase):
     def test_caching_and_idempotency(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             gen = AIProductImageGenerator(api_key="", output_dir=tmpdir)
-            # Create a valid pre-existing image file
+            # Create a valid pre-existing source and cropped image file
             dummy_img = np.full((200, 200, 3), 200, dtype=np.uint8)
+            source_img_path = os.path.join(tmpdir, "source_scan.jpg")
+            cv2.imwrite(source_img_path, dummy_img)
+
             import hashlib
             from product_identity import derive_display_name
             identity = derive_display_name("Test Product", None, None)
             id_hash = hashlib.sha256(identity.lower().encode("utf-8")).hexdigest()[:10]
-            existing_path = os.path.join(tmpdir, f"prod_999_{id_hash}.jpg")
+            existing_path = os.path.join(tmpdir, f"crop_999_{id_hash}.jpg")
             cv2.imwrite(existing_path, dummy_img)
 
-            # Request generation for product_id=999
-            result = gen.generate_product_image("Test Product", product_id=999)
+            # Request crop generation for product_id=999
+            result = gen.generate_product_image("Test Product", product_id=999, source_image_path=source_img_path)
             self.assertTrue(result.success)
             self.assertEqual(result.status, "generated")
             self.assertEqual(result.image_path, existing_path)

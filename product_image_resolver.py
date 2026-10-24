@@ -281,6 +281,118 @@ def generate_search_queries(product_name: str | None, brand: str | None) -> list
     return deduped[:5]
 
 
+# Comprehensive Variant & Flavor Taxonomy for Precise Matching & Conflict Detection
+# Maps canonical variant id -> (group_name, [synonyms])
+VARIANT_TAXONOMY: dict[str, tuple[str, list[str]]] = {
+    # Fruit Flavors Group ("fruit")
+    "litchi": ("fruit", ["litchi", "lychee", "lichi"]),
+    "mixed_fruit": ("fruit", ["mixed fruit", "fruit punch", "multi fruit", "all fruit", "mixed fruits", "tropical"]),
+    "orange": ("fruit", ["orange", "santre", "santra", "mosambi", "sweet lime"]),
+    "mango": ("fruit", ["mango", "alphonso", "aam", "kacha aam", "raw mango", "totapuri", "kesar"]),
+    "apple": ("fruit", ["apple", "green apple", "red apple", "seb"]),
+    "guava": ("fruit", ["guava", "amrud", "pink guava"]),
+    "lemon": ("fruit", ["lemon", "lime", "nimbu", "lemonade", "citrus"]),
+    "pomegranate": ("fruit", ["pomegranate", "anar"]),
+    "pineapple": ("fruit", ["pineapple", "ananas"]),
+    "grape": ("fruit", ["grape", "grapes", "black grape", "green grape", "angoor"]),
+    "strawberry": ("fruit", ["strawberry", "strawberries"]),
+    "cranberry": ("fruit", ["cranberry", "cranberries"]),
+    "blueberry": ("fruit", ["blueberry", "blueberries"]),
+    "peach": ("fruit", ["peach", "peaches"]),
+    "watermelon": ("fruit", ["watermelon", "tarbooz"]),
+    "coconut": ("fruit", ["coconut", "tender coconut", "nariyal"]),
+    "banana": ("fruit", ["banana", "kela"]),
+    "papaya": ("fruit", ["papaya", "papita"]),
+    "kiwi": ("fruit", ["kiwi"]),
+
+    # Confectionery, Biscuit & Snack Flavors ("confectionery")
+    "chocolate": ("confectionery", ["chocolate", "choco", "dark chocolate", "milk chocolate", "cocoa"]),
+    "white_chocolate": ("confectionery", ["white chocolate", "milkybar"]),
+    "vanilla": ("confectionery", ["vanilla"]),
+    "butterscotch": ("confectionery", ["butterscotch"]),
+    "caramel": ("confectionery", ["caramel", "toffee"]),
+    "mint": ("confectionery", ["mint", "pudina", "cool mint", "fresh mint", "spearmint", "peppermint"]),
+    "cola": ("confectionery", ["cola", "coke"]),
+    "jeera": ("confectionery", ["jeera", "cumin", "zeera"]),
+    "masala": ("confectionery", ["masala", "spicy", "chatpata", "peri peri", "magic masala"]),
+    "chilli": ("confectionery", ["chilli", "chili", "green chilli", "red chilli", "mirch"]),
+    "tomato": ("confectionery", ["tomato", "tangy tomato", "spanish tomato"]),
+    "cream_onion": ("confectionery", ["sour cream and onion", "cream and onion", "onion cream", "sour cream"]),
+    "salted": ("confectionery", ["salted", "classic salted", "plain salted"]),
+    "cheese": ("confectionery", ["cheese", "cheddar", "nacho cheese"]),
+    "butter": ("confectionery", ["butter", "maska", "buttery"]),
+    "almond": ("confectionery", ["almond", "badam"]),
+    "cashew": ("confectionery", ["cashew", "kaju"]),
+    "pista": ("confectionery", ["pista", "pistachio"]),
+    "walnut": ("confectionery", ["walnut", "akhrot"]),
+    "dry_fruit": ("confectionery", ["dry fruit", "dry fruits", "fruit and nut"]),
+
+    # Biscuit Varieties ("biscuit_variety")
+    "osmania": ("biscuit_variety", ["osmania", "osmania biscuit", "osmania biscuits"]),
+    "marie": ("biscuit_variety", ["marie", "marie gold", "marie light"]),
+    "bourbon": ("biscuit_variety", ["bourbon", "bourbon biscuit"]),
+    "oreo": ("biscuit_variety", ["oreo"]),
+    "digestive": ("biscuit_variety", ["digestive", "digestive biscuit"]),
+    "rusk": ("biscuit_variety", ["rusk", "suji rusk", "toast"]),
+    "glucose": ("biscuit_variety", ["glucose", "parle g", "parle-g"]),
+}
+
+
+def extract_variants(text: str | None) -> dict[str, str]:
+    """
+    Extract canonical variants and their groups from text.
+    Returns mapping of canonical_variant_id -> group_name.
+    """
+    if not text:
+        return {}
+    clean = f" {text.lower()} "
+    clean = re.sub(r"[^a-z0-9\s]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean)
+
+    detected: dict[str, str] = {}
+    all_variants = []
+    for can_id, (grp, syns) in VARIANT_TAXONOMY.items():
+        for syn in syns:
+            all_variants.append((syn, can_id, grp))
+    # Match longer phrases first (e.g. 'mixed fruit' before 'fruit')
+    all_variants.sort(key=lambda x: len(x[0]), reverse=True)
+
+    for syn, can_id, grp in all_variants:
+        if re.search(rf"\b{re.escape(syn)}\b", clean):
+            detected[can_id] = grp
+    return detected
+
+
+def check_variant_conflict(
+    target_variants: dict[str, str],
+    cand_variants: dict[str, str],
+) -> tuple[bool, bool]:
+    """
+    Check for variant/flavor conflict between target and candidate.
+    Returns:
+      (has_conflict, has_exact_match)
+      - has_conflict: True if both target and candidate specify variants in the same group, but none match.
+      - has_exact_match: True if at least one canonical variant matches.
+    """
+    if not target_variants:
+        return False, False
+
+    target_keys = set(target_variants.keys())
+    cand_keys = set(cand_variants.keys())
+
+    matching = target_keys.intersection(cand_keys)
+    if matching:
+        return False, True
+
+    # If no matching variant, check if candidate has any other variant in the same group
+    for t_var, t_grp in target_variants.items():
+        for c_var, c_grp in cand_variants.items():
+            if t_grp == c_grp and t_var != c_var:
+                return True, False
+
+    return False, False
+
+
 def score_candidate(
     cand_brand: str | None,
     cand_name: str | None,
@@ -288,8 +400,10 @@ def score_candidate(
     target_name: str | None,
     has_front_img: bool = False,
 ) -> float:
-    """Score relevance of candidate product against target brand and product name."""
-    score = 0.0
+    """
+    Score relevance of candidate product against target brand and product name.
+    Strictly penalizes/disqualifies flavor and variant conflicts.
+    """
     c_brand = (cand_brand or "").lower().strip()
     c_name = (cand_name or "").lower().strip()
     t_brand = (target_brand or "").lower().strip()
@@ -300,7 +414,19 @@ def score_candidate(
     t_brand = re.sub(r"['’]s\b", "", t_brand)
     t_name = re.sub(r"['’]s\b", "", t_name)
 
-    # 1. Brand matching
+    # 1. Variant & Flavor Conflict Detection (Strict rejection on mismatch)
+    t_variants = extract_variants(f"{t_brand} {t_name}")
+    c_variants = extract_variants(f"{c_brand} {c_name}")
+
+    has_conflict, has_match = check_variant_conflict(t_variants, c_variants)
+    if has_conflict:
+        # Direct flavor/variant mismatch (e.g. Litchi vs Mixed Fruit Juice, Osmania vs Marie)
+        # Disqualify candidate completely so it defaults to image cropping
+        return -100.0
+
+    score = 0.0
+
+    # 2. Brand matching
     if t_brand:
         if t_brand in c_brand or c_brand in t_brand or t_brand in c_name:
             score += 50.0
@@ -312,7 +438,7 @@ def score_candidate(
     else:
         score += 10.0
 
-    # 2. Token overlap
+    # 3. Token overlap
     t_tokens = set(t for t in re.findall(r"\w+", t_name) if len(t) > 2)
     if t_brand:
         t_tokens -= set(re.findall(r"\w+", t_brand))
@@ -325,21 +451,14 @@ def score_candidate(
     else:
         score += 15.0
 
-    # 3. Flavor / variant match
-    flavor_words = {
-        "orange", "brownie", "mint", "almond", "chocolate", "cookies",
-        "mango", "lemon", "apple", "berry", "butter", "masala", "lychee", "guava",
-    }
-    t_flavors = t_tokens.intersection(flavor_words)
-    c_flavors = c_all_tokens.intersection(flavor_words)
+    # 4. Flavor / Variant agreement
+    if has_match:
+        score += 35.0
+    elif t_variants and not c_variants:
+        # Target has a specific flavor (e.g. Litchi), but candidate has NO flavor specified at all
+        score -= 35.0
 
-    if t_flavors:
-        if t_flavors.intersection(c_flavors):
-            score += 25.0
-        elif c_flavors:
-            score -= 15.0
-
-    # 4. Front image preference
+    # 5. Front image preference
     if has_front_img:
         score += 10.0
 
@@ -1291,6 +1410,7 @@ class ProductImageResolver:
 
         # 1. SerpAPI Google Images Search (if configured)
         serp_key = os.environ.get("SERPAPI_API_KEY")
+        min_threshold = 45.0 if (brand and brand.strip()) else 25.0
         if serp_key:
             try:
                 serp_query = f"{brand or ''} {product_name} packaging product".strip()
@@ -1306,6 +1426,12 @@ class ProductImageResolver:
                     for item in data.get("images_results", []):
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError("Execution budget exceeded during web image download")
+                        title = item.get("title") or ""
+                        score = score_candidate(None, title, brand, product_name)
+                        if score < min_threshold:
+                            logger.info("Discarded web candidate '%s' due to low score/variant conflict (score=%.1f)", title, score)
+                            continue
+
                         img_url = item.get("original") or item.get("thumbnail")
                         if not img_url:
                             continue
@@ -1321,7 +1447,7 @@ class ProductImageResolver:
                                 cached_path=meta_dict.get("cached_path"),
                                 status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
                                 barcode=barcode,
-                                product_identity=identity_str,
+                                product_identity=f"{title} ({identity_str})",
                                 content_type=meta_dict.get("content_type"),
                                 width=meta_dict.get("width"),
                                 height=meta_dict.get("height"),
@@ -1358,6 +1484,12 @@ class ProductImageResolver:
             for item in items:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("Execution budget exceeded during web image download")
+                title = f"{item.get('title') or ''} {item.get('snippet') or ''}".strip()
+                score = score_candidate(None, title, brand, product_name)
+                if score < min_threshold:
+                    logger.info("Discarded Google CSE candidate '%s' due to low score/variant conflict (score=%.1f)", title, score)
+                    continue
+
                 img_url = item.get("link")
                 if not img_url:
                     continue
@@ -1374,7 +1506,7 @@ class ProductImageResolver:
                         cached_path=meta_dict.get("cached_path"),
                         status=ImageResolutionStatus.VERIFIED_WEB_IMAGE,
                         barcode=barcode,
-                        product_identity=identity_str,
+                        product_identity=f"{title} ({identity_str})",
                         content_type=meta_dict.get("content_type"),
                         width=meta_dict.get("width"),
                         height=meta_dict.get("height"),

@@ -524,10 +524,10 @@ class AIProductImageGenerator:
 
         identity = derive_display_name(product_name, brand, category)
         id_hash = hashlib.sha256(identity.lower().encode("utf-8")).hexdigest()[:10]
-        filename = f"prod_{product_id or 'gen'}_{id_hash}.jpg"
+        filename = f"crop_{product_id or 'gen'}_{id_hash}.jpg"
         target_path = self.output_dir / filename
 
-        # Idempotency Cache Check
+        # Idempotency Cache Check (ensure existing file is a verified studio crop)
         if target_path.exists() and target_path.stat().st_size > 1024:
             try:
                 img_check = cv2.imread(str(target_path))
@@ -568,30 +568,6 @@ class AIProductImageGenerator:
             created_at=time.time(),
         )
 
-    def _generate_via_ai_diffusion(self, prompt: str) -> bytes | None:
-        """Fetch image generated from scratch via high-speed AI diffusion service with certifi SSL context."""
-        import ssl
-        import urllib.parse
-        import urllib.request
-        try:
-            import certifi
-            ctx = ssl.create_default_context(cafile=certifi.where())
-        except Exception:
-            ctx = ssl.create_default_context()
-
-        try:
-            clean_prompt = prompt[:280]
-            url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(clean_prompt)}?width=600&height=600&nologo=true"
-            req = urllib.request.Request(url, headers={"User-Agent": "AnnaRakshak/1.0 (FoodSafetyApp)"})
-            with urllib.request.urlopen(req, context=ctx, timeout=12) as resp:
-                if resp.status == 200:
-                    data = resp.read()
-                    if len(data) > 2048:
-                        return data
-        except Exception as e:
-            logger.info("AI diffusion generation note: %s", e)
-        return None
-
     def generate_product_image_from_scratch(
         self,
         product_name: str,
@@ -602,107 +578,24 @@ class AIProductImageGenerator:
         with_label_overlay: bool = False,
     ) -> GeneratedImageResult:
         """
-        Stage 3 of image pipeline: AI Image Generation from Scratch.
-        Generates a brand new commercial catalog image from scratch based on
-        scanned image visual characteristics, brand, packaging looks, colors, and product type.
+        AI diffusion from scratch is disabled to guarantee real, accurate images.
+        If a scanned photo is available, delegates to generate_ai_crop_studio_image.
+        Otherwise returns failure so the pipeline can fall back to the 200 Household Items Catalog.
         """
-        identity = derive_display_name(product_name, brand, category)
-        id_hash = hashlib.sha256(identity.lower().encode("utf-8")).hexdigest()[:10]
-        filename = f"prod_{product_id or 'gen'}_{id_hash}.jpg"
-        target_path = self.output_dir / filename
-
-        # 1. Idempotency Cache Check
-        if target_path.exists() and target_path.stat().st_size > 1024:
-            try:
-                img_check = cv2.imread(str(target_path))
-                if img_check is not None and img_check.shape[0] >= 100 and img_check.shape[1] >= 100:
-                    return GeneratedImageResult(
-                        success=True,
-                        status="generated",
-                        image_path=str(target_path),
-                        width=img_check.shape[1],
-                        height=img_check.shape[0],
-                        content_type="image/jpeg",
-                        model_name="ai-image-scratch",
-                        created_at=target_path.stat().st_mtime,
-                    )
-            except Exception:
-                pass
-
-        # 2. Extract rich visual characteristics using Gemini Vision if scan is available
-        vision_details: dict[str, Any] = {}
         if source_image_path and os.path.exists(source_image_path):
-            vision_details = self.extract_packaging_details_and_prompt(
-                source_image_path, product_name, brand, category
+            return self.generate_ai_crop_studio_image(
+                product_name=product_name,
+                brand=brand,
+                category=category,
+                product_id=product_id,
+                source_image_path=source_image_path,
             )
 
-        prompt = vision_details.get("prompt") or build_product_image_prompt(product_name, brand, category)
-        client = self._get_client()
-
-        raw_image_bytes: bytes | None = None
-
-        # 3. Try Gemini Image Generation Model if API client is configured
-        if client:
-            acquired = _concurrency_semaphore.acquire(timeout=1.0)
-            if acquired:
-                try:
-                    from google.genai import types
-                    logger.info("Requesting Gemini API image generation for '%s'...", identity)
-                    response = client.models.generate_content(
-                        model=self.model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
-                    )
-                    if response and response.candidates:
-                        candidate = response.candidates[0]
-                        if candidate.content and candidate.content.parts:
-                            for part in candidate.content.parts:
-                                if hasattr(part, "inline_data") and part.inline_data:
-                                    data = part.inline_data.data
-                                    raw_image_bytes = base64.b64decode(data) if isinstance(data, str) else data
-                                    break
-                except Exception as exc:
-                    logger.info("Gemini image generation API note (%s); trying high-fidelity diffusion...", str(exc)[:80])
-                finally:
-                    _concurrency_semaphore.release()
-
-        # 4. If Gemini image generation API unavailable/quota exhausted (429), try diffusion service
-        if not raw_image_bytes:
-            raw_image_bytes = self._generate_via_ai_diffusion(prompt)
-
-        # 5. If we have image bytes from Gemini or diffusion, validate, process, and persist
-        if raw_image_bytes:
-            try:
-                nparr = np.frombuffer(raw_image_bytes, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is not None and img.shape[0] >= 100 and img.shape[1] >= 100:
-                    h, w = img.shape[:2]
-                    if with_label_overlay:
-                        img = overlay_product_label_pill(img, identity)
-                    cv2.imwrite(str(target_path), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                    logger.info("Saved AI-generated product image from scratch for '%s' to %s", identity, target_path)
-                    return GeneratedImageResult(
-                        success=True,
-                        status="generated",
-                        image_path=str(target_path),
-                        width=w,
-                        height=h,
-                        content_type="image/jpeg",
-                        prompt_used=prompt,
-                        model_name="ai-diffusion-from-scratch",
-                        created_at=time.time(),
-                    )
-            except Exception as e:
-                logger.warning("Error processing generated image bytes: %s", e)
-
-        # 6. Fallback: High-Fidelity 3D Packaging Synthesizer using extracted visual colors & metadata
-        return self.synthesize_studio_image(
-            product_name=product_name,
-            brand=brand,
-            category=category,
-            product_id=product_id,
-            source_image_path=source_image_path,
-            gemini_vision_details=vision_details,
+        return GeneratedImageResult(
+            success=False,
+            status="crop_unavailable",
+            error_message="AI scratch diffusion is disabled; use 200 Household Catalog fallback",
+            created_at=time.time(),
         )
 
     def generate_product_image(
@@ -715,9 +608,9 @@ class AIProductImageGenerator:
         with_label_overlay: bool = False,
     ) -> GeneratedImageResult:
         """
-        Coordinated AI image generation following the user's explicit hierarchy:
-        1. Intelligent AI Crop (first in line after web search)
-        2. AI Image Generation from Scratch (if crop is unavailable or fails)
+        Coordinated image generation following the user's explicit hierarchy:
+        1. Intelligent AI Crop (first in line when scanned packaging image exists)
+        2. Fallback to Tier 3 Household Catalog (never AI scratch diffusion)
         """
         if not product_name or not product_name.strip():
             return GeneratedImageResult(
@@ -727,25 +620,21 @@ class AIProductImageGenerator:
                 created_at=time.time(),
             )
 
-        # 1. Scanned products must strictly use crop as final endpoint and NEVER AI image generation from scratch
+        # Scanned products strictly use packaging crop and NEVER AI hallucinated images from scratch
         if source_image_path and os.path.exists(source_image_path):
-            crop_res = self.generate_ai_crop_studio_image(
+            return self.generate_ai_crop_studio_image(
                 product_name=product_name,
                 brand=brand,
                 category=category,
                 product_id=product_id,
                 source_image_path=source_image_path,
             )
-            return crop_res
 
-        # 2. Next in line: AI Image Generation from Scratch (strictly for non-scanned/manual entries if enabled)
-        return self.generate_product_image_from_scratch(
-            product_name=product_name,
-            brand=brand,
-            category=category,
-            product_id=product_id,
-            source_image_path=source_image_path,
-            with_label_overlay=with_label_overlay,
+        return GeneratedImageResult(
+            success=False,
+            status="crop_unavailable",
+            error_message="No source scan photo available for crop",
+            created_at=time.time(),
         )
 
 

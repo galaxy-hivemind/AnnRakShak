@@ -139,6 +139,8 @@ export function matchPresetFood(name?: string, image?: string): DemoPreset | nul
   return null;
 }
 
+import { findBestHouseholdItem } from './household-catalog';
+
 export function resolveFoodImage(item?: {
   name?: string;
   category?: string;
@@ -146,22 +148,29 @@ export function resolveFoodImage(item?: {
 }): string {
   if (!item) return tomatoesImg;
 
-  // 1. If an actual image was provided (web URL, API image, cropped scan, data URI), ALWAYS respect and display it!
+  // 1. If an actual image was provided (web URL, API image, cropped scan, data URI, or household card), ALWAYS respect and display it!
   if (
     item.image &&
-    !item.image.endsWith('.svg') &&
-    (item.image.startsWith('data:') ||
-      item.image.startsWith('/captures/') ||
-      item.image.startsWith('/api/') ||
-      item.image.startsWith('http://') ||
-      item.image.startsWith('https://') ||
-      item.image.startsWith('/presets/') ||
-      item.image.includes('/assets/'))
+    (item.image.startsWith('/household/') ||
+      (!item.image.endsWith('.svg') &&
+        (item.image.startsWith('data:') ||
+          item.image.startsWith('/captures/') ||
+          item.image.startsWith('/api/') ||
+          item.image.startsWith('http://') ||
+          item.image.startsWith('https://') ||
+          item.image.startsWith('/presets/') ||
+          item.image.includes('/assets/'))))
   ) {
     return item.image;
   }
 
-  // 2. Only if NO real image is available, check demo preset whole-word match
+  // 2. Tier 3 Fallback: Match against the 200 Common Household Items Catalog
+  const householdMatch = findBestHouseholdItem(item.name, item.category);
+  if (householdMatch) {
+    return householdMatch.image;
+  }
+
+  // 3. Demo presets whole-word match
   const preset = matchPresetFood(item.name, item.image);
   if (preset) {
     return preset.image;
@@ -169,8 +178,7 @@ export function resolveFoodImage(item?: {
 
   const name = (item.name || '').toLowerCase();
 
-  // Common refrigerator and pantry items matching
-  if (name.includes('milk')) return milkImg;
+  // Common natural ingredient photo matching (using genuine food photography, never AI scratch images)
   if (name.includes('tomato')) return tomatoesImg;
   if (name.includes('carrot')) return carrotsImg;
   if (name.includes('spinach') || name.includes('palak')) return spinachImg;
@@ -183,52 +191,8 @@ export function resolveFoodImage(item?: {
     return breadImg;
   }
   if (name.includes('banana')) return bananasImg;
-  if (
-    name.includes('juice') ||
-    name.includes('water') ||
-    name.includes('drink') ||
-    name.includes('beverage') ||
-    name.includes('tea') ||
-    name.includes('coffee')
-  ) {
-    return juiceImg;
-  }
-  if (
-    name.includes('oat') ||
-    name.includes('rice') ||
-    name.includes('cereal') ||
-    name.includes('corn flake') ||
-    name.includes('pasta') ||
-    name.includes('wheat')
-  ) {
-    return grainsImg;
-  }
-  if (
-    name.includes('nut') ||
-    name.includes('chocolate') ||
-    name.includes('biscuit') ||
-    name.includes('cookie') ||
-    name.includes('snack')
-  ) {
-    return snacksImg;
-  }
-  if (
-    name.includes('oil') ||
-    name.includes('peanut butter') ||
-    name.includes('honey') ||
-    name.includes('ketchup') ||
-    name.includes('sauce') ||
-    name.includes('salt') ||
-    name.includes('spice') ||
-    name.includes('chickpea')
-  ) {
-    return pantryImg;
-  }
+  if (name.includes('juice')) return juiceImg;
 
-  // Category fallback
-  if (item.category && categoryImages[item.category]) {
-    return categoryImages[item.category];
-  }
-
+  // Final neutral food photo fallback
   return tomatoesImg;
 }

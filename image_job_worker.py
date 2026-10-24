@@ -225,8 +225,29 @@ def process_image_discovery_job(
                 except Exception as crop_err:
                     logger.warning("Scanned image crop encountered error: %s", crop_err)
 
-            # Fallback: Only if NO scanned image was present at all (e.g. manual text entry without a photo)
-            logger.info("Applying default category image for product %d ('%s') as no scanned image was available.", product_id, curr_ident)
+            # Tier 3: Collection of 200 Common Household Items Fallback
+            from household_catalog import find_best_household_item
+            household_item = find_best_household_item(product.product_name, product.brand, product.food_category)
+            if household_item:
+                logger.info("Job %d matched Tier 3 household catalog item '%s' for product %d ('%s')", job_id, household_item.name, product_id, curr_ident)
+                meta_dict = {
+                    "source": "household_catalog",
+                    "item_id": household_item.id,
+                    "item_name": household_item.name,
+                    "category": household_item.category,
+                    "is_verified": True,
+                }
+                success = db.apply_resolved_product_image(
+                    product_id=product_id,
+                    job_id=job_id,
+                    image_path=household_item.image_path,
+                    image_metadata=meta_dict,
+                    image_source_type="catalog_preset",
+                )
+                return success
+
+            # Fallback: Only if NO scanned image was present and no household item matched
+            logger.info("Applying default category image for product %d ('%s') as no scanned image or household match was available.", product_id, curr_ident)
             db.apply_no_match_product_image(product_id, job_id)
             return True
 

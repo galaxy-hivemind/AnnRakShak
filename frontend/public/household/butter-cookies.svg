@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="100%" height="100%">
+  <!-- Background Studio Canvas -->
+  <rect width="400" height="400" rx="24" fill="#FAF7F2"/>
+  <rect x="12" y="12" width="376" height="376" rx="18" fill="none" stroke="#E6DFD5" stroke-width="1.5"/>
+
+  <!-- Category Pill Badge -->
+  <g transform="translate(24, 24)">
+    <rect x="0" y="0" width="150" height="28" rx="14" fill="#92400E"/>
+    <text x="75" y="18" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle" letter-spacing="0.5">
+      GRAINS & CEREALS
+    </text>
+  </g>
+
+  <!-- Verified Household Catalog Chip -->
+  <g transform="translate(285, 24)">
+    <rect x="0" y="0" width="90" height="28" rx="14" fill="#FFFFFF" stroke="#E6DFD5" stroke-width="1"/>
+    <text x="45" y="18" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10" font-weight="600" fill="#4B5563" text-anchor="middle">
+      CATALOG
+    </text>
+  </g>
+
+  <!-- Center Artwork Graphic -->
+  
+        <!-- Cookie Graphic -->
+        <ellipse cx="200" cy="245" rx="65" ry="14" fill="#000000" fill-opacity="0.08"/>
+        <!-- Back Biscuit -->
+        <circle cx="175" cy="165" r="42" fill="#FCD34D" opacity="0.85" stroke="#B45309" stroke-width="2"/>
+        <circle cx="160" cy="155" r="3" fill="#78350F" opacity="0.6"/>
+        <circle cx="185" cy="150" r="3" fill="#78350F" opacity="0.6"/>
+        <circle cx="170" cy="175" r="3" fill="#78350F" opacity="0.6"/>
+        <!-- Front Biscuit -->
+        <circle cx="215" cy="175" r="46" fill="#FCD34D" stroke="#92400E" stroke-width="2.5"/>
+        <circle cx="200" cy="165" r="3.5" fill="#78350F" opacity="0.7"/>
+        <circle cx="230" cy="160" r="3.5" fill="#78350F" opacity="0.7"/>
+        <circle cx="205" cy="190" r="3.5" fill="#78350F" opacity="0.7"/>
+        <circle cx="225" cy="185" r="3.5" fill="#78350F" opacity="0.7"/>
+        <circle cx="215" cy="172" r="3" fill="#B45309" opacity="0.8"/>
+        
+
+  <!-- Bottom Details Card -->
+  <g transform="translate(24, 275)">
+    <rect x="0" y="0" width="352" height="96" rx="16" fill="#FFFFFF" stroke="#E6DFD5" stroke-width="1"/>
+    <!-- Title -->
+    <text x="20" y="36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="800" fill="#111827">
+      Rich Danish Butter Cookies
+    </text>
+    <!-- Subtitle -->
+    <text x="20" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="500" fill="#6B7280">
+      Melt-in-Mouth Golden Butter Biscuits
+    </text>
+    <!-- Footer Tag -->
+    <text x="20" y="82" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10" font-weight="700" fill="#92400E" letter-spacing="0.3">
+      ★ ANNARAKSHAK HOUSEHOLD STANDARD
+    </text>
+  </g>
+</svg>

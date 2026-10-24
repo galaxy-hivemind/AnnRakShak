@@ -873,6 +873,13 @@ def get_product_image(
         if p.image_path.startswith("http://") or p.image_path.startswith("https://"):
             from fastapi.responses import RedirectResponse
             return RedirectResponse(url=p.image_path, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        if p.image_path.startswith("/household/"):
+            local_household = Path("frontend/public") / p.image_path.lstrip("/")
+            if local_household.exists():
+                return FileResponse(path=local_household, media_type="image/svg+xml")
+            c_household = Path("captures") / p.image_path.lstrip("/")
+            if c_household.exists():
+                return FileResponse(path=c_household, media_type="image/svg+xml")
         if p.image_path.startswith("/presets/"):
             local_preset = Path("frontend/public") / p.image_path.lstrip("/")
             if local_preset.exists():
@@ -998,18 +1005,33 @@ def create_product(
         init_img_src = "manual"
         init_img_status = "resolved"
     elif not payload.scan_id and not disp_img:
-        # Presets only apply to manual text additions without a scan, using whole-word boundary matching
-        preset_match = None
-        if payload.product_name:
-            p_name_lower = payload.product_name.lower().strip()
-            for k, p_url in preset_images.items():
-                if re.search(rf"\b{re.escape(k)}\b", p_name_lower):
-                    preset_match = p_url
-                    break
-        if preset_match:
-            disp_img = preset_match
-            init_img_src = "manual"
+        # Tier 3: Match against the 200 Common Household Items Catalog first
+        from household_catalog import find_best_household_item
+        household_item = find_best_household_item(payload.product_name, payload.brand, payload.food_category)
+        if household_item:
+            disp_img = household_item.image_path
+            init_img_src = "catalog_preset"
             init_img_status = "resolved"
+            image_meta = {
+                "source": "household_catalog",
+                "item_id": household_item.id,
+                "item_name": household_item.name,
+                "category": household_item.category,
+                "is_verified": True,
+            }
+        else:
+            # Presets fallback using whole-word boundary matching
+            preset_match = None
+            if payload.product_name:
+                p_name_lower = payload.product_name.lower().strip()
+                for k, p_url in preset_images.items():
+                    if re.search(rf"\b{re.escape(k)}\b", p_name_lower):
+                        preset_match = p_url
+                        break
+            if preset_match:
+                disp_img = preset_match
+                init_img_src = "manual"
+                init_img_status = "resolved"
 
     product_id = db.add_product(
         product_name=payload.product_name,
@@ -2102,6 +2124,21 @@ async def create_scan(
                             }
                     except Exception as auto_crop_err:
                         logger.warning("Auto-save crop error: %s", auto_crop_err)
+
+                # Tier 3: Collection of 200 Common Household Items Fallback
+                if not product_display_image:
+                    from household_catalog import find_best_household_item
+                    household_item = find_best_household_item(result.product_name, result.brand, result.food_category)
+                    if household_item:
+                        product_display_image = household_item.image_path
+                        prod_img_src = "catalog_preset"
+                        image_meta_dict = {
+                            "source": "household_catalog",
+                            "item_id": household_item.id,
+                            "item_name": household_item.name,
+                            "category": household_item.category,
+                            "is_verified": True,
+                        }
 
                 product_id = db.add_product(
                     product_name=result.product_name,
